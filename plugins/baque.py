@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
@@ -16,6 +17,9 @@ from game_baque.event_vision import OpponentEventVision
 from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
 from game_baque.vision import BaqueVision
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 OBJECT = {"type": "object", "additionalProperties": False}
@@ -299,39 +303,53 @@ class BaquePlugin:
 
         self._auto_stop_event = Event()
         self._auto_started_observer = False
-        observer = self.observer
-        if observer is not None:
-            if not observer.running:
-                game.set_external_observer_active(True)
-                await game.inspect()
-                await observer.start()
-                self._auto_started_observer = True
-            else:
-                game.set_external_observer_active(True)
 
+        # 不在工具调用阶段直接 inspect：用户发送命令时前台可能是抖音/IDE。
+        # 后台自动流程会先把欢乐斗地主切到前台，识别并点击“开始游戏”，
+        # 等正式发牌完成后再启动三家观察器和 EV 循环。
         self._auto_task = asyncio.create_task(
             self._auto_loop(),
             name="baque-plugin-auto-game",
         )
         return {
             "running": True,
-            "message": "八雀自动游戏已启动；三家观察和EV计算同步运行。",
+            "message": "八雀自动游戏启动中：将先切到欢乐斗地主并自动点击“开始游戏”，进入正式牌局后再启动三家记牌和EV。",
             "auto_next_round": game.auto_next_round,
         }
 
     async def _auto_loop(self) -> str:
         game = self._require_game()
+        observer = self.observer
         try:
+            await game.prepare_auto_round()
+
+            if self._auto_stop_event.is_set():
+                self._last_auto_message = "八雀自动游戏已在进入牌局前停止。"
+                return self._last_auto_message
+
+            if observer is not None:
+                game.set_external_observer_active(True)
+                if not observer.running:
+                    await observer.start()
+                    self._auto_started_observer = True
+                    LOGGER.info("八雀启动流程：正式牌局已就绪，三家观察器已启动")
+
             message = await game.run_loop(self._auto_stop_event)
             self._last_auto_message = message
             return message
+        except asyncio.CancelledError:
+            self._last_auto_message = "八雀自动游戏已取消。"
+            return self._last_auto_message
+        except Exception as exc:
+            LOGGER.exception("八雀自动启动/游戏循环失败")
+            self._last_auto_message = f"八雀自动游戏启动失败：{type(exc).__name__}: {exc}"
+            return self._last_auto_message
         finally:
-            observer = self.observer
             if self._auto_started_observer and observer is not None and observer.running:
                 try:
                     await observer.stop()
                 except Exception:
-                    pass
+                    LOGGER.exception("停止八雀自动观察器失败")
             if observer is None or not observer.running:
                 game.set_external_observer_active(False)
             self._auto_started_observer = False
