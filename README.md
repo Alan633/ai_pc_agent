@@ -2,6 +2,28 @@
 
 这是一个可直接运行在 Windows 11 交互式桌面会话中的本地 Agent。手机端通过 Telegram 发送命令或自然语言；本地模型负责理解和规划，本机工具层负责真实读取状态、启动应用、切换窗口和执行输入动作。
 
+## 本地 Qwen 视觉上下文
+
+八雀视觉请求包含截图，Ollama 默认 4096 context 容易出现：
+
+```text
+request (...) exceeds the available context size (4096 tokens)
+```
+
+AIAGENT 已提供 16K 模型配置。Windows 下在项目根目录运行：
+
+```bat
+scripts\setup_ollama_qwen16k.bat
+```
+
+脚本会：
+- 基于本地 `qwen3.5:9b` 创建 `qwen3.5-9b-16k`；
+- 设置 `PARAMETER num_ctx 16384`；
+- 自动备份并更新现有 `.env` 中的 `OPENAI_MODEL` 与 `GAME_VISION_MODEL`；
+- 不删除原来的 `qwen3.5:9b`。
+
+完成后必须彻底停止并重新启动 `main.py`。如果只修改代码、不创建 16K 模型，4096 context 的视觉请求仍可能失败。
+
 ## AIAGENT 分支定位
 
 该分支把项目从“某个游戏的自动化程序”调整为**通用电脑 AI 助手**：
