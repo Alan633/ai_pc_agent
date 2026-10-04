@@ -234,12 +234,48 @@ class OpponentEventVision:
         actor_hint: str = "unknown",
         peak_scores: dict[str, float] | None = None,
     ) -> TableObservation:
+        if self._prefer_chat_completions:
+            raw = await self._classify_chat(
+                before,
+                peak,
+                after,
+                actor_hint=actor_hint,
+                peak_scores=peak_scores or {},
+            )
+        else:
+            try:
+                raw = await self._classify_responses(
+                    before,
+                    peak,
+                    after,
+                    actor_hint=actor_hint,
+                    peak_scores=peak_scores or {},
+                )
+            except Exception:
+                raw = await self._classify_chat(
+                    before,
+                    peak,
+                    after,
+                    actor_hint=actor_hint,
+                    peak_scores=peak_scores or {},
+                )
+        return self._parse(json.loads(self._clean_json(raw)))
+
+    async def _classify_responses(
+        self,
+        before: Path,
+        peak: Path,
+        after: Path,
+        *,
+        actor_hint: str,
+        peak_scores: dict[str, float],
+    ) -> str:
         content: list[dict[str, Any]] = [
             {
                 "type": "input_text",
                 "text": (
                     f"actor_hint={actor_hint}; "
-                    f"local_peak_scores={json.dumps(peak_scores or {}, ensure_ascii=False)}。"
+                    f"local_peak_scores={json.dumps(peak_scores, ensure_ascii=False)}。" 
                     "下面三张图按 BEFORE、PEAK、AFTER 顺序。"
                 ),
             }
@@ -269,8 +305,58 @@ class OpponentEventVision:
                 }
             },
         )
-        return self._parse(json.loads(response.output_text))
+        return response.output_text
 
+    async def _classify_chat(
+        self,
+        before: Path,
+        peak: Path,
+        after: Path,
+        *,
+        actor_hint: str,
+        peak_scores: dict[str, float],
+    ) -> str:
+        prompt = (
+            EVENT_PROMPT
+            + "\nactor_hint="
+            + actor_hint
+            + "; local_peak_scores="
+            + json.dumps(peak_scores, ensure_ascii=False)
+            + "\n严格只输出 JSON 对象，不要 Markdown。JSON Schema：\n"
+            + json.dumps(EVENT_SCHEMA, ensure_ascii=False)
+            + "\n下面三张图片依次是 BEFORE、PEAK、AFTER。"
+        )
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        for path in (before, peak, after):
+            data = base64.b64encode(path.read_bytes()).decode("ascii")
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{data}"},
+                }
+            )
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0,
+        }
+        try:
+            response = await self.client.chat.completions.create(
+                **kwargs,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            response = await self.client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content or ""
+
+    @staticmethod
+    def _clean_json(raw: str) -> str:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.removeprefix("```json").removeprefix("```").strip()
+            raw = raw.removesuffix("```").strip()
+        return raw
     @classmethod
     def _parse(cls, payload: dict[str, Any]) -> TableObservation:
         def card(value: dict[str, Any]) -> ObservedCard:
