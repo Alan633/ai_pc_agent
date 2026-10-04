@@ -1,0 +1,54 @@
+apps:
+  chrome:
+    paths:
+      - "C:/Program Files/Google/Chrome/Application/chrome.exe"
+      - "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"
+      - "%LOCALAPPDATA%/Google/Chrome/Application/chrome.exe"
+    allow_extra_args: false
+
+  edge:
+    paths:
+      - "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+      - "C:/Program Files/Microsoft/Edge/Application/msedge.exe"
+    allow_extra_args: false
+
+  notepad:
+    paths:
+      - "%WINDIR%/System32/notepad.exe"
+    allow_extra_args: false
+
+  explorer:
+    paths:
+      - "%WINDIR%/explorer.exe"
+    allow_extra_args: false
+
+  cmd:
+    paths:
+      - "%WINDIR%/System32/cmd.exe"
+    allow_extra_args: false
+    default_args:
+      - "/K"
+    new_console: true
+
+  powershell:
+    paths:
+      - "%WINDIR%/System32/WindowsPowerShell/v1.0/powershell.exe"
+    allow_extra_args: false
+    default_args:
+      - "-NoExit"
+    new_console: true
+
+  idea:
+    paths:
+      - "C:/Program Files/JetBrains/IntelliJ IDEA/bin/idea64.exe"
+      - "%LOCALAPPDATA%/JetBrains/Toolbox/apps/IDEA-U/ch-0/bin/idea64.exe"
+    allow_extra_args: false
+
+  a_share_recommend:
+    paths:
+      - "F:/AAA/a_share_recommend/.venv/Scripts/python.exe"
+    cwd: "F:/AAA/a_share_recommend"
+    default_args:
+      - "F:/AAA/a_share_recommend/main.py"
+    allow_extra_args: false
+    new_console: true

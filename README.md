@@ -1,0 +1,199 @@
+# AI PC Agent（Windows 11）
+
+这是一个可直接运行在 Windows 11 交互式桌面会话中的本地 Agent。手机端通过 Telegram 发送命令或自然语言；本机只执行预先注册的工具，并将文字结果与截图返回 Telegram。
+
+## 已实现功能
+
+- Telegram 用户白名单：只有 `.env` 中指定的用户 ID 可以操作。
+- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。
+- OpenAI Responses API 工具调用循环，最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
+- 本地白名单应用启动、网页打开、截图、系统状态、鼠标键盘和受管进程。
+- 自然语言阶段只暴露 16 个明确工具；Playwright、UI Automation、文件和 Git 工具当前不向模型开放。
+- 当前不启用视觉 AI 坐标推断；坐标类操作必须由用户明确给出或使用确定性计算。
+- 高 DPI 感知、PyAutoGUI FailSafe、`Ctrl+Alt+F12` 紧急停止、单 AI 任务互斥。
+- 高风险文件、Shell、生产系统和资金操作没有注册工具，模型无法调用。
+- 日志滚动与密钥脱敏。单个工具异常只返回失败结果，不会终止主程序。
+
+## 第二阶段：自然语言 Agent
+
+普通 Telegram 文本会交给 OpenAI Planner，模型只能从以下 16 个工具中选择：
+
+```text
+take_screenshot        get_system_status
+get_active_window      get_mouse_position
+move_mouse             click
+double_click           scroll
+type_text              hotkey
+launch_app             open_url
+list_processes         start_process
+stop_managed_process   wait
+```
+
+应用白名单位于 `config/apps.yaml`。第一版包含 Chrome、Edge、记事本、资源管理器、CMD、PowerShell、IDEA 和 `a_share_recommend`。`cmd`、`powershell` 仅允许打开空窗口，AI 不能传入命令；`start_process` 的 `program` 也必须是 YAML 中的应用名称，不能传入原始可执行路径。
+
+可直接测试以下消息：
+
+```text
+给我看看电脑现在的屏幕
+打开 Chrome
+打开记事本
+把鼠标移动到屏幕中央
+打开百度
+查看当前运行的 Python 程序
+启动 a_share_recommend
+告诉我电脑现在怎么样
+```
+
+任务状态为 `IDLE`、`RUNNING`、`WAITING_CONFIRMATION`、`STOPPING`。同一时间只运行一个任务；`/stop` 会立即取消模型请求或可中断等待，已经进入 Windows 原生调用的操作会安全收尾后停止，不会继续执行下一工具。
+
+删除文件、删除目录、关机、重启、格式化磁盘、安装软件、发送邮件/微信、付款、转账、真实股票下单、生产数据库修改、敏感文件上传等功能在第一版**没有注册工具，因此无法执行**。模型也被明确禁止利用鼠标或浏览器工具绕过这一限制。
+
+## 1. 安装 Python
+
+安装 64 位 Python 3.11 或更高版本，并在安装界面勾选“Add Python to PATH”。在 PowerShell 中确认：
+
+```powershell
+py -3 --version
+```
+
+## 2. 创建 Telegram Bot
+
+1. 在 Telegram 搜索 `@BotFather`。
+2. 发送 `/newbot`，按提示设置名称。
+3. 保存 BotFather 返回的 Token。不要把 Token 发给其他人或提交到 Git。
+
+## 3. 获取 Telegram User ID
+
+在 Telegram 搜索 `@userinfobot`（或其他可信的 User ID 查询 Bot），向它发送任意消息，记录返回的数字 ID。项目使用的是用户 ID，不是用户名。
+
+## 4. 配置 `.env`
+
+在项目目录执行：
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+填写：
+
+```dotenv
+TELEGRAM_BOT_TOKEN=BotFather给出的Token
+ALLOWED_TELEGRAM_USER_ID=你的数字UserID
+OPENAI_API_KEY=你的OpenAI_API_Key
+OPENAI_MODEL=gpt-4.1-mini
+AGENT_ALLOWED_ROOTS=D:\Projects;D:\Work
+```
+
+应用路径和启动参数统一在 `config/apps.yaml` 中维护。模型名称可按账号实际可用模型修改；固定 Telegram 指令不需要 OpenAI Key，自然语言 Agent 必须配置 `OPENAI_API_KEY`。
+
+## 5. 安装依赖
+
+双击 `start.bat` 会自动创建 `.venv` 并安装依赖。也可手动执行：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+## 6. 安装 Playwright Chromium
+
+首次使用 Playwright 前执行：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+playwright install chromium
+```
+
+## 7. 启动
+
+直接双击 `start.bat`，或：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python main.py
+```
+
+看到 `Telegram: Connected` 和 `Agent: READY` 后，在手机上先依次测试 `/start`、`/status`、`/screen`，再测试 `/click 800 500`。最后发送“打开 Chrome”测试自然语言工具调用。
+
+## 8. Windows 权限问题
+
+- Agent 只能操作与它权限级别相同或更低的窗口。若目标程序以管理员身份运行，Agent 也需“以管理员身份运行”。
+- 不建议日常以管理员身份启动；权限越高，误操作影响越大。
+- Windows 锁屏、UAC 安全桌面、断开的 RDP 会话通常不能截图或模拟输入。
+- UI Automation 对不同版本 IDEA/Chrome 的控件树可能不同，可先用自然语言要求 Agent 查找控件。
+
+## 9. 高 DPI 与多显示器
+
+程序在导入 GUI 库前启用 Per-Monitor DPI Awareness，截图坐标使用 PNG 原始像素。第一版已校验坐标范围，但主要按 PyAutoGUI 提供的桌面尺寸工作；混合缩放、多显示器位于主屏左侧（负坐标）等复杂布局需要人工实测。关键操作前建议先 `/screen`，确认截图与坐标一致。
+
+## 10. PyAutoGUI FailSafe
+
+`pyautogui.FAILSAFE = True`。将鼠标快速移动到主屏左上角会触发 FailSafe，使当前鼠标工具失败并将错误返回 Agent。也可以按 `Ctrl+Alt+F12`，或在 Telegram 发送 `/stop`。
+
+`/stop` 是协作式停止：它会立即设置停止信号并取消待确认操作；如果 Windows 原生调用已经开始，会在该次调用返回后安全释放任务锁，避免旧任务与新任务同时控制鼠标。
+
+## 11. 安全注意事项
+
+- `.env`、日志、截图均被 `.gitignore` 排除；截图仍可能含敏感信息，请定期清理。
+- 不要将项目目录、Token、API Key 暴露给不可信用户。
+- `start_process` 只允许白名单程序。Python 只允许执行允许目录中的 `.py` 文件，禁止 `python -c` 和 `python -m`。
+- `run_safe_command` 不使用 `shell=True`，拒绝 Shell 元字符，并限制 Git 子命令。
+- 文件 API 只允许访问 `AGENT_ALLOWED_ROOTS`。文本读取会截断，命令输出也有长度限制。
+- 通用鼠标点击无法理解按钮背后的业务含义。涉及资金、生产系统或敏感信息时不要依赖通用坐标自动化。
+
+## 12. 常见错误
+
+- **`.env 缺少配置`**：确认文件名确实是 `.env`，不是 `.env.txt`。
+- **Unauthorized / 未授权**：检查 User ID 是否为纯数字且属于当前 Telegram 账号。
+- **Conflict: terminated by other getUpdates request**：同一个 Bot Token 有另一个实例正在运行，关闭旧实例。
+- **Chromium executable doesn't exist**：执行 `playwright install chromium`。
+- **未找到 Chrome/IDEA**：当前版本只查找常见安装位置。可在 `tools/browser.py` 增加本机绝对路径。
+- **截图黑屏或失败**：确认处于已登录、未锁屏的本地桌面会话；某些远程桌面断开后无法捕获。
+- **中文输入失败**：`/type` 会通过剪贴板粘贴 Unicode；目标控件阻止粘贴时，改用 UIA 输入。
+- **OpenAI 400/model not found**：将 `.env` 的 `OPENAI_MODEL` 改成账号可用且支持工具调用的模型。
+
+## 13. 设置 Windows 开机启动
+
+推荐使用“任务计划程序”，并选择“仅当用户登录时运行”（GUI 自动化必须有交互式桌面）：
+
+1. 打开“任务计划程序”→“创建任务”。
+2. 触发器选择“登录时”。
+3. 操作选择“启动程序”。
+4. 程序填写项目中的 `start.bat` 完整路径。
+5. “起始于”填写项目目录。
+6. 默认不要勾选“使用最高权限运行”。
+
+## 测试与基础自检
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m compileall .
+pytest
+```
+
+截图测试在没有可交互桌面的环境中会自动跳过。Telegram 和 OpenAI 的真实连通性需要填写 `.env` 后通过 `/start`、`/screen` 和一条自然语言命令验证。
+
+## 项目结构
+
+```text
+ai_pc_agent/
+├── agent/             # 规划、执行、工具注册、安全、会话
+├── telegram_bot/      # 指令、消息、确认回调
+├── tools/             # Windows/浏览器/文件/Git 工具
+├── tests/             # 安全、步骤上限、停止、截图等测试
+├── main.py
+├── config.py
+├── emergency.py
+├── requirements.txt
+├── .env.example
+└── start.bat
+```
+
+## 第一版明确限制
+
+- 不包含 OCR、任意 JavaScript、任意 Shell、文件删除、文件上传和生产系统专用工具。
+- Playwright 使用独立受控 Chromium，不复用个人 Chrome 登录态。
+- UIA 调用无法安全强杀；已设置工具超时的地方会优先超时，`/stop` 会等待正在运行的原生调用收尾。
+- Windows 应用版本、显示器布局和网页 DOM 差异仍需在目标电脑上做一次真实验收。

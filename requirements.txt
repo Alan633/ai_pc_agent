@@ -1,0 +1,13 @@
+python-telegram-bot>=21.6,<23
+openai>=1.54,<3
+python-dotenv>=1.0,<2
+PyYAML>=6.0,<7
+PyAutoGUI>=0.9.54,<1
+Pillow>=10.4,<13
+psutil>=6.0,<8
+playwright>=1.48,<2
+pywinauto>=0.6.9,<1
+pynput>=1.7.7,<2
+pyperclip>=1.9,<2
+pytest>=8.3,<10
+pytest-asyncio>=0.24,<2
