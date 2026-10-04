@@ -11,6 +11,8 @@ import yaml
 @dataclass(frozen=True, slots=True)
 class AppSpec:
     name: str
+    aliases: tuple[str, ...]
+    process_names: tuple[str, ...]
     paths: tuple[Path, ...]
     cwd: Path | None
     default_args: tuple[str, ...]
@@ -28,20 +30,35 @@ class LaunchRecipe:
 
 
 class AppCatalog:
-    """从受信任的本地 YAML 读取应用配方；模型只能引用应用名称。"""
+    """从受信任的本地 YAML 读取应用配方；模型只能引用应用名称或显式别名。"""
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path.resolve()
-        self._apps = self._load()
+        self._apps, self._aliases = self._load()
 
     def names(self) -> tuple[str, ...]:
+        """返回模型可直接使用的规范名和别名。"""
+        return tuple(sorted(self._aliases))
+
+    def canonical_names(self) -> tuple[str, ...]:
         return tuple(sorted(self._apps))
 
-    def resolve(self, program: str, args: list[str] | None = None) -> LaunchRecipe:
-        name = program.strip().lower()
-        spec = self._apps.get(name)
-        if spec is None:
+    def canonical_name(self, program: str) -> str:
+        key = program.strip().casefold()
+        name = self._aliases.get(key)
+        if name is None:
             raise PermissionError(f"应用不在白名单中：{program}；允许：{', '.join(self.names())}")
+        return name
+
+    def process_names(self, program: str) -> tuple[str, ...]:
+        spec = self._apps[self.canonical_name(program)]
+        configured = tuple(name.casefold() for name in spec.process_names if name.strip())
+        derived = tuple(path.name.casefold() for path in spec.paths if path.name)
+        return tuple(dict.fromkeys((*configured, *derived)))
+
+    def resolve(self, program: str, args: list[str] | None = None) -> LaunchRecipe:
+        name = self.canonical_name(program)
+        spec = self._apps[name]
         extra = args or []
         if not isinstance(extra, list) or any(not isinstance(value, str) for value in extra):
             raise TypeError("args 必须是字符串数组")
@@ -50,23 +67,28 @@ class AppCatalog:
         executable = next((path for path in spec.paths if path.is_file()), None)
         if executable is None:
             candidates = ", ".join(str(path) for path in spec.paths)
-            raise FileNotFoundError(f"未找到应用 {name}，已检查：{candidates}")
+            raise FileNotFoundError(
+                f"未找到应用 {name}。已检查：{candidates}。"
+                "如应用安装在自定义目录，请只修改 config/apps.yaml 的白名单路径。"
+            )
         cwd = spec.cwd or executable.parent
         if not cwd.is_dir():
             raise NotADirectoryError(f"应用工作目录不存在：{cwd}")
         command = (str(executable), *spec.default_args, *extra)
         return LaunchRecipe(name, executable, command, cwd, spec.new_console)
 
-    def _load(self) -> dict[str, AppSpec]:
+    def _load(self) -> tuple[dict[str, AppSpec], dict[str, str]]:
         if not self.config_path.is_file():
             raise FileNotFoundError(f"应用配置不存在：{self.config_path}")
         document = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         raw_apps = document.get("apps")
         if not isinstance(raw_apps, dict) or not raw_apps:
             raise ValueError("apps.yaml 必须包含非空 apps 映射")
+
         apps: dict[str, AppSpec] = {}
+        aliases: dict[str, str] = {}
         for raw_name, raw_spec in raw_apps.items():
-            name = str(raw_name).strip().lower()
+            name = str(raw_name).strip().casefold()
             if not name or not isinstance(raw_spec, dict):
                 raise ValueError("应用名称和配置必须有效")
             raw_paths = raw_spec.get("paths")
@@ -78,19 +100,40 @@ class AppCatalog:
             default_args = raw_spec.get("default_args", [])
             if not isinstance(default_args, list) or any(not isinstance(value, str) for value in default_args):
                 raise ValueError(f"应用 {name} 的 default_args 必须是字符串数组")
-            apps[name] = AppSpec(
+
+            raw_aliases = raw_spec.get("aliases", [])
+            if not isinstance(raw_aliases, list) or any(not isinstance(value, str) for value in raw_aliases):
+                raise ValueError(f"应用 {name} 的 aliases 必须是字符串数组")
+            app_aliases = tuple(value.strip().casefold() for value in raw_aliases if value.strip())
+
+            raw_process_names = raw_spec.get("process_names", [])
+            if not isinstance(raw_process_names, list) or any(
+                not isinstance(value, str) for value in raw_process_names
+            ):
+                raise ValueError(f"应用 {name} 的 process_names 必须是字符串数组")
+            process_names = tuple(value.strip() for value in raw_process_names if value.strip())
+
+            spec = AppSpec(
                 name=name,
+                aliases=app_aliases,
+                process_names=process_names,
                 paths=paths,
                 cwd=cwd,
                 default_args=tuple(default_args),
                 allow_extra_args=bool(raw_spec.get("allow_extra_args", False)),
                 new_console=bool(raw_spec.get("new_console", False)),
             )
-        return apps
+            apps[name] = spec
+
+            for alias in (name, *app_aliases):
+                if alias in aliases and aliases[alias] != name:
+                    raise ValueError(f"应用别名重复：{alias}")
+                aliases[alias] = name
+
+        return apps, aliases
 
     @staticmethod
     def _expand_path(value: Any) -> Path:
         if not isinstance(value, str) or not value.strip():
             raise ValueError("应用路径必须是非空字符串")
         return Path(os.path.expandvars(value)).expanduser().resolve()
-
