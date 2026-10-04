@@ -208,7 +208,16 @@ class BaqueGameController:
             if snapshot.screen_type == ScreenType.RECHARGE:
                 raise RuntimeError("检测到豆子不足/充值/购买界面，自动游戏不会继续。")
 
-            if snapshot.screen_type == ScreenType.START:
+            looks_like_start = (
+                snapshot.screen_type == ScreenType.START
+                or (
+                    snapshot.start_button is not None
+                    and snapshot.screen_type in {ScreenType.WAITING, ScreenType.UNKNOWN}
+                    and not snapshot.hand
+                    and not snapshot.gold_ranks
+                )
+            )
+            if looks_like_start:
                 if snapshot.start_button is None:
                     raise RuntimeError(
                         "已进入八雀开始页面，但视觉模型没有可靠识别到“开始游戏”按钮。"
@@ -219,9 +228,10 @@ class BaqueGameController:
                     self._last_action_at = time.monotonic()
                     start_clicked = True
                     LOGGER.info(
-                        "八雀启动流程：自动点击开始游戏 x=%s y=%s",
+                        "八雀启动流程：自动点击开始游戏 x=%s y=%s screen=%s",
                         snapshot.start_button.x,
                         snapshot.start_button.y,
+                        snapshot.screen_type.value,
                     )
                 await asyncio.sleep(0.8)
                 continue
