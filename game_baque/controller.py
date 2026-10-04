@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent.session import AgentSession
-from game_baque.capture import CapturedFrame, assert_game_foreground, capture_game_window
+from game_baque.capture import (
+    CapturedFrame,
+    assert_game_foreground,
+    capture_game_window,
+    focus_game_window,
+)
 from game_baque.ev import ExpectedValueEngine
 from game_baque.event_vision import TableObservation
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
@@ -102,6 +107,30 @@ class BaqueGameController:
         self.step_count += 1
         frame, snapshot = await self.inspect()
 
+        if snapshot.screen_type == ScreenType.START:
+            if snapshot.start_button is None:
+                return GameStepResult(
+                    False,
+                    "已识别到八雀开始页面，但没有可靠识别到“开始游戏”按钮，暂不点击。",
+                    snapshot,
+                    frame,
+                )
+            if execute:
+                await self._click(frame, snapshot.start_button)
+                self.action_count += 1
+                self._last_action_at = time.monotonic()
+                LOGGER.info(
+                    "八雀启动流程：已自动点击开始游戏 x=%s y=%s",
+                    snapshot.start_button.x,
+                    snapshot.start_button.y,
+                )
+            return GameStepResult(
+                execute,
+                "已点击“开始游戏”，等待发牌。" if execute else "当前在开始页面，可点击“开始游戏”。",
+                snapshot,
+                frame,
+            )
+
         if snapshot.screen_type == ScreenType.RECHARGE:
             return GameStepResult(
                 False,
@@ -159,6 +188,74 @@ class BaqueGameController:
         self._last_action_fingerprint = fingerprint
         self._last_action_at = time.monotonic()
         return GameStepResult(True, message, snapshot, frame)
+
+    async def prepare_auto_round(self, timeout_seconds: float = 30.0) -> GameSnapshot:
+        """自动模式启动前，把游戏切到前台并从“开始游戏”页面进入正式牌局。
+
+        只有识别到真实“开始游戏”按钮才点击，不使用固定坐标；进入有 7/8 张手牌
+        和 3 个金牌的正式牌局后才返回，随后插件再启动三家观察器。
+        """
+        await asyncio.to_thread(focus_game_window, self.window_title_keyword)
+        LOGGER.info("八雀启动流程：已切换游戏窗口到前台")
+
+        deadline = time.monotonic() + max(5.0, float(timeout_seconds))
+        start_clicked = False
+        while time.monotonic() < deadline:
+            frame, snapshot = await self.inspect()
+
+            if snapshot.screen_type == ScreenType.RECHARGE:
+                raise RuntimeError("检测到豆子不足/充值/购买界面，自动游戏不会继续。")
+
+            if snapshot.screen_type == ScreenType.START:
+                if snapshot.start_button is None:
+                    raise RuntimeError(
+                        "已进入八雀开始页面，但视觉模型没有可靠识别到“开始游戏”按钮。"
+                    )
+                if not start_clicked:
+                    await self._click(frame, snapshot.start_button)
+                    self.action_count += 1
+                    self._last_action_at = time.monotonic()
+                    start_clicked = True
+                    LOGGER.info(
+                        "八雀启动流程：自动点击开始游戏 x=%s y=%s",
+                        snapshot.start_button.x,
+                        snapshot.start_button.y,
+                    )
+                await asyncio.sleep(0.8)
+                continue
+
+            if snapshot.screen_type == ScreenType.SETTLEMENT:
+                if self.auto_next_round and snapshot.continue_button is not None:
+                    await self._click(frame, snapshot.continue_button)
+                    self.action_count += 1
+                    LOGGER.info("八雀启动流程：结算页自动点击继续")
+                    await asyncio.sleep(0.8)
+                    continue
+                raise RuntimeError(
+                    "当前停在上一局结算页；GAME_AUTO_NEXT_ROUND=false，未自动开始下一局。"
+                )
+
+            if (
+                snapshot.screen_type
+                in {ScreenType.SWAP, ScreenType.DRAW, ScreenType.DISCARD, ScreenType.HU}
+                and len(snapshot.gold_ranks) == 3
+                and len(snapshot.hand) in {7, 8}
+            ):
+                LOGGER.info(
+                    "八雀启动流程：正式牌局已就绪 state=%s hand=%s gold=%s deck=%s",
+                    snapshot.screen_type.value,
+                    len(snapshot.hand),
+                    snapshot.gold_ranks,
+                    snapshot.deck_count,
+                )
+                return snapshot
+
+            # 开始按钮点击后会经历发牌/动画/等待阶段；这期间不误点。
+            await asyncio.sleep(0.8)
+
+        raise TimeoutError(
+            "点击“开始游戏”后 30 秒内仍未识别到正式牌局，已停止自动启动。"
+        )
 
     async def run_loop(self, stop_event: Event | None = None) -> str:
         unknown_streak = 0
