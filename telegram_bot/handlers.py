@@ -16,6 +16,7 @@ from agent.session import AgentSession
 from agent.tool_registry import ToolRegistry
 from config import Settings
 from game_baque.controller import BaqueGameController
+from game_baque.recorder import GameRecorder
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.messages import BUSY, NO_TASK, UNAUTHORIZED, command_usage
 from tools.process import ProcessManager
@@ -33,6 +34,7 @@ class TelegramHandlers:
         processes: ProcessManager,
         confirmations: ConfirmationStore,
         game: BaqueGameController | None = None,
+        game_recorder: GameRecorder | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -41,6 +43,7 @@ class TelegramHandlers:
         self.processes = processes
         self.confirmations = confirmations
         self.game = game
+        self.game_recorder = game_recorder
 
     def install(self, application: Application) -> None:
         commands = {
@@ -59,6 +62,9 @@ class TelegramHandlers:
             "game_step": self.game_step,
             "game_start": self.game_start,
             "game_stop": self.game_stop,
+            "game_record_start": self.game_record_start,
+            "game_record_status": self.game_record_status,
+            "game_record_stop": self.game_record_stop,
             "stop": self.stop,
         }
         for name, callback in commands.items():
@@ -103,6 +109,7 @@ class TelegramHandlers:
                     f"当前前台窗口：{title}",
                     f"Agent 已运行：{str(uptime).split('.')[0]}",
                     f"任务状态：{session.state.value}",
+                    f"牌局采集：{'RUNNING' if self.game_recorder and self.game_recorder.running else 'IDLE'}",
                 ]
             )
         )
@@ -192,8 +199,69 @@ class TelegramHandlers:
         if not await self._authorized(update):
             return
         self.confirmations.cancel_all()
-        stopped = self.session.request_stop()
-        await update.effective_message.reply_text("已发送停止信号。" if stopped else NO_TASK)
+        stopped_agent = self.session.request_stop()
+        stopped_recording = False
+        if self.game_recorder is not None and self.game_recorder.running:
+            await self.game_recorder.stop()
+            stopped_recording = True
+        if stopped_agent or stopped_recording:
+            parts = []
+            if stopped_agent:
+                parts.append("Agent 任务")
+            if stopped_recording:
+                parts.append("牌局采集")
+            await update.effective_message.reply_text("已停止：" + "、".join(parts))
+        else:
+            await update.effective_message.reply_text(NO_TASK)
+
+    async def game_record_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_recorder is None:
+            await update.effective_message.reply_text("牌局采集器未初始化。")
+            return
+        if self.game_recorder.running:
+            await update.effective_message.reply_text(
+                "牌局采集已经在运行。\n" + self.game_recorder.status().to_text()
+            )
+            return
+        try:
+            status = await self.game_recorder.start()
+            await update.effective_message.reply_text(
+                status.to_text()
+                + "\n\n请保持欢乐斗地主窗口在前台，正常手动玩完整一局。"
+                + "\n结束后发送 /game_record_stop。"
+            )
+        except Exception as exc:
+            LOGGER.exception("启动牌局采集失败")
+            await update.effective_message.reply_text(
+                f"启动采集失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def game_record_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_recorder is None:
+            await update.effective_message.reply_text("牌局采集器未初始化。")
+            return
+        await update.effective_message.reply_text(self.game_recorder.status().to_text())
+
+    async def game_record_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_recorder is None:
+            await update.effective_message.reply_text("牌局采集器未初始化。")
+            return
+        if not self.game_recorder.running:
+            await update.effective_message.reply_text(
+                "当前没有正在进行的牌局采集。\n" + self.game_recorder.status().to_text()
+            )
+            return
+        status = await self.game_recorder.stop()
+        await update.effective_message.reply_text(
+            status.to_text()
+            + "\n\n本局数据已保存。后续可根据 events.jsonl 和关键帧训练/调试三家动作识别器。"
+        )
 
     async def game_state(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
