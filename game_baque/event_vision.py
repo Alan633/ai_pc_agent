@@ -352,11 +352,16 @@ class OpponentEventVision:
 
     @staticmethod
     def _clean_json(raw: str) -> str:
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.removeprefix("```json").removeprefix("```").strip()
-            raw = raw.removesuffix("```").strip()
-        return raw
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.removeprefix("```json").removeprefix("```").strip()
+            text = text.removesuffix("```").strip()
+        # Qwen3.5 的 thinking/兼容层偶尔会在 JSON 前后附加说明。
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return text[start : end + 1]
+        return text
     @classmethod
     def _parse(cls, payload: dict[str, Any]) -> TableObservation:
         def card(value: dict[str, Any]) -> ObservedCard:
