@@ -57,8 +57,7 @@ class OpponentPatternModel:
         top_cards: int = 8,
     ) -> list[OpponentInference]:
         sample_count = max(40, samples or self.samples)
-        draw_dist = tracker.draw_distribution()
-        if not draw_dist:
+        if not tracker.draw_distribution():
             return [
                 OpponentInference(
                     seat=seat,
@@ -88,7 +87,16 @@ class OpponentPatternModel:
         hu_score_mass = Counter()
 
         for _ in range(sample_count):
-            hands = tracker.sample_opponent_hands(self.rng)
+            hands, remaining_pool = tracker.sample_world(self.rng)
+            if tracker.known_deck_top:
+                sample_draw_dist = {tracker.known_deck_top[0]: 1.0}
+            else:
+                remaining_total = sum(remaining_pool.values())
+                sample_draw_dist = (
+                    {key: count / remaining_total for key, count in remaining_pool.items()}
+                    if remaining_total > 0
+                    else {}
+                )
             for seat, hand in hands.items():
                 opp = tracker.opponents[seat]
                 if opp.finished or len(hand) != 7:
@@ -96,7 +104,7 @@ class OpponentPatternModel:
 
                 sample_hu_probability = 0.0
                 sample_score = 0.0
-                for key, draw_probability in draw_dist.items():
+                for key, draw_probability in sample_draw_dist.items():
                     hu = evaluate_hu(hand + [card_from_key(key)], gold_ranks)
                     if hu is None:
                         continue
