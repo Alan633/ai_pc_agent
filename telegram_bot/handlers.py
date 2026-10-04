@@ -15,6 +15,7 @@ from agent.executor import AgentExecutor
 from agent.session import AgentSession
 from agent.tool_registry import ToolRegistry
 from config import Settings
+from game_baque.controller import BaqueGameController
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.messages import BUSY, NO_TASK, UNAUTHORIZED, command_usage
 from tools.process import ProcessManager
@@ -31,6 +32,7 @@ class TelegramHandlers:
         session: AgentSession,
         processes: ProcessManager,
         confirmations: ConfirmationStore,
+        game: BaqueGameController | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -38,6 +40,7 @@ class TelegramHandlers:
         self.session = session
         self.processes = processes
         self.confirmations = confirmations
+        self.game = game
 
     def install(self, application: Application) -> None:
         commands = {
@@ -52,6 +55,10 @@ class TelegramHandlers:
             "type": self.type_text,
             "hotkey": self.hotkey,
             "process": self.process,
+            "game_state": self.game_state,
+            "game_step": self.game_step,
+            "game_start": self.game_start,
+            "game_stop": self.game_stop,
             "stop": self.stop,
         }
         for name, callback in commands.items():
@@ -187,6 +194,71 @@ class TelegramHandlers:
         self.confirmations.cancel_all()
         stopped = self.session.request_stop()
         await update.effective_message.reply_text("已发送停止信号。" if stopped else NO_TASK)
+
+    async def game_state(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None:
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY。")
+            return
+        if self.session.status().busy:
+            await update.effective_message.reply_text(BUSY)
+            return
+        try:
+            async with self.session.task_lock:
+                result = await self.game.step(execute=False)
+            await update.effective_message.reply_text(
+                self.game.state_text() + "\n策略预览：" + result.message
+            )
+            if result.frame.path.exists():
+                with result.frame.path.open("rb") as image:
+                    await update.effective_message.reply_photo(image, caption="点字成金识别截图")
+        except Exception as exc:
+            LOGGER.exception("读取点字成金状态失败")
+            await update.effective_message.reply_text(f"识别失败：{type(exc).__name__}: {exc}")
+
+    async def game_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None:
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY。")
+            return
+        if self.session.status().busy:
+            await update.effective_message.reply_text(BUSY)
+            return
+        try:
+            async with self.session.task_lock:
+                result = await self.game.step(execute=True)
+            await update.effective_message.reply_text(result.message)
+        except Exception as exc:
+            LOGGER.exception("执行点字成金单步失败")
+            await update.effective_message.reply_text(f"执行失败：{type(exc).__name__}: {exc}")
+
+    async def game_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None:
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY。")
+            return
+        if self.session.status().busy or self.session.task_lock.locked():
+            await update.effective_message.reply_text(BUSY)
+            return
+        task = context.application.create_task(self._run_game_loop(update), update=update)
+        self.session.begin(task, "点字成金自动游戏")
+        await update.effective_message.reply_text(
+            "点字成金自动游戏已启动。请保持欢乐斗地主窗口在前台；/game_stop 或 /stop 可停止。"
+        )
+
+    async def game_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.stop(update, context)
+
+    async def _run_game_loop(self, update: Update) -> None:
+        try:
+            async with self.session.task_lock:
+                message = await self.game.run_loop() if self.game is not None else "游戏模块不可用。"
+            await update.effective_message.reply_text(message)
+        finally:
+            self.session.finish()
 
     async def natural_language(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
