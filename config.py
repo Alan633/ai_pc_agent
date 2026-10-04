@@ -28,7 +28,6 @@ class Settings:
     game_record_archive_fps: float
     game_record_diff_threshold: float
     game_record_jpeg_quality: int
-    game_opponent_event_confidence: float
     openai_base_url: str = ""
     game_vision_base_url: str = ""
     game_min_event_confidence: float = 0.80
