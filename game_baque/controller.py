@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import time
 from collections import deque
@@ -137,7 +138,9 @@ class BaqueGameController:
             return GameStepResult(False, "画面尚未变化，等待游戏响应。", snapshot, frame)
 
         # EV/蒙特卡洛属于 CPU 密集计算，放到工作线程，避免阻塞 6 FPS 对手观察器。
-        decision = await asyncio.to_thread(self._decide, snapshot)
+        # 决策使用当前 TableTracker 的深拷贝，避免后台观察器在计算过程中修改同一牌池。
+        tracker_snapshot = copy.deepcopy(self.tracker)
+        decision = await asyncio.to_thread(self._decide, snapshot, tracker_snapshot)
         if not execute:
             return GameStepResult(False, decision.reason, snapshot, frame)
 
@@ -180,7 +183,12 @@ class BaqueGameController:
             return "尚未读取游戏画面。"
         return f"{self._snapshot_summary(self.last_snapshot)}\n最近动作：{self.last_message}\n累计动作：{self.action_count}"
 
-    def _decide(self, snapshot: GameSnapshot) -> GameDecision:
+    def _decide(
+        self,
+        snapshot: GameSnapshot,
+        tracker: TableTracker | None = None,
+    ) -> GameDecision:
+        tracker = tracker or self.tracker
         if snapshot.screen_type == ScreenType.SWAP:
             return choose_swap_two(snapshot.hand, snapshot.gold_ranks)
         if snapshot.screen_type == ScreenType.DRAW:
@@ -188,13 +196,13 @@ class BaqueGameController:
                 snapshot.hand,
                 snapshot.visible_cards,
                 snapshot.gold_ranks,
-                self.tracker,
+                tracker,
             )
         if snapshot.screen_type in {ScreenType.DISCARD, ScreenType.HU}:
             decision, values = self.ev.choose_8_card_action(
                 snapshot.hand,
                 snapshot.gold_ranks,
-                self.tracker,
+                tracker,
             )
             LOGGER.info(
                 "八雀EV候选 %s",
