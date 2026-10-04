@@ -296,10 +296,13 @@ class BaqueVision:
         return text
 
     @staticmethod
-    def _to_point(value: dict[str, Any]) -> Point | None:
-        if not value.get("visible", False):
+    def _to_point(value: dict[str, Any] | None) -> Point | None:
+        if not isinstance(value, dict) or not value.get("visible", False):
             return None
-        return Point(int(value["x"]), int(value["y"]))
+        try:
+            return Point(int(value.get("x", 0)), int(value.get("y", 0)))
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _to_card(value: dict[str, Any]) -> Card:
@@ -336,6 +339,14 @@ class BaqueVision:
             detail=str(value.get("detail", "")),
         )
 
+    @staticmethod
+    def _to_deck_count(value: Any) -> int | None:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return None if count < 0 else count
+
     @classmethod
     def _to_snapshot(cls, payload: dict[str, Any]) -> GameSnapshot:
         screen_type = ScreenType(str(payload["screen_type"]))
@@ -345,11 +356,11 @@ class BaqueVision:
             cls._to_opponent_event(item)
             for item in payload.get("opponent_events", [])
         ]
-        deck_click = cls._to_point(payload["deck_click"])
-        swap_button = cls._to_point(payload["swap_button"])
-        discard_button = cls._to_point(payload["discard_button"])
-        hu_button = cls._to_point(payload["hu_button"])
-        continue_button = cls._to_point(payload["continue_button"])
+        deck_click = cls._to_point(payload.get("deck_click"))
+        swap_button = cls._to_point(payload.get("swap_button"))
+        discard_button = cls._to_point(payload.get("discard_button"))
+        hu_button = cls._to_point(payload.get("hu_button"))
+        continue_button = cls._to_point(payload.get("continue_button"))
         start_value = payload.get("start_button")
         start_button = (
             cls._to_point(start_value)
@@ -372,7 +383,7 @@ class BaqueVision:
             hu_button=hu_button,
             start_button=start_button,
             continue_button=continue_button,
-            close_popup=cls._to_point(payload["close_popup"]),
-            deck_count=None if int(payload.get("deck_count", -1)) < 0 else int(payload["deck_count"]),
+            close_popup=cls._to_point(payload.get("close_popup")),
+            deck_count=cls._to_deck_count(payload.get("deck_count", -1)),
             message=str(payload.get("message", "")),
         )
