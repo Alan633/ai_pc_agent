@@ -36,6 +36,7 @@ class BaqueGameController:
         window_title_keyword: str = "欢乐斗地主",
         action_interval_seconds: float = 1.5,
         min_card_confidence: float = 0.72,
+        min_event_confidence: float = 0.80,
         auto_next_round: bool = False,
     ) -> None:
         self.vision = vision
@@ -44,6 +45,7 @@ class BaqueGameController:
         self.window_title_keyword = window_title_keyword
         self.action_interval_seconds = max(0.5, float(action_interval_seconds))
         self.min_card_confidence = min(max(float(min_card_confidence), 0.0), 1.0)
+        self.min_event_confidence = min(max(float(min_event_confidence), 0.0), 1.0)
         self.auto_next_round = bool(auto_next_round)
         self.last_snapshot: GameSnapshot | None = None
         self.last_message = "尚未识别"
@@ -54,6 +56,9 @@ class BaqueGameController:
         self._round_gold_ranks: tuple[str, ...] = ()
         self._last_action_fingerprint: tuple[object, ...] | None = None
         self._last_action_at = 0.0
+        self._previous_frame_path: Path | None = None
+        self._recent_opponent_events: dict[tuple[str, str, str], float] = {}
+        self.opponent_event_count = 0
 
     async def inspect(self) -> tuple[CapturedFrame, GameSnapshot]:
         frame = await asyncio.to_thread(
@@ -61,8 +66,13 @@ class BaqueGameController:
             self.screenshots_dir,
             self.window_title_keyword,
         )
-        snapshot = await self.vision.parse(frame.path)
+        snapshot = await self.vision.parse(
+            frame.path,
+            previous_image_path=self._previous_frame_path,
+        )
+        self._previous_frame_path = frame.path
         self._sync_tracker(snapshot)
+        self._apply_opponent_events(snapshot)
         self.last_snapshot = snapshot
         self.last_message = self._snapshot_summary(snapshot)
         return frame, snapshot
@@ -257,7 +267,7 @@ class BaqueGameController:
     def opponent_state_text(self) -> str:
         if not self._tracker_started:
             return "对手记牌：尚未建立本局状态。"
-        lines = ["对手记牌："]
+        lines = [f"对手记牌：已接收 {self.opponent_event_count} 个实时事件"]
         for seat, data in self.tracker.opponent_known_summary().items():
             known = data["known_hand"]
             known_text = "、".join(f"{key}×{count}" for key, count in known.items()) or "无"
@@ -292,6 +302,74 @@ class BaqueGameController:
                 )
         return "\n".join(lines)
 
+    def _apply_opponent_events(self, snapshot: GameSnapshot) -> None:
+        if not self._tracker_started or not snapshot.opponent_events:
+            return
+
+        now = time.monotonic()
+        ttl_seconds = 2.5
+        self._recent_opponent_events = {
+            signature: seen_at
+            for signature, seen_at in self._recent_opponent_events.items()
+            if now - seen_at <= ttl_seconds
+        }
+
+        for event in snapshot.opponent_events:
+            if event.confidence < self.min_event_confidence:
+                LOGGER.info(
+                    "忽略低置信度对手事件 seat=%s action=%s confidence=%.2f",
+                    event.seat,
+                    event.action,
+                    event.confidence,
+                )
+                continue
+
+            card_key = "NONE"
+            if event.card is not None:
+                card_key = "WILD" if event.card.wild else f"{event.card.rank}:{event.card.suit}"
+            signature = (event.seat, event.action, card_key)
+            if signature in self._recent_opponent_events:
+                continue
+
+            try:
+                if event.action == "draw_deck":
+                    self.tracker.record_opponent_draw_deck(event.seat)
+                elif event.action == "take_visible":
+                    if event.card is None:
+                        LOGGER.warning("拿亮牌事件缺少牌，已忽略 seat=%s", event.seat)
+                        continue
+                    self.tracker.record_opponent_take_visible(event.seat, event.card)
+                elif event.action == "discard":
+                    if event.card is None:
+                        LOGGER.warning("出牌事件缺少牌，已忽略 seat=%s", event.seat)
+                        continue
+                    self.tracker.record_opponent_discard(event.seat, event.card)
+                elif event.action == "finished":
+                    self.tracker.mark_finished(event.seat)
+                else:
+                    LOGGER.warning("未知对手事件 action=%s", event.action)
+                    continue
+            except (ValueError, RuntimeError) as exc:
+                LOGGER.warning(
+                    "对手事件与当前记牌状态冲突，已忽略 seat=%s action=%s card=%s error=%s",
+                    event.seat,
+                    event.action,
+                    card_key,
+                    exc,
+                )
+                continue
+
+            self._recent_opponent_events[signature] = now
+            self.opponent_event_count += 1
+            LOGGER.info(
+                "写入对手事件 seat=%s action=%s card=%s confidence=%.2f detail=%s",
+                event.seat,
+                event.action,
+                card_key,
+                event.confidence,
+                event.detail,
+            )
+
     def _sync_tracker(self, snapshot: GameSnapshot) -> None:
         if len(snapshot.gold_ranks) != 3 or len(snapshot.hand) not in {7, 8}:
             return
@@ -310,6 +388,8 @@ class BaqueGameController:
             self.tracker.reset_round(snapshot.hand, snapshot.deck_count)
             self._tracker_started = True
             self._round_gold_ranks = new_gold
+            self._recent_opponent_events.clear()
+            self.opponent_event_count = 0
             LOGGER.info("建立新一局记牌状态 gold=%s deck=%s", new_gold, snapshot.deck_count)
             return
         self.tracker.update_own_hand(snapshot.hand)
