@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 from collections.abc import Coroutine
 from typing import Any, TypeVar
@@ -64,7 +65,13 @@ class AgentSession:
             coroutine.close()
             raise RuntimeError("不能在主事件循环线程同步等待异步工具")
         future = asyncio.run_coroutine_threadsafe(coroutine, loop)
-        return future.result(timeout=max(1.0, timeout))
+        try:
+            return future.result(timeout=max(1.0, timeout))
+        except concurrent.futures.TimeoutError as exc:
+            # result() 超时不会自动停止主循环里的协程；显式取消可防止工具已
+            # 向模型报告失败后，旧协程仍在后台继续识别或点击。
+            future.cancel()
+            raise TimeoutError(f"异步工具执行超过 {max(1.0, timeout):g} 秒，已取消") from exc
 
     def begin(self, task: asyncio.Task[object], description: str) -> None:
         self.stop_event.clear()

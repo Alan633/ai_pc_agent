@@ -325,7 +325,7 @@ class OpponentEventVision:
                 "type": "input_text",
                 "text": (
                     f"actor_hint={actor_hint}; "
-                    f"local_peak_scores={json.dumps(peak_scores, ensure_ascii=False)}。" 
+                    f"local_peak_scores={json.dumps(peak_scores, ensure_ascii=False)}。"
                     "下面三张图按 BEFORE、PEAK、AFTER 顺序。"
                 ),
             }

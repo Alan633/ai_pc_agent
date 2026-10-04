@@ -34,8 +34,10 @@ class AgentExecutor:
         started = time.monotonic()
         artifacts = []
         steps = 0
+        active_response_id: str | None = None
         try:
             plan = await self.planner.first(user_text)
+            active_response_id = plan.response_id
             while steps < self.max_steps:
                 if self.session.stop_event.is_set():
                     return TaskOutcome(False, "任务已停止。", steps, artifacts)
@@ -65,6 +67,7 @@ class AgentExecutor:
                 if self.session.stop_event.is_set():
                     return TaskOutcome(False, "任务已停止。", steps, artifacts)
                 plan = await self.planner.next(plan.response_id, call.call_id, result)
+                active_response_id = plan.response_id
             return TaskOutcome(False, f"已达到最大步骤数 {self.max_steps}，任务自动停止。", steps, artifacts)
         except asyncio.CancelledError:
             return TaskOutcome(False, "任务已停止。", steps, artifacts)
@@ -72,4 +75,7 @@ class AgentExecutor:
             LOGGER.exception("Agent 任务异常")
             return TaskOutcome(False, f"Agent 任务失败：{type(exc).__name__}: {exc}", steps, artifacts)
         finally:
+            discard = getattr(self.planner, "discard", None)
+            if callable(discard):
+                discard(active_response_id)
             LOGGER.info("任务结束 steps=%s duration=%.2fs", steps, time.monotonic() - started)

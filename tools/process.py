@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -49,15 +50,23 @@ class ProcessManager:
 
     def is_app_running(self, app_name: str) -> dict[str, Any]:
         canonical = self.catalog.canonical_name(app_name)
-        names = set(self.catalog.process_names(canonical))
         pids: list[int] = []
         matched_names: list[str] = []
-        for proc in psutil.process_iter(["pid", "name"]):
+        for proc in psutil.process_iter(["pid", "name", "exe", "cmdline"]):
             try:
                 name = str(proc.info.get("name") or "")
-                if name.casefold() in names:
-                    pids.append(int(proc.info["pid"]))
-                    matched_names.append(name)
+                pid = int(proc.info["pid"])
+                if pid == os.getpid():
+                    continue
+                if not self.catalog.matches_process(
+                    canonical,
+                    name=name,
+                    executable=proc.info.get("exe"),
+                    command_line=proc.info.get("cmdline") or (),
+                ):
+                    continue
+                pids.append(pid)
+                matched_names.append(name)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
         return {

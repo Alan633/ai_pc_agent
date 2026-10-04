@@ -8,6 +8,16 @@ from typing import Any
 import yaml
 
 
+_SHARED_INTERPRETER_NAMES = {
+    "python",
+    "python.exe",
+    "python3",
+    "python3.exe",
+    "pythonw",
+    "pythonw.exe",
+}
+
+
 @dataclass(frozen=True, slots=True)
 class AppSpec:
     name: str
@@ -55,6 +65,40 @@ class AppCatalog:
         configured = tuple(name.casefold() for name in spec.process_names if name.strip())
         derived = tuple(path.name.casefold() for path in spec.paths if path.name)
         return tuple(dict.fromkeys((*configured, *derived)))
+
+    def matches_process(
+        self,
+        program: str,
+        *,
+        name: str,
+        executable: str | None = None,
+        command_line: list[str] | tuple[str, ...] | None = None,
+    ) -> bool:
+        """判断系统进程是否确实属于白名单应用。
+
+        普通桌面应用可按其专用进程名识别；Python 这类共享解释器必须同时
+        匹配白名单解释器路径和默认启动参数，避免把其他脚本当成目标应用。
+        """
+        spec = self._apps[self.canonical_name(program)]
+        process_name = name.strip().casefold()
+        if process_name not in self.process_names(spec.name):
+            return False
+        if process_name not in _SHARED_INTERPRETER_NAMES:
+            return True
+        if not executable or not spec.default_args:
+            return False
+
+        allowed_executables = {self._normalize_path(path) for path in spec.paths}
+        if self._normalize_path(executable) not in allowed_executables:
+            return False
+
+        actual_arguments = {
+            self._normalize_argument(value) for value in (command_line or ())[1:]
+        }
+        required_arguments = {
+            self._normalize_argument(value) for value in spec.default_args
+        }
+        return required_arguments.issubset(actual_arguments)
 
     def resolve(self, program: str, args: list[str] | None = None) -> LaunchRecipe:
         name = self.canonical_name(program)
@@ -137,3 +181,14 @@ class AppCatalog:
         if not isinstance(value, str) or not value.strip():
             raise ValueError("应用路径必须是非空字符串")
         return Path(os.path.expandvars(value)).expanduser().resolve()
+
+    @staticmethod
+    def _normalize_path(value: str | Path) -> str:
+        return os.path.normcase(os.path.normpath(str(Path(value).expanduser().resolve())))
+
+    @classmethod
+    def _normalize_argument(cls, value: str) -> str:
+        text = str(value).strip()
+        if Path(text).is_absolute():
+            return cls._normalize_path(text)
+        return text.casefold()

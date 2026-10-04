@@ -72,6 +72,11 @@ class OpenAIPlanner:
         self.chat_tools = [self._to_chat_tool(schema) for schema in tool_schemas]
         self._chat_histories: dict[str, list[dict[str, Any]]] = {}
 
+    def discard(self, response_id: str | None) -> None:
+        """丢弃未完成的本地模型会话，供任务取消和步数耗尽时清理。"""
+        if response_id:
+            self._chat_histories.pop(response_id, None)
+
     async def first(self, user_text: str) -> PlanResponse:
         if self.client is None:
             raise RuntimeError("OPENAI_API_KEY 或 OPENAI_BASE_URL 尚未配置；Telegram 基础指令仍可正常使用。")
