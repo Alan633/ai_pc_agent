@@ -292,10 +292,11 @@ class TelegramHandlers:
             return
 
         try:
-            async with self.session.task_lock:
-                # 先读取一次自己的 7/8 张手牌、金牌和牌堆数量，初始化 TableTracker。
-                await self.game.inspect()
+            # 先关闭旧的“两帧差分事件”路径，避免上一张历史截图被误当成本局事件。
             self.game.set_external_observer_active(True)
+            async with self.session.task_lock:
+                # 只读取当前帧，建立自己的 7/8 张手牌、金牌和牌堆基线。
+                await self.game.inspect()
             status = await self.game_observer.start()
             await update.effective_message.reply_text(
                 status.to_text()
@@ -402,9 +403,9 @@ class TelegramHandlers:
                     return
 
                 if self.game_observer is not None and not self.game_observer.running:
-                    # 先建立本局基线，再开启高频三家观察；否则开局动画容易被误当成对手动作。
-                    await self.game.inspect()
+                    # 先关闭旧两帧事件路径，再用单帧建立本局基线，避免历史截图污染记牌。
                     self.game.set_external_observer_active(True)
+                    await self.game.inspect()
                     await self.game_observer.start()
                     observer_started_here = True
 
