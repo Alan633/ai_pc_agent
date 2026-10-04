@@ -23,9 +23,10 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
 5. 每张手牌的 x/y 要放在“该牌自己可点击的暴露区域”中心，优先取牌面上方的点数/花色附近，避免落在被右侧牌遮住的区域。若手牌明显被抬高/高亮表示已选中，selected=true。
 6. visible_cards 只返回当前提示“请从牌堆或亮牌中选择一张牌”时，桌面上真正正面朝上且可选择的亮牌；问号背面牌、对手手牌、历史弃牌不要放进去。
 7. deck_click 是当前牌堆（蓝色背面、通常带剩余张数）的可点击中心。
-8. 识别按钮中心：换牌、出牌、胡牌、继续/再来一局。不可见时 visible=false。
-9. 若出现“豆子不足啦”、充值、钻石购买等弹窗，screen_type 必须为 recharge。不要把任何购买按钮当作 continue_button。
+8. 识别按钮中心：开始游戏、换牌、出牌、胡牌、继续/再来一局。不可见时 visible=false。
+9. 若出现“豆子不足啦”、充值、钻石购买等弹窗，screen_type 必须为 recharge。不要把任何购买按钮当作 start_button 或 continue_button。
 10. screen_type：
+   - start：已经进入“百变八雀·点字成金”桌面，但牌局尚未开始，界面中央有明显橙色“开始游戏”按钮；
    - swap：开局换2张；
    - draw：提示从牌堆或亮牌中选一张，自己手牌通常 7 张；
    - discard：自己已取得第8张，需要选择1张并点击出牌；
@@ -98,7 +99,7 @@ SNAPSHOT_SCHEMA = {
     "properties": {
         "screen_type": {
             "type": "string",
-            "enum": ["swap", "draw", "discard", "hu", "waiting", "settlement", "recharge", "unknown"],
+            "enum": ["start", "swap", "draw", "discard", "hu", "waiting", "settlement", "recharge", "unknown"],
         },
         "gold_ranks": {
             "type": "array",
@@ -112,6 +113,7 @@ SNAPSHOT_SCHEMA = {
         "swap_button": _point_schema(),
         "discard_button": _point_schema(),
         "hu_button": _point_schema(),
+        "start_button": _point_schema(),
         "continue_button": _point_schema(),
         "close_popup": _point_schema(),
         "deck_count": {"type": "integer"},
@@ -127,6 +129,7 @@ SNAPSHOT_SCHEMA = {
         "swap_button",
         "discard_button",
         "hu_button",
+        "start_button",
         "continue_button",
         "close_popup",
         "deck_count",
@@ -319,6 +322,7 @@ class BaqueVision:
             swap_button=cls._to_point(payload["swap_button"]),
             discard_button=cls._to_point(payload["discard_button"]),
             hu_button=cls._to_point(payload["hu_button"]),
+            start_button=cls._to_point(payload["start_button"]),
             continue_button=cls._to_point(payload["continue_button"]),
             close_popup=cls._to_point(payload["close_popup"]),
             deck_count=None if int(payload.get("deck_count", -1)) < 0 else int(payload["deck_count"]),
