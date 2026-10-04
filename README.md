@@ -1,40 +1,73 @@
 # AI PC Agent（Windows 11）
 
-这是一个可直接运行在 Windows 11 交互式桌面会话中的本地 Agent。手机端通过 Telegram 发送命令或自然语言；本机只执行预先注册的工具，并将文字结果与截图返回 Telegram。
+这是一个可直接运行在 Windows 11 交互式桌面会话中的本地 Agent。手机端通过 Telegram 发送命令或自然语言；本地模型负责理解和规划，本机工具层负责真实读取状态、启动应用、切换窗口和执行输入动作。
+
+## AIAGENT 分支定位
+
+该分支把项目从“某个游戏的自动化程序”调整为**通用电脑 AI 助手**：
+
+```text
+Telegram / 后续语音入口
+        ↓
+本地 Qwen3.5:9b / OpenAI
+        ↓
+Agent Planner + Tool Router
+        ↓
+Windows 工具层
+  ├─ 应用：启动 / 检查运行 / 置前 / 关闭
+  ├─ 窗口：枚举 / 获取前台 / 按标题置前
+  ├─ 屏幕：截图
+  ├─ 输入：鼠标 / 键盘
+  ├─ 系统：CPU / 内存 / 进程
+  └─ 插件：点字成金等专项能力
+```
+
+点字成金现在通过 `plugins/baque.py` 组装，`game_baque/` 保留原来的视觉、记牌、对手模型和 EV 引擎。主程序只把它当作一个插件，不再以游戏作为 Agent 核心。
+
+当配置 `OPENAI_BASE_URL`（例如 Ollama）时，规划器自动走 OpenAI-compatible **Chat Completions + function calling**。对于部分本地模型偶尔把工具请求输出成 JSON 文本的情况，还提供“仅限已注册工具”的 JSON 兜底解析。因此模型收到“微信有没有运行”“打开抖音”时，应先实际调用本机工具，而不是回答“我无法查看你的设备”。
 
 ## 已实现功能
 
 - Telegram 用户白名单：只有 `.env` 中指定的用户 ID 可以操作。
-- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。\n- 点字成金：`/game_state`、`/game_step`、`/game_start`、`/game_stop`。\n- 牌局采集：`/game_record_start`、`/game_record_status`、`/game_record_stop`。
-- OpenAI Responses API 工具调用循环，最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
-- 本地白名单应用启动、网页打开、截图、系统状态、鼠标键盘和受管进程。
-- 自然语言阶段只暴露 16 个明确工具；Playwright、UI Automation、文件和 Git 工具当前不向模型开放。
+- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。
+- 点字成金：`/game_state`、`/game_step`、`/game_start`、`/game_stop`。
+- 牌局采集：`/game_record_start`、`/game_record_status`、`/game_record_stop`。
+- OpenAI 官方接口使用 Responses API；配置本地 `OPENAI_BASE_URL` 时使用 Chat Completions/function calling。最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
+- 本地白名单应用启动、运行状态检测、窗口置前、确认后关闭、网页打开、截图、系统状态、鼠标键盘和受管进程。
+- 自然语言阶段暴露 22 个明确工具；窗口枚举/置前使用 Windows UI Automation，但更高风险的通用 UIA 点击、文件和 Git 工具仍不向模型开放。
 - 当前不启用视觉 AI 坐标推断；坐标类操作必须由用户明确给出或使用确定性计算。
 - 高 DPI 感知、PyAutoGUI FailSafe、`Ctrl+Alt+F12` 紧急停止、单 AI 任务互斥。
 - 高风险文件、Shell、生产系统和资金操作没有注册工具，模型无法调用。
 - 日志滚动与密钥脱敏。单个工具异常只返回失败结果，不会终止主程序。
 
-## 第二阶段：自然语言 Agent
+## 通用自然语言 Agent
 
-普通 Telegram 文本会交给 OpenAI Planner，模型只能从以下 16 个工具中选择：
+普通 Telegram 文本会交给 Planner。模型只能从已注册的 22 个工具中选择：
 
 ```text
+launch_app             is_app_running
+focus_app              close_app
+list_windows           focus_window
 take_screenshot        get_system_status
 get_active_window      get_mouse_position
 move_mouse             click
 double_click           scroll
-type_text              hotkey
-launch_app             open_url
+type_text              press_key
+hotkey                 open_url
 list_processes         start_process
 stop_managed_process   wait
 ```
 
-应用白名单位于 `config/apps.yaml`。第一版包含 Chrome、Edge、记事本、资源管理器、CMD、PowerShell、IDEA 和 `a_share_recommend`。`cmd`、`powershell` 仅允许打开空窗口，AI 不能传入命令；`start_process` 的 `program` 也必须是 YAML 中的应用名称，不能传入原始可执行路径。
+应用白名单位于 `config/apps.yaml`。AIAGENT 分支包含 Chrome、Edge、微信、抖音、记事本、资源管理器、CMD、PowerShell、IDEA 和 `a_share_recommend`，并支持“微信/weixin”“抖音/douyin”等别名。`cmd`、`powershell` 仅允许打开空窗口，AI 不能传入命令；`start_process` 的 `program` 也必须是 YAML 中的应用名称，不能传入原始可执行路径。
 
 可直接测试以下消息：
 
 ```text
 给我看看电脑现在的屏幕
+微信有没有运行
+打开微信
+切到微信
+打开抖音
 打开 Chrome
 打开记事本
 把鼠标移动到屏幕中央
@@ -96,7 +129,7 @@ OPENAI_MODEL=qwen3.5:9b
 OPENAI_BASE_URL=http://127.0.0.1:11434/v1
 ```
 
-Ollama 不校验 `OPENAI_API_KEY`，这里的 `ollama` 只是 OpenAI SDK 要求的占位值。项目通过 Telegram long polling 收到消息后，会把普通文本交给该本地接口；`/status`、`/screen` 等固定指令不经过模型。
+Ollama 不校验 `OPENAI_API_KEY`，这里的 `ollama` 只是 OpenAI SDK 要求的占位值。项目通过 Telegram long polling 收到消息后，会把普通文本交给该本地接口；`/status`、`/screen` 等固定指令不经过模型。配置了 `OPENAI_BASE_URL` 后会自动使用 Chat Completions/function calling，适配本地 `qwen3.5:9b`。
 
 ## 5. 安装依赖
 
