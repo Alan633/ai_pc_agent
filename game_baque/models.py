@@ -59,12 +59,22 @@ class Point:
     y: int
 
 
+@dataclass(frozen=True, slots=True)
+class OpponentEvent:
+    seat: str
+    action: str
+    card: Card | None = None
+    confidence: float = 1.0
+    detail: str = ""
+
+
 @dataclass(slots=True)
 class GameSnapshot:
     screen_type: ScreenType
     gold_ranks: tuple[str, ...] = ()
     hand: list[Card] = field(default_factory=list)
     visible_cards: list[Card] = field(default_factory=list)
+    opponent_events: list[OpponentEvent] = field(default_factory=list)
     deck_click: Point | None = None
     swap_button: Point | None = None
     discard_button: Point | None = None
