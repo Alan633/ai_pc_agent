@@ -232,16 +232,25 @@ class TableTracker:
             return {}
         return {key: value / total for key, value in unseen.items()}
 
-    def sample_opponent_hands(
+    def sample_world(
         self,
         rng: random.Random | None = None,
-    ) -> dict[str, list[Card]]:
-        """从当前条件分布采样 3 家可能手牌。
+    ) -> tuple[dict[str, list[Card]], Counter[CardKey]]:
+        """采样三家隐藏手牌，并返回采样后仍可能位于牌堆中的剩余牌池。
 
-        已知的亮牌/机会牌会固定在对应玩家手中；其余未知手牌从未见牌池无放回采样。
+        已知牌堆顶部会先从隐藏手牌抽样池中保留，避免把“已知未来牌”错误分配给对手。
         """
         rng = rng or random.Random()
         pool = self.unseen_counts(include_opportunity=False)
+
+        reserved_top: Counter[CardKey] = Counter(self.known_deck_top)
+        for key, count in reserved_top.items():
+            if pool[key] < count:
+                raise RuntimeError(f"已知牌堆顶部与牌池冲突：{key}")
+            pool[key] -= count
+            if pool[key] == 0:
+                del pool[key]
+
         result: dict[str, list[Card]] = {}
 
         def draw_one() -> CardKey:
@@ -250,7 +259,7 @@ class TableTracker:
                 raise RuntimeError("未见牌池不足以采样对手手牌")
             pick = rng.randrange(total)
             cursor = 0
-            for key, count in pool.items():
+            for key, count in tuple(pool.items()):
                 cursor += count
                 if pick < cursor:
                     pool[key] -= 1
@@ -266,7 +275,18 @@ class TableTracker:
             for _ in range(opp.unknown_hand_count):
                 cards.append(card_from_key(draw_one()))
             result[seat] = cards
-        return result
+
+        # 采样完对手隐藏手牌后，把已知顶部重新放回“牌堆剩余池”。
+        pool.update(reserved_top)
+        return result, pool
+
+    def sample_opponent_hands(
+        self,
+        rng: random.Random | None = None,
+    ) -> dict[str, list[Card]]:
+        """兼容接口：仅返回从当前条件分布采样得到的三家可能手牌。"""
+        hands, _ = self.sample_world(rng)
+        return hands
 
     def opponent_known_summary(self) -> dict[str, dict[str, object]]:
         return {
