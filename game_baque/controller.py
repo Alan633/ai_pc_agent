@@ -59,9 +59,10 @@ class BaqueGameController:
         self._last_action_fingerprint: tuple[object, ...] | None = None
         self._last_action_at = 0.0
         self._observation_dedupe: deque[tuple[float, tuple[object, ...]]] = deque(maxlen=24)
-        self._recent_opponent_events: deque[str] = deque(maxlen=12)
+        self._observer_recent_events: deque[str] = deque(maxlen=12)
         self._previous_frame_path: Path | None = None
-        self._recent_opponent_events: dict[tuple[str, str, str], float] = {}
+        self._pair_event_dedupe: dict[tuple[str, str, str], float] = {}
+        self.external_observer_active = False
         self.opponent_event_count = 0
 
     async def inspect(self) -> tuple[CapturedFrame, GameSnapshot]:
@@ -72,11 +73,14 @@ class BaqueGameController:
         )
         snapshot = await self.vision.parse(
             frame.path,
-            previous_image_path=self._previous_frame_path,
+            previous_image_path=(
+                None if self.external_observer_active else self._previous_frame_path
+            ),
         )
         self._previous_frame_path = frame.path
         self._sync_tracker(snapshot)
-        self._apply_opponent_events(snapshot)
+        if not self.external_observer_active:
+            self._apply_opponent_events(snapshot)
         # 当前截图里的 deck_count 是视觉观察到的最终状态；
         # 对手暗摸事件会先按事件语义减 1，这里再用观察值校准，避免双重扣减。
         if snapshot.deck_count is not None and self._tracker_started:
@@ -316,9 +320,9 @@ class BaqueGameController:
 
         now = time.monotonic()
         ttl_seconds = 2.5
-        self._recent_opponent_events = {
+        self._pair_event_dedupe = {
             signature: seen_at
-            for signature, seen_at in self._recent_opponent_events.items()
+            for signature, seen_at in self._pair_event_dedupe.items()
             if now - seen_at <= ttl_seconds
         }
 
@@ -336,7 +340,7 @@ class BaqueGameController:
             if event.card is not None:
                 card_key = "WILD" if event.card.wild else f"{event.card.rank}:{event.card.suit}"
             signature = (event.seat, event.action, card_key)
-            if signature in self._recent_opponent_events:
+            if signature in self._pair_event_dedupe:
                 continue
 
             try:
@@ -367,7 +371,7 @@ class BaqueGameController:
                 )
                 continue
 
-            self._recent_opponent_events[signature] = now
+            self._pair_event_dedupe[signature] = now
             self.opponent_event_count += 1
             LOGGER.info(
                 "写入对手事件 seat=%s action=%s card=%s confidence=%.2f detail=%s",
@@ -396,7 +400,9 @@ class BaqueGameController:
             self.tracker.reset_round(snapshot.hand, snapshot.deck_count)
             self._tracker_started = True
             self._round_gold_ranks = new_gold
-            self._recent_opponent_events.clear()
+            self._pair_event_dedupe.clear()
+            self._observation_dedupe.clear()
+            self._observer_recent_events.clear()
             self.opponent_event_count = 0
             LOGGER.info("建立新一局记牌状态 gold=%s deck=%s", new_gold, snapshot.deck_count)
             return
@@ -478,15 +484,21 @@ class BaqueGameController:
         if observation.deck_after >= 0:
             self.tracker.set_deck_count(observation.deck_after)
         self._observation_dedupe.append((now, signature))
-        self._recent_opponent_events.append(observation.summary())
+        self._observer_recent_events.append(observation.summary())
+        self.opponent_event_count += 1
         LOGGER.info("已采用对手事件：%s", observation.summary())
         return True
 
+    def set_external_observer_active(self, active: bool) -> None:
+        self.external_observer_active = bool(active)
+        if active:
+            self._previous_frame_path = None
+
     def recent_opponent_events_text(self) -> str:
-        if not self._recent_opponent_events:
+        if not self._observer_recent_events:
             return "最近对手事件：暂无"
         return "最近对手事件：\n" + "\n".join(
-            f"- {item}" for item in list(self._recent_opponent_events)[-6:]
+            f"- {item}" for item in list(self._observer_recent_events)[-6:]
         )
 
     async def _click_card(self, frame: CapturedFrame, card: Card) -> None:
