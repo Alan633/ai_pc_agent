@@ -267,7 +267,7 @@ class TelegramHandlers:
         if not await self._authorized(update):
             return
         if self.game is None:
-            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY。")
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
             return
         if self.session.status().busy:
             await update.effective_message.reply_text(BUSY)
@@ -293,7 +293,7 @@ class TelegramHandlers:
         if not await self._authorized(update):
             return
         if self.game is None:
-            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY。")
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
             return
         if self.session.status().busy:
             await update.effective_message.reply_text(BUSY)
@@ -310,7 +310,7 @@ class TelegramHandlers:
         if not await self._authorized(update):
             return
         if self.game is None:
-            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY。")
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
             return
         if self.session.status().busy or self.session.task_lock.locked():
             await update.effective_message.reply_text(BUSY)
