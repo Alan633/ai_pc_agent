@@ -24,6 +24,10 @@ class Settings:
     game_action_interval_seconds: float
     game_min_card_confidence: float
     game_auto_next_round: bool
+    game_record_fps: float
+    game_record_archive_fps: float
+    game_record_diff_threshold: float
+    game_record_jpeg_quality: int
 
     @property
     def logs_dir(self) -> Path:
@@ -33,9 +37,14 @@ class Settings:
     def screenshots_dir(self) -> Path:
         return self.base_dir / "screenshots"
 
+    @property
+    def game_recordings_dir(self) -> Path:
+        return self.base_dir / "game_recordings"
+
     def prepare_directories(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self.game_recordings_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -97,6 +106,10 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_action_interval_seconds=max(float(os.getenv("GAME_ACTION_INTERVAL_SECONDS", "1.5")), 0.5),
         game_min_card_confidence=game_confidence,
         game_auto_next_round=_env_bool("GAME_AUTO_NEXT_ROUND"),
+        game_record_fps=min(max(float(os.getenv("GAME_RECORD_FPS", "6")), 1.0), 12.0),
+        game_record_archive_fps=max(float(os.getenv("GAME_RECORD_ARCHIVE_FPS", "2")), 0.2),
+        game_record_diff_threshold=min(max(float(os.getenv("GAME_RECORD_DIFF_THRESHOLD", "0.028")), 0.001), 0.30),
+        game_record_jpeg_quality=min(max(int(os.getenv("GAME_RECORD_JPEG_QUALITY", "78")), 40), 95),
     )
     settings.prepare_directories()
     return settings
