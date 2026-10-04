@@ -11,6 +11,8 @@ from agent.security import SecurityPolicy
 from agent.session import AgentSession
 from config import load_settings
 from emergency import EmergencyHotkey
+from game_baque.controller import BaqueGameController
+from game_baque.vision import BaqueVision
 from logging_setup import configure_logging
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.handlers import TelegramHandlers
@@ -36,6 +38,18 @@ def main() -> None:
     confirmations = ConfirmationStore()
     emergency = EmergencyHotkey(session)
 
+    game: BaqueGameController | None = None
+    if settings.openai_api_key:
+        game = BaqueGameController(
+            vision=BaqueVision(settings.openai_api_key, settings.game_vision_model),
+            screenshots_dir=settings.screenshots_dir,
+            session=session,
+            window_title_keyword=settings.game_window_title_keyword,
+            action_interval_seconds=settings.game_action_interval_seconds,
+            min_card_confidence=settings.game_min_card_confidence,
+            auto_next_round=settings.game_auto_next_round,
+        )
+
     async def post_init(application: Application) -> None:
         session.attach_loop(asyncio.get_running_loop())
         emergency.start()
@@ -53,6 +67,7 @@ def main() -> None:
                     f"OpenAI: {'Ready' if settings.openai_api_key else 'Not configured (commands only)'}",
                     f"Authorized User: {masked}",
                     f"Screen: {width}x{height}",
+                    f"点字成金: {'Ready' if game else '需要 OPENAI_API_KEY'}",
                     "Emergency Stop: Ctrl+Alt+F12",
                     "Agent: READY",
                     "================================",
@@ -72,7 +87,15 @@ def main() -> None:
         .post_shutdown(post_shutdown)
         .build()
     )
-    TelegramHandlers(settings, registry, executor, session, processes, confirmations).install(application)
+    TelegramHandlers(
+        settings,
+        registry,
+        executor,
+        session,
+        processes,
+        confirmations,
+        game=game,
+    ).install(application)
     LOGGER.info("启动 Telegram polling")
     application.run_polling(drop_pending_updates=False)
 
