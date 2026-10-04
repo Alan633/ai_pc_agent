@@ -19,6 +19,11 @@ class Settings:
     confirm_timeout_seconds: int
     allowed_roots: tuple[Path, ...]
     allowed_executables: frozenset[str]
+    game_vision_model: str
+    game_window_title_keyword: str
+    game_action_interval_seconds: float
+    game_min_card_confidence: float
+    game_auto_next_round: bool
 
     @property
     def logs_dir(self) -> Path:
@@ -31,6 +36,10 @@ class Settings:
     def prepare_directories(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True) -> Settings:
@@ -70,17 +79,24 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         if item.strip()
     )
     max_steps = min(max(int(os.getenv("MAX_STEPS", "15")), 1), 15)
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    game_confidence = min(max(float(os.getenv("GAME_MIN_CARD_CONFIDENCE", "0.72")), 0.0), 1.0)
     settings = Settings(
         base_dir=root,
         telegram_bot_token=token,
         allowed_telegram_user_id=allowed_user_id,
         openai_api_key=api_key,
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
-        playwright_headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").strip().lower() in {"1", "true", "yes"},
+        openai_model=openai_model,
+        playwright_headless=_env_bool("PLAYWRIGHT_HEADLESS"),
         max_steps=max_steps,
         confirm_timeout_seconds=max(int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120")), 10),
         allowed_roots=roots,
         allowed_executables=executables,
+        game_vision_model=os.getenv("GAME_VISION_MODEL", openai_model).strip(),
+        game_window_title_keyword=os.getenv("GAME_WINDOW_TITLE", "欢乐斗地主").strip(),
+        game_action_interval_seconds=max(float(os.getenv("GAME_ACTION_INTERVAL_SECONDS", "1.5")), 0.5),
+        game_min_card_confidence=game_confidence,
+        game_auto_next_round=_env_bool("GAME_AUTO_NEXT_ROUND"),
     )
     settings.prepare_directories()
     return settings
