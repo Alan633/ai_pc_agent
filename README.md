@@ -34,7 +34,7 @@ Windows 工具层
 - 牌局采集：`/game_record_start`、`/game_record_status`、`/game_record_stop`。
 - OpenAI 官方接口使用 Responses API；配置本地 `OPENAI_BASE_URL` 时使用 Chat Completions/function calling。最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
 - 本地白名单应用启动、运行状态检测、窗口置前、确认后关闭、网页打开、截图、系统状态、鼠标键盘和受管进程。
-- 自然语言阶段暴露 22 个明确工具；窗口枚举/置前使用 Windows UI Automation，但更高风险的通用 UIA 点击、文件和 Git 工具仍不向模型开放。
+- 自然语言阶段暴露 22 个通用电脑工具 + 10 个八雀插件工具；窗口枚举/置前使用 Windows UI Automation，但更高风险的通用 UIA 点击、文件和 Git 工具仍不向模型开放。
 - 当前不启用视觉 AI 坐标推断；坐标类操作必须由用户明确给出或使用确定性计算。
 - 高 DPI 感知、PyAutoGUI FailSafe、`Ctrl+Alt+F12` 紧急停止、单 AI 任务互斥。
 - 高风险文件、Shell、生产系统和资金操作没有注册工具，模型无法调用。
@@ -42,7 +42,7 @@ Windows 工具层
 
 ## 通用自然语言 Agent
 
-普通 Telegram 文本会交给 Planner。模型只能从已注册的 22 个工具中选择：
+普通 Telegram 文本会交给 Planner。当前注册 22 个通用电脑工具，并在八雀插件可用时额外注册 10 个八雀工具：
 
 ```text
 launch_app             is_app_running
@@ -56,6 +56,30 @@ type_text              press_key
 hotkey                 open_url
 list_processes         start_process
 stop_managed_process   wait
+```
+
+八雀插件工具：
+
+```text
+baque_get_state          baque_step
+baque_watch_start        baque_watch_status
+baque_watch_stop         baque_auto_start
+baque_auto_stop          baque_acceptance_report
+baque_acceptance_mark    baque_acceptance_reset
+```
+
+因此可以直接发送自然语言：
+
+```text
+看看八雀现在什么状态
+我自己玩，你只帮我记三家的牌
+看看三家现在可能在做什么牌型
+八雀只走一步
+开始八雀自动游戏
+停止八雀自动游戏
+刚才自己的牌面识别对了
+刚才对手那次记牌错了，Q黑桃其实是Q红桃
+看看八雀目前准确率够不够无人值守
 ```
 
 应用白名单位于 `config/apps.yaml`。AIAGENT 分支包含 Chrome、Edge、微信、抖音、记事本、资源管理器、CMD、PowerShell、IDEA 和 `a_share_recommend`，并支持“微信/weixin”“抖音/douyin”等别名。`cmd`、`powershell` 仅允许打开空窗口，AI 不能传入命令；`start_process` 的 `program` 也必须是 YAML 中的应用名称，不能传入原始可执行路径。
@@ -268,6 +292,9 @@ Telegram 命令：
 - /game_watch_start：只启动三家实时观察/记牌，不自动点击，适合先手动玩一局验证。
 - /game_watch_status：查看采样帧、动作片段、模型识别结果和当前三家记牌/危险牌推断。
 - /game_watch_stop：停止三家实时观察器。
+- /game_acceptance：查看当前真实牌局验收报告。
+- /game_accept own|opponent|action ok|bad [备注]：给刚才结果打真值标签。
+- /game_accept_reset：开始新一轮验收统计，历史标签仍保留。
 
 在 .env 可配置：
 
@@ -291,7 +318,74 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 6. 单步稳定后最后才使用 /game_start；自动模式会同时启动高频对手观察器。
 
 当前已支持通过 Ollama 使用本地 `qwen3.5:9b` 进行视觉识别，不需要远程视觉 API。自动模式包含两条并行链路：主链识别自己的手牌/按钮并计算动作；后台观察器以约 GAME_RECORD_FPS 的频率做本地图像差分，把连续动画合并成 BEFORE/PEAK/AFTER 三关键帧，只在检测到真实动作片段时调用 Qwen3.5。高置信度的 left/top/right 完整回合会原子写入 TableTracker，EV 使用当时牌局状态的独立快照计算，因此不会阻塞后台采样，也不会在计算过程中被新事件改写牌池。
-\n\n## 点字成金牌局采集模式\n\n为了训练三家对手的实时动作识别器，先使用“只观察、不自动点击”的牌局采集模式。\n\n### 使用方法\n\n1. 打开欢乐斗地主并进入点字成金牌桌。\n2. 保持游戏窗口在前台。\n3. Telegram 发送 `/game_record_start`。\n4. 正常手动玩完整一局。采集器会在本机高频观察游戏窗口，不调用 OpenAI，不控制鼠标。\n5. 随时发送 `/game_record_status` 查看状态。\n6. 一局结束后发送 `/game_record_stop`。\n\n数据保存到 `game_recordings/YYYYMMDD_HHMMSS/`，包含：\n\n- `meta.json`：本次采集参数和窗口信息。\n- `summary.json`：采样帧、归档帧、事件候选数量等汇总。\n- `frames.jsonl`：每次采样的整体变化与各区域变化分数。\n- `events.jsonl`：事件候选、变化区域、前后关键帧路径。\n- `frames/`：低频连续归档帧，默认约 2 FPS。\n- `events/`：ROI 图像差分检测到明显变化时保存的高质量前后关键帧。\n\n当前 `events.jsonl` 的 `label` 暂为空。下一阶段会把事件自动分类为左家/上家/右家的暗摸、拿亮牌、出牌、机会牌等动作。\n\n采集期间如果切到其他窗口，程序会暂停采样，不会把其他软件截图写入牌局数据；切回欢乐斗地主后自动继续。\n\n### 采集配置\n\n`.env` 可调整：\n\n    GAME_RECORD_FPS=6\n    GAME_RECORD_ARCHIVE_FPS=2\n    GAME_RECORD_DIFF_THRESHOLD=0.028\n    GAME_RECORD_JPEG_QUALITY=78\n\n第一次建议保持默认值。`game_recordings/` 已加入 `.gitignore`，真实牌局截图不会提交到 GitHub。\n\n采集模式不依赖 OpenAI API，因此即使视觉模型尚未配置，也可以先采集真实牌局。
+
+### 真实牌局验收
+
+仅仅“程序没有报错”不能证明视觉识别正确，因此 AIAGENT 增加了两层验收：
+
+1. **自动质量指标**：统计画面识别次数、unknown 率、可操作画面拒绝率、对手动作片段/低置信率以及 TableTracker 牌池一致性。
+2. **人工真值准确率**：你只需要在关键样本后告诉助手“刚才对/错”，程序会把真值追加写入 `game_recordings/acceptance_labels.jsonl`，重启后仍可追溯。
+
+默认 PASS 门槛：
+
+- 自己牌面：至少 20 个真值样本，准确率 ≥ 98%。
+- 对手动作：至少 30 个真值样本，准确率 ≥ 95%。
+- 决策/点击：至少 20 个真值样本，准确率 ≥ 99%。
+- 至少 20 次画面识别，unknown 率 ≤ 10%。
+- 至少 30 个已分类对手动作，低置信率 ≤ 20%。
+- TableTracker 牌池计数必须无冲突。
+
+在样本不足时报告为 `INSUFFICIENT_DATA`；任一硬指标失败为 `FAIL`；全部满足才会给 `PASS`。报告同时写入 `game_recordings/acceptance_report.json`。
+
+建议真实测试时直接用自然语言反馈：
+
+```text
+刚才自己的牌识别对了
+刚才对手动作识别错了，实际是右家拿了亮牌
+刚才点击是对的
+看看八雀验收结果
+```
+
+
+
+## 点字成金牌局采集模式
+
+为了训练三家对手的实时动作识别器，先使用“只观察、不自动点击”的牌局采集模式。
+
+### 使用方法
+
+1. 打开欢乐斗地主并进入点字成金牌桌。
+2. 保持游戏窗口在前台。
+3. Telegram 发送 `/game_record_start`。
+4. 正常手动玩完整一局。采集器会在本机高频观察游戏窗口，不调用 OpenAI，不控制鼠标。
+5. 随时发送 `/game_record_status` 查看状态。
+6. 一局结束后发送 `/game_record_stop`。
+
+数据保存到 `game_recordings/YYYYMMDD_HHMMSS/`，包含：
+
+- `meta.json`：本次采集参数和窗口信息。
+- `summary.json`：采样帧、归档帧、事件候选数量等汇总。
+- `frames.jsonl`：每次采样的整体变化与各区域变化分数。
+- `events.jsonl`：事件候选、变化区域、前后关键帧路径。
+- `frames/`：低频连续归档帧，默认约 2 FPS。
+- `events/`：ROI 图像差分检测到明显变化时保存的高质量前后关键帧。
+
+当前 `events.jsonl` 的 `label` 暂为空。下一阶段会把事件自动分类为左家/上家/右家的暗摸、拿亮牌、出牌、机会牌等动作。
+
+采集期间如果切到其他窗口，程序会暂停采样，不会把其他软件截图写入牌局数据；切回欢乐斗地主后自动继续。
+
+### 采集配置
+
+`.env` 可调整：
+
+    GAME_RECORD_FPS=6
+    GAME_RECORD_ARCHIVE_FPS=2
+    GAME_RECORD_DIFF_THRESHOLD=0.028
+    GAME_RECORD_JPEG_QUALITY=78
+
+第一次建议保持默认值。`game_recordings/` 已加入 `.gitignore`，真实牌局截图不会提交到 GitHub。
+
+采集模式不依赖 OpenAI API，因此即使视觉模型尚未配置，也可以先采集真实牌局。
 
 ## 三家对手实时观察（基于真实牌局校准）
 
