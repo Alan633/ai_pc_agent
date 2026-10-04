@@ -7,15 +7,22 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
-class MaxLevelFilter(logging.Filter):
-    """只放行低于指定级别的日志，避免 ERROR 同时出现在 stdout 和 stderr。"""
-
-    def __init__(self, max_exclusive: int) -> None:
-        super().__init__()
-        self.max_exclusive = max_exclusive
+class StdoutConsoleFilter(logging.Filter):
+    """普通日志走 stdout；被标记为 console_red 的 INFO 不在这里重复输出。"""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        return record.levelno < self.max_exclusive
+        return record.levelno < logging.ERROR and not bool(
+            getattr(record, "console_red", False)
+        )
+
+
+class StderrConsoleFilter(logging.Filter):
+    """ERROR/CRITICAL 和显式标红日志走 stderr。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno >= logging.ERROR or bool(
+            getattr(record, "console_red", False)
+        )
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -50,15 +57,17 @@ def configure_logging(log_dir: Path, secrets: list[str]) -> None:
     file_handler = RotatingFileHandler(
         log_dir / "agent.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
-    # IDE（包括 PyCharm）通常把 stderr 整体显示成红色。logging.StreamHandler()
-    # 默认就是 stderr，因此之前 INFO/httpx 等普通日志也全是红色。
-    # 现在普通日志走 stdout（白色），只有 ERROR/CRITICAL 走 stderr（红色）。
+    # IDE（包括 PyCharm）通常把 stderr 整体显示成红色。
+    # 普通 INFO/WARNING 走 stdout；ERROR/CRITICAL 走 stderr。
+    # 特定重要 INFO（如“收到用户命令”）可通过 extra={"console_red": True}
+    # 单独走 stderr 显示红色，但文件日志中的级别仍保持 INFO。
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setLevel(logging.INFO)
-    stdout_handler.addFilter(MaxLevelFilter(logging.ERROR))
+    stdout_handler.addFilter(StdoutConsoleFilter())
 
     stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setLevel(logging.ERROR)
+    stderr_handler.setLevel(logging.INFO)
+    stderr_handler.addFilter(StderrConsoleFilter())
 
     for handler in (file_handler, stdout_handler, stderr_handler):
         handler.setFormatter(formatter)
