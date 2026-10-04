@@ -288,6 +288,29 @@ class TableTracker:
         hands, _ = self.sample_world(rng)
         return hands
 
+    def state_fingerprint(self) -> tuple[object, ...]:
+        """用于 EV/对手模型缓存；只有牌局已知信息变化时才改变。"""
+        opponents = tuple(
+            (
+                seat,
+                tuple(sorted(opp.known_hand.items())),
+                opp.unknown_hand_count,
+                tuple(opp.discards),
+                tuple(opp.known_takes),
+                opp.deck_draws,
+                opp.finished,
+            )
+            for seat, opp in sorted(self.opponents.items())
+        )
+        return (
+            tuple(sorted(self.own_hand.items())),
+            tuple(sorted(self.public_discards.items())),
+            opponents,
+            self.consumed_opportunity_cards,
+            tuple(self.known_deck_top),
+            self.deck_count,
+        )
+
     def opponent_known_summary(self) -> dict[str, dict[str, object]]:
         return {
             seat: {
