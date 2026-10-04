@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
+from PIL import Image
 
 from game_baque.models import Card, RANKS, SUITS
 
@@ -224,6 +226,33 @@ LOCAL_EVENT_PROMPT = """分析百变八雀一个动作片段。输入三张图�
 """
 
 
+LOCAL_EVENT_CROPS: dict[str, tuple[float, float, float, float]] = {
+    # 玩家手部 + 中央亮牌/弃牌区的联合区域；本地模型不再接收整张全屏。
+    "left": (0.06, 0.20, 0.72, 0.60),
+    "top": (0.28, 0.02, 0.72, 0.60),
+    "right": (0.28, 0.20, 0.94, 0.60),
+    "self": (0.20, 0.20, 0.80, 0.995),
+    "unknown": (0.05, 0.02, 0.95, 0.72),
+}
+
+
+def _local_event_image_url(path: Path, actor_hint: str) -> str:
+    """裁剪本地视觉输入，降低 Qwen/Ollama 的视觉上下文占用。"""
+    box = LOCAL_EVENT_CROPS.get(actor_hint, LOCAL_EVENT_CROPS["unknown"])
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        left = max(0, min(width - 1, int(width * box[0])))
+        top = max(0, min(height - 1, int(height * box[1])))
+        right = max(left + 1, min(width, int(width * box[2])))
+        bottom = max(top + 1, min(height, int(height * box[3])))
+        cropped = image.crop((left, top, right, bottom))
+        buffer = io.BytesIO()
+        cropped.save(buffer, "JPEG", quality=88, optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
 class OpponentEventVision:
     def __init__(
         self,
@@ -351,11 +380,12 @@ class OpponentEventVision:
         )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for path in (before, peak, after):
-            data = base64.b64encode(path.read_bytes()).decode("ascii")
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{data}"},
+                    "image_url": {
+                        "url": _local_event_image_url(path, actor_hint)
+                    },
                 }
             )
 
