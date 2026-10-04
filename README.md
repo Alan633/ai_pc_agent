@@ -5,7 +5,7 @@
 ## 已实现功能
 
 - Telegram 用户白名单：只有 `.env` 中指定的用户 ID 可以操作。
-- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。
+- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。\n- 点字成金：/game_state（只识别不点击）、/game_step（单步执行）、/game_start（连续自动游戏）、/game_stop（停止）。
 - OpenAI Responses API 工具调用循环，最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
 - 本地白名单应用启动、网页打开、截图、系统状态、鼠标键盘和受管进程。
 - 自然语言阶段只暴露 16 个明确工具；Playwright、UI Automation、文件和 Git 工具当前不向模型开放。
@@ -197,3 +197,48 @@ ai_pc_agent/
 - Playwright 使用独立受控 Chromium，不复用个人 Chrome 登录态。
 - UIA 调用无法安全强杀；已设置工具超时的地方会优先超时，`/stop` 会等待正在运行的原生调用收尾。
 - Windows 应用版本、显示器布局和网页 DOM 差异仍需在目标电脑上做一次真实验收。
+
+
+## 点字成金自动游戏（实验功能）
+
+该模块针对腾讯欢乐斗地主中的“百变八雀·点字成金”。实现方式仅为截图识别 + 普通鼠标点击，不读取游戏进程内存、不注入 DLL、不修改客户端、不绕过反作弊。
+
+工作流程：
+
+    欢乐斗地主前台窗口
+    → 截取游戏窗口
+    → OpenAI 视觉模型识别金牌/手牌/亮牌/按钮/当前阶段
+    → 本地 rules.py 判断 19 种胡牌牌型
+    → 本地 strategy.py 决定换牌、摸牌、出牌或胡牌
+    → PyAutoGUI 点击
+    → 等待新画面后继续
+
+规则引擎当前按项目约定实现：点数为 6、7、8、9、10、J、Q、K、A；6~10 为 10 分，J/Q/K 与癞子 20 分，A 30 分；金牌数 0~1/2/3/4/5/6+ 对应倍率 1/2/4/8/16/32；支持 8 张同点/同花顺、6+2、5+3、4+4、3+3+2，以及癞子补牌。当前暂按硬气胡额外 ×2 处理。
+
+Telegram 命令：
+
+- /game_state：只截图识别并返回状态，不点击。第一次务必先用它核对识别结果。
+- /game_step：只执行一个动作，适合调试。
+- /game_start：连续执行。
+- /game_stop：停止连续自动游戏。
+
+在 .env 可配置：
+
+    GAME_VISION_MODEL=gpt-4.1-mini
+    GAME_WINDOW_TITLE=欢乐斗地主
+    GAME_ACTION_INTERVAL_SECONDS=1.5
+    GAME_MIN_CARD_CONFIDENCE=0.72
+    GAME_AUTO_NEXT_ROUND=false
+
+GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子不足/充值/购买”弹窗也会直接停止，不会自动购买豆子、钻石或执行充值。
+
+第一次真实测试顺序：
+
+1. 启动游戏并进入点字成金牌桌，保持游戏窗口在前台。
+2. Telegram 发送 /game_state。
+3. 核对 3 个金牌、7/8 张手牌、花色和亮牌是否全部正确。
+4. 连续测试 5~10 次 /game_state，确认视觉稳定。
+5. 再用 /game_step 一次只执行一步。
+6. 单步稳定后最后才使用 /game_start。
+
+第一版视觉识别每次判断都会调用远程模型，会产生 API 消耗和网络延迟。后续建议用积累的真实截图训练/制作本地 OpenCV 模板识别，仅在低置信度时调用视觉模型。
