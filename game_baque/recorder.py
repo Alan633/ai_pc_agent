@@ -12,6 +12,7 @@ from typing import Any
 from PIL import Image, ImageChops, ImageStat
 
 from game_baque.capture import GameWindow, grab_game_window
+from game_baque.motion import MotionEpisode, MotionEpisodeDetector
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ class RecorderStatus:
     sampled_frames: int
     archived_frames: int
     event_candidates: int
+    episode_candidates: int
     last_change_score: float
     last_changed_regions: tuple[str, ...]
     paused_reason: str | None
@@ -53,6 +55,7 @@ class RecorderStatus:
             f"采样帧：{self.sampled_frames}",
             f"归档帧：{self.archived_frames}",
             f"事件候选：{self.event_candidates}",
+            f"动作片段：{self.episode_candidates}",
             f"最近变化：{self.last_change_score:.4f}",
         ]
         if self.last_changed_regions:
@@ -131,6 +134,7 @@ class GameRecorder:
         self._sampled_frames = 0
         self._archived_frames = 0
         self._event_candidates = 0
+        self._episode_candidates = 0
         self._last_change_score = 0.0
         self._last_changed_regions: tuple[str, ...] = ()
         self._paused_reason: str | None = None
@@ -158,6 +162,7 @@ class GameRecorder:
             suffix += 1
         (recording_dir / "frames").mkdir(parents=True, exist_ok=False)
         (recording_dir / "events").mkdir(parents=True, exist_ok=False)
+        (recording_dir / "episodes").mkdir(parents=True, exist_ok=False)
 
         self._recording_dir = recording_dir
         self._started_at = datetime.now(UTC)
@@ -165,6 +170,7 @@ class GameRecorder:
         self._sampled_frames = 0
         self._archived_frames = 0
         self._event_candidates = 0
+        self._episode_candidates = 0
         self._last_change_score = 0.0
         self._last_changed_regions = ()
         self._paused_reason = None
@@ -239,6 +245,7 @@ class GameRecorder:
             sampled_frames=self._sampled_frames,
             archived_frames=self._archived_frames,
             event_candidates=self._event_candidates,
+            episode_candidates=self._episode_candidates,
             last_change_score=self._last_change_score,
             last_changed_regions=self._last_changed_regions,
             paused_reason=self._paused_reason,
@@ -255,6 +262,7 @@ class GameRecorder:
         last_event_time = 0.0
         frame_log = self._recording_dir / "frames.jsonl"
         event_log = self._recording_dir / "events.jsonl"
+        detector = MotionEpisodeDetector(fps=self.fps)
 
         try:
             while not self._stop_event.is_set():
@@ -366,13 +374,64 @@ class GameRecorder:
                     )
                     last_event_time = event_now
 
+                episode = detector.push(
+                    previous,
+                    current,
+                    sequence=sequence,
+                    timestamp=timestamp,
+                )
+                if episode is not None:
+                    await self._save_motion_episode(episode)
+
                 previous = current
         except asyncio.CancelledError:
             raise
         except Exception:
             LOGGER.exception("点字成金采集循环异常")
         finally:
+            pending_episode = detector.flush()
+            if pending_episode is not None:
+                try:
+                    await self._save_motion_episode(pending_episode)
+                except Exception:
+                    LOGGER.exception("保存最后一个动作片段失败")
             self._write_summary()
+
+    async def _save_motion_episode(self, episode: MotionEpisode) -> None:
+        if self._recording_dir is None:
+            return
+        self._episode_candidates += 1
+        folder = self._recording_dir / "episodes"
+        prefix = folder / f"episode_{episode.episode_id:04d}"
+        before = prefix.with_name(prefix.name + "_before.jpg")
+        peak = prefix.with_name(prefix.name + "_peak.jpg")
+        after = prefix.with_name(prefix.name + "_after.jpg")
+        await asyncio.gather(
+            asyncio.to_thread(self._save_jpeg, episode.before, before, self.event_jpeg_quality),
+            asyncio.to_thread(self._save_jpeg, episode.peak, peak, self.event_jpeg_quality),
+            asyncio.to_thread(self._save_jpeg, episode.after, after, self.event_jpeg_quality),
+        )
+        self._append_jsonl(
+            self._recording_dir / "episodes.jsonl",
+            {
+                "episode_id": episode.episode_id,
+                "start_sequence": episode.start_sequence,
+                "end_sequence": episode.end_sequence,
+                "start_timestamp": episode.start_timestamp,
+                "end_timestamp": episode.end_timestamp,
+                "duration_frames": episode.duration_frames,
+                "peak_scores": {
+                    key: round(value, 6)
+                    for key, value in episode.peak_scores.items()
+                },
+                "overall_peak": round(episode.overall_peak, 6),
+                "actor_hint": episode.actor_hint,
+                "global_effect": episode.global_effect,
+                "before": before.relative_to(self._recording_dir).as_posix(),
+                "peak": peak.relative_to(self._recording_dir).as_posix(),
+                "after": after.relative_to(self._recording_dir).as_posix(),
+            },
+        )
 
     def _region_changes(
         self,
