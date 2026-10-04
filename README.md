@@ -38,7 +38,7 @@ Windows 工具层
 - 当前不启用视觉 AI 坐标推断；坐标类操作必须由用户明确给出或使用确定性计算。
 - 高 DPI 感知、PyAutoGUI FailSafe、`Ctrl+Alt+F12` 紧急停止、单 AI 任务互斥。
 - 高风险文件、Shell、生产系统和资金操作没有注册工具，模型无法调用。
-- 日志滚动与密钥脱敏。单个工具异常只返回失败结果，不会终止主程序。
+- 日志滚动与密钥脱敏。运行日志统一保存到项目根目录 `LOGS/`；单个工具异常只返回失败结果，不会终止主程序。
 
 ## 通用自然语言 Agent
 
@@ -202,6 +202,22 @@ python main.py
 
 `/stop` 是协作式停止：它会立即设置停止信号并取消待确认操作；如果 Windows 原生调用已经开始，会在该次调用返回后安全释放任务锁，避免旧任务与新任务同时控制鼠标。
 
+## 日志目录
+
+程序运行日志统一保存到：
+
+```text
+LOGS/
+├── agent.log
+├── agent.log.1
+├── agent.log.2
+└── baque/
+    ├── acceptance_labels.jsonl
+    └── acceptance_report.json
+```
+
+其中 `agent.log` 使用滚动日志；八雀的验收真值与验收报告也统一放到 `LOGS/baque/`。牌局截图、关键帧和采集素材仍保存在 `game_recordings/`，因为它们属于调试/训练数据而不是运行日志。
+
 ## 11. 安全注意事项
 
 - `.env`、日志、截图均被 `.gitignore` 排除；截图仍可能含敏感信息，请定期清理。
@@ -324,7 +340,7 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 仅仅“程序没有报错”不能证明视觉识别正确，因此 AIAGENT 增加了两层验收：
 
 1. **自动质量指标**：统计画面识别次数、unknown 率、可操作画面拒绝率、对手动作片段/低置信率以及 TableTracker 牌池一致性。
-2. **人工真值准确率**：你只需要在关键样本后告诉助手“刚才对/错”，程序会把真值追加写入 `game_recordings/acceptance_labels.jsonl`，重启后仍可追溯。
+2. **人工真值准确率**：你只需要在关键样本后告诉助手“刚才对/错”，程序会把真值追加写入 `LOGS/baque/acceptance_labels.jsonl`，重启后仍可追溯。
 
 默认 PASS 门槛：
 
@@ -335,7 +351,7 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 - 至少 30 个已分类对手动作，低置信率 ≤ 20%。
 - TableTracker 牌池计数必须无冲突。
 
-在样本不足时报告为 `INSUFFICIENT_DATA`；任一硬指标失败为 `FAIL`；全部满足才会给 `PASS`。报告同时写入 `game_recordings/acceptance_report.json`。
+在样本不足时报告为 `INSUFFICIENT_DATA`；任一硬指标失败为 `FAIL`；全部满足才会给 `PASS`。报告同时写入 `LOGS/baque/acceptance_report.json`。
 
 建议真实测试时直接用自然语言反馈：
 
