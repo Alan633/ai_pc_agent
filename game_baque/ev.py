@@ -124,6 +124,23 @@ class ExpectedValueEngine:
         return value
 
 
+    def infer_opponents(
+        self,
+        tracker: TableTracker,
+        gold_ranks: tuple[str, ...] | list[str],
+        *,
+        samples: int | None = None,
+        top_patterns: int = 5,
+        top_cards: int = 8,
+    ):
+        return self._cached_infer_all(
+            tracker,
+            gold_ranks,
+            samples=samples or max(120, self.simulations // 3),
+            top_patterns=top_patterns,
+            top_cards=top_cards,
+        )
+
     def opponent_threats(
         self,
         tracker: TableTracker,
