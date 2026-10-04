@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
 
-from game_baque.models import Card, GameSnapshot, Point, RANKS, ScreenType, SUITS
+from game_baque.models import Card, GameSnapshot, OpponentEvent, Point, RANKS, ScreenType, SUITS
 
 
 VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点字成金”游戏截图，不负责制定策略。
@@ -36,6 +37,14 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
 11. 坐标均使用“这张输入图片自身的像素坐标”，左上角为 (0,0)。
 12. 看不清的牌不要猜。confidence 低于 0.65 时仍可返回，但如无法确定 rank/suit，应将整个 screen_type 设为 unknown，并在 message 中说明。
 13. 不要输出策略建议，只做视觉转录。
+
+对手事件识别：
+14. 如果输入包含两张图片，第一张是上一帧、第二张是当前帧。只有能从两帧变化中明确确认时，才输出 opponent_events。
+15. seat 只允许 left/top/right；action 只允许 draw_deck、take_visible、discard、finished。
+16. draw_deck 表示该玩家从背面牌堆暗摸；take_visible 表示明确拿走桌面正面亮牌；discard 表示明确打出一张可见牌；finished 表示该玩家已经胡牌/结束本局。
+17. discard/take_visible 必须可靠识别具体牌；看不清则不要猜，也不要输出该事件。draw_deck/finished 不需要 card。
+18. 同一个动作不要重复输出。仅描述“上一帧到当前帧之间新发生”的动作。
+19. 如果是首次截图、跨局、结算切换、新一局开始或无法确认动作，opponent_events 返回空数组。
 """
 
 
@@ -67,6 +76,22 @@ CARD_SCHEMA = {
     "required": ["rank", "suit", "wild", "x", "y", "confidence", "selected"],
 }
 
+OPPONENT_EVENT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "seat": {"type": "string", "enum": ["left", "top", "right"]},
+        "action": {"type": "string", "enum": ["draw_deck", "take_visible", "discard", "finished"]},
+        "card_rank": {"type": "string", "enum": [*RANKS, "WILD", "NONE"]},
+        "card_suit": {"type": "string", "enum": [*SUITS, "NONE"]},
+        "card_wild": {"type": "boolean"},
+        "confidence": {"type": "number"},
+        "detail": {"type": "string"},
+    },
+    "required": ["seat", "action", "card_rank", "card_suit", "card_wild", "confidence", "detail"],
+}
+
+
 SNAPSHOT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -82,6 +107,7 @@ SNAPSHOT_SCHEMA = {
         },
         "hand": {"type": "array", "items": CARD_SCHEMA, "maxItems": 8},
         "visible_cards": {"type": "array", "items": CARD_SCHEMA, "maxItems": 8},
+        "opponent_events": {"type": "array", "items": OPPONENT_EVENT_SCHEMA, "maxItems": 6},
         "deck_click": _point_schema(),
         "swap_button": _point_schema(),
         "discard_button": _point_schema(),
@@ -96,6 +122,7 @@ SNAPSHOT_SCHEMA = {
         "gold_ranks",
         "hand",
         "visible_cards",
+        "opponent_events",
         "deck_click",
         "swap_button",
         "discard_button",
@@ -109,75 +136,119 @@ SNAPSHOT_SCHEMA = {
 
 
 class BaqueVision:
-    def __init__(self, api_key: str, model: str) -> None:
-        if not api_key:
-            raise ValueError("点字成金视觉识别需要 OPENAI_API_KEY")
-        self.client = AsyncOpenAI(api_key=api_key)
+    def __init__(self, api_key: str, model: str, base_url: str = "") -> None:
+        client_key = api_key or ("local-model" if base_url else "")
+        if not client_key:
+            raise ValueError("点字成金视觉识别需要 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL")
+        options: dict[str, Any] = {"api_key": client_key}
+        if base_url:
+            options["base_url"] = base_url.rstrip("/")
+        self.client = AsyncOpenAI(**options)
         self.model = model
+        self.base_url = base_url.rstrip("/")
+        self._prefer_chat_completions = bool(self.base_url)
 
-    async def parse(self, image_path: Path) -> GameSnapshot:
+    @staticmethod
+    def _data_url(image_path: Path) -> str:
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        data_url = f"data:image/png;base64,{image_b64}"
-        structured_input = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "读取这张游戏截图，严格按结构化格式返回。",
-                    },
-                    {
-                        "type": "input_image",
-                        "image_url": data_url,
-                        "detail": "high",
-                    },
-                ],
-            }
-        ]
-        try:
-            response = await self.client.responses.create(
-                model=self.model,
-                instructions=VISION_PROMPT,
-                input=structured_input,
-                text={
-                    "format": {
-                        "type": "json_schema",
-                        "name": "baque_snapshot",
-                        "description": "百变八雀点字成金截图状态",
-                        "schema": SNAPSHOT_SCHEMA,
-                        "strict": True,
-                    }
-                },
-            )
-            raw = response.output_text
-        except TypeError:
-            response = await self.client.responses.create(
-                model=self.model,
-                instructions=VISION_PROMPT,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "读取截图，仅输出一个 JSON 对象，不要 Markdown。字段必须符合："
-                                    + json.dumps(SNAPSHOT_SCHEMA, ensure_ascii=False)
-                                ),
-                            },
-                            {
-                                "type": "input_image",
-                                "image_url": data_url,
-                                "detail": "high",
-                            },
-                        ],
-                    }
-                ],
-            )
-            raw = response.output_text
+        return f"data:image/png;base64,{image_b64}"
+
+    async def parse(
+        self,
+        image_path: Path,
+        previous_image_path: Path | None = None,
+    ) -> GameSnapshot:
+        current_url = self._data_url(image_path)
+        previous_url = (
+            self._data_url(previous_image_path)
+            if previous_image_path is not None and previous_image_path.exists()
+            else None
+        )
+
+        if self._prefer_chat_completions:
+            raw = await self._parse_chat_completions(current_url, previous_url)
+        else:
+            try:
+                raw = await self._parse_responses(current_url, previous_url)
+            except Exception:
+                logging.getLogger(__name__).exception("Responses API 视觉解析失败，尝试 Chat Completions")
+                raw = await self._parse_chat_completions(current_url, previous_url)
 
         payload = json.loads(raw)
         return self._to_snapshot(payload)
+
+    async def _parse_responses(self, current_url: str, previous_url: str | None) -> str:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": (
+                    "若有两张图：第一张是上一帧，第二张是当前帧；识别当前状态以及两帧之间新发生的对手动作。"
+                    if previous_url
+                    else "这是首次截图，只识别当前状态，opponent_events 必须为空数组。"
+                ),
+            }
+        ]
+        if previous_url:
+            content.append({"type": "input_image", "image_url": previous_url, "detail": "high"})
+        content.append({"type": "input_image", "image_url": current_url, "detail": "high"})
+        response = await self.client.responses.create(
+            model=self.model,
+            instructions=VISION_PROMPT,
+            input=[{"role": "user", "content": content}],
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "baque_snapshot",
+                    "description": "百变八雀点字成金截图状态与对手事件",
+                    "schema": SNAPSHOT_SCHEMA,
+                    "strict": True,
+                }
+            },
+        )
+        return response.output_text
+
+    async def _parse_chat_completions(self, current_url: str, previous_url: str | None) -> str:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    VISION_PROMPT
+                    + "\n严格只输出 JSON 对象，不要 Markdown。JSON Schema：\n"
+                    + json.dumps(SNAPSHOT_SCHEMA, ensure_ascii=False)
+                    + (
+                        "\n第一张图片是上一帧，第二张是当前帧。只输出两帧之间新发生的 opponent_events。"
+                        if previous_url
+                        else "\n这是首次截图，opponent_events 必须为空数组。"
+                    )
+                ),
+            }
+        ]
+        if previous_url:
+            content.append({"type": "image_url", "image_url": {"url": previous_url}})
+        content.append({"type": "image_url", "image_url": {"url": current_url}})
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0,
+        }
+        try:
+            response = await self.client.chat.completions.create(
+                **kwargs,
+                response_format={"type": "json_object"},
+            )
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "本地视觉接口不支持 response_format，回退到纯 JSON 提示词",
+                exc_info=True,
+            )
+            response = await self.client.chat.completions.create(**kwargs)
+        raw = response.choices[0].message.content or ""
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.removeprefix("```json").removeprefix("```").strip()
+            raw = raw.removesuffix("```").strip()
+        return raw
 
     @staticmethod
     def _to_point(value: dict[str, Any]) -> Point | None:
@@ -198,16 +269,41 @@ class BaqueVision:
             selected=bool(value.get("selected", False)),
         )
 
+    @staticmethod
+    def _to_opponent_event(value: dict[str, Any]) -> OpponentEvent:
+        rank = str(value.get("card_rank", "NONE"))
+        wild = bool(value.get("card_wild", False)) or rank == "WILD"
+        card: Card | None = None
+        if rank != "NONE":
+            card = Card(
+                rank=None if wild else rank,
+                suit=None if wild else str(value.get("card_suit", "NONE")),
+                wild=wild,
+                confidence=float(value.get("confidence", 0.0)),
+            )
+        return OpponentEvent(
+            seat=str(value["seat"]),
+            action=str(value["action"]),
+            card=card,
+            confidence=float(value.get("confidence", 0.0)),
+            detail=str(value.get("detail", "")),
+        )
+
     @classmethod
     def _to_snapshot(cls, payload: dict[str, Any]) -> GameSnapshot:
         screen_type = ScreenType(str(payload["screen_type"]))
         hand = [cls._to_card(item) for item in payload.get("hand", [])]
         visible = [cls._to_card(item) for item in payload.get("visible_cards", [])]
+        events = [
+            cls._to_opponent_event(item)
+            for item in payload.get("opponent_events", [])
+        ]
         return GameSnapshot(
             screen_type=screen_type,
             gold_ranks=tuple(str(rank) for rank in payload.get("gold_ranks", [])),
             hand=hand,
             visible_cards=visible,
+            opponent_events=events,
             deck_click=cls._to_point(payload["deck_click"]),
             swap_button=cls._to_point(payload["swap_button"]),
             discard_button=cls._to_point(payload["discard_button"]),
