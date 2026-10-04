@@ -3,6 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 
+# 必须在任何会间接导入 PyAutoGUI 的模块之前启用 DPI Awareness，
+# 否则高缩放 Windows 上截图像素与点击坐标可能不一致。
+from tools.screen import enable_high_dpi_awareness
+
+enable_high_dpi_awareness()
+
 from telegram.ext import Application
 
 from agent.executor import AgentExecutor
@@ -22,13 +28,12 @@ from telegram_bot.handlers import TelegramHandlers
 from tools.apps import AppCatalog
 from tools.factory import build_registry
 from tools.process import ProcessManager
-from tools.screen import enable_high_dpi_awareness, get_screen_size
+from tools.screen import get_screen_size
 
 LOGGER = logging.getLogger(__name__)
 
 
 def main() -> None:
-    enable_high_dpi_awareness()
     settings = load_settings()
     configure_logging(settings.logs_dir, [settings.telegram_bot_token, settings.openai_api_key])
     security = SecurityPolicy(settings)
