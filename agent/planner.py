@@ -23,6 +23,16 @@ SYSTEM_INSTRUCTIONS = """你是运行在用户 Windows 11 电脑上的本地 AI 
 6. 优先级：Windows 系统/API 或进程工具 > Windows UI Automation > 浏览器自动化 > 鼠标键盘。
 7. 每一步选择最少且可验证的下一步；工具失败后可以换一种安全方法，但不要重复无效动作。
 8. 任务完成后用简短中文说明实际结果。没有成功执行时，不得声称已完成。
+9. “八雀 / 百变八雀 / 点字成金”属于已注册插件能力：
+   - 看状态、识别牌面、问现在怎么打：baque_get_state；
+   - 只记牌、只观察、用户自己操作：baque_watch_start；
+   - 查看三家记牌和观察质量：baque_watch_status；
+   - 明确要求只走一步：baque_step；
+   - 明确要求连续自动玩：baque_auto_start；
+   - 停止自动游戏：baque_auto_stop；
+   - “刚才识别对/错、刚才点击对/错”应调用 baque_acceptance_mark 记录真值；
+   - 问准确率、稳定性、是否可以无人值守：先调用 baque_acceptance_report，再依据报告回答。
+10. 八雀自动游戏已经有独立停止逻辑。启动后不要再用通用 click/type_text 干预牌桌，除非用户明确要求手动调试。
 
 安全限制：
 - 只能调用提供的白名单工具。
