@@ -53,14 +53,19 @@ def main() -> None:
     )
 
     game: BaqueGameController | None = None
-    if settings.openai_api_key:
+    if settings.openai_api_key or settings.game_vision_base_url:
         game = BaqueGameController(
-            vision=BaqueVision(settings.openai_api_key, settings.game_vision_model),
+            vision=BaqueVision(
+                settings.openai_api_key,
+                settings.game_vision_model,
+                settings.game_vision_base_url,
+            ),
             screenshots_dir=settings.screenshots_dir,
             session=session,
             window_title_keyword=settings.game_window_title_keyword,
             action_interval_seconds=settings.game_action_interval_seconds,
             min_card_confidence=settings.game_min_card_confidence,
+            min_event_confidence=settings.game_min_event_confidence,
             auto_next_round=settings.game_auto_next_round,
         )
 
@@ -81,7 +86,7 @@ def main() -> None:
                     f"LLM: {'Ready' if settings.openai_api_key or settings.openai_base_url else 'Not configured (commands only)'}",
                     f"Authorized User: {masked}",
                     f"Screen: {width}x{height}",
-                    f"点字成金: {'Ready' if game else '需要 OPENAI_API_KEY'}",
+                    f"点字成金: {'Ready' if game else '需要 OPENAI_API_KEY 或 GAME_VISION_BASE_URL'}",
                     "牌局采集器: Ready",
                     "Emergency Stop: Ctrl+Alt+F12",
                     "Agent: READY",
