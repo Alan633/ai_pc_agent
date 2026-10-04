@@ -16,11 +16,12 @@ def test_known_six_k_makes_a_dangerous_for_opponent() -> None:
 
     top = tracker.opponents["top"]
     top.known_hand.clear()
-    top.unknown_hand_count = 1
+    top.unknown_hand_count = 0
     for suit in ("S", "H", "C", "D"):
         top.known_hand[f"K:{suit}"] += 1
     top.known_hand["K:S"] += 1
     top.known_hand["K:H"] += 1
+    top.known_hand["A:S"] += 1
 
     model = OpponentPatternModel(samples=120, seed=7)
     risk = model.release_risk(c("A", "D"), tracker, ("6", "10", "K"), samples=120)
