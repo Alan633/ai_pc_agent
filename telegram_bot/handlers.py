@@ -18,6 +18,7 @@ from config import Settings
 from game_baque.controller import BaqueGameController
 from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
+from plugins.baque import BaquePlugin
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.messages import BUSY, NO_TASK, UNAUTHORIZED, command_usage
 from tools.process import ProcessManager
@@ -37,6 +38,7 @@ class TelegramHandlers:
         game: BaqueGameController | None = None,
         game_recorder: GameRecorder | None = None,
         game_observer: OpponentObserver | None = None,
+        baque_plugin: BaquePlugin | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -47,6 +49,7 @@ class TelegramHandlers:
         self.game = game
         self.game_recorder = game_recorder
         self.game_observer = game_observer
+        self.baque_plugin = baque_plugin
 
     def install(self, application: Application) -> None:
         commands = {
@@ -71,6 +74,9 @@ class TelegramHandlers:
             "game_watch_start": self.game_watch_start,
             "game_watch_status": self.game_watch_status,
             "game_watch_stop": self.game_watch_stop,
+            "game_acceptance": self.game_acceptance,
+            "game_accept": self.game_accept,
+            "game_accept_reset": self.game_accept_reset,
             "stop": self.stop,
         }
         for name, callback in commands.items():
