@@ -402,7 +402,7 @@ class OpponentEventVision:
         except Exception as exc:
             if self._is_context_length_error(exc):
                 raise RuntimeError(
-                    "本地对手视觉模型上下文不足；三关键帧模式建议 Ollama 上下文至少 8192。"
+                    "本地对手视觉模型上下文不足；请运行 scripts/setup_ollama_qwen16k.bat 创建 16K 上下文模型，并重启 Agent。"
                 ) from exc
             response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""
