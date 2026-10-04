@@ -196,6 +196,8 @@ class BaqueGameController:
         和 3 个金牌的正式牌局后才返回，随后插件再启动三家观察器。
         """
         await asyncio.to_thread(focus_game_window, self.window_title_keyword)
+        # Windows 前台切换存在极短的异步窗口，给系统一点时间完成激活。
+        await asyncio.sleep(0.30)
         LOGGER.info("八雀启动流程：已切换游戏窗口到前台")
 
         deadline = time.monotonic() + max(5.0, float(timeout_seconds))
