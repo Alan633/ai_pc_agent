@@ -134,6 +134,35 @@ class TableTracker:
         if self.deck_count is not None:
             self.deck_count = max(0, self.deck_count - 1)
 
+    def record_opponent_draw_unknown(self, seat: str) -> None:
+        """确认对手取得了一张牌，但无法可靠判断来自牌堆还是桌面亮牌。
+
+        只增加未知手牌数量，不擅自扣牌堆数量；后续自己的稳定截图会用真实 deck_count 校正。
+        """
+        opp = self._opponent(seat)
+        opp.unknown_hand_count += 1
+        self._event("opponent_draw_unknown", seat)
+
+    def record_opponent_turn(
+        self,
+        seat: str,
+        *,
+        draw_source: str,
+        discard: Card,
+        drawn_card: Card | None = None,
+    ) -> None:
+        """原子记录一名对手完成的一整轮“取 1 张 → 打 1 张”。
+
+        这样即使视觉只识别到最终弃牌，也不会把对手手牌数错误地从 7 记成 6。
+        """
+        if draw_source == "visible" and drawn_card is not None:
+            self.record_opponent_take_visible(seat, drawn_card)
+        elif draw_source == "deck":
+            self.record_opponent_draw_deck(seat)
+        else:
+            self.record_opponent_draw_unknown(seat)
+        self.record_opponent_discard(seat, discard)
+
     def record_opponent_take_visible(self, seat: str, card: Card) -> None:
         key = card_key(card)
         opp = self._opponent(seat)
