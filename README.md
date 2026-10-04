@@ -259,3 +259,44 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 
 当前已支持通过 Ollama 使用本地 `qwen3.5:9b` 进行视觉识别，不需要远程视觉 API。自动模式包含两条并行链路：主链识别自己的手牌/按钮并计算动作；后台观察器以约 GAME_RECORD_FPS 的频率做本地图像差分，把连续动画合并成 BEFORE/PEAK/AFTER 三关键帧，只在检测到真实动作片段时调用 Qwen3.5。高置信度的 left/top/right 完整回合会原子写入 TableTracker，EV 使用当时牌局状态的独立快照计算，因此不会阻塞后台采样，也不会在计算过程中被新事件改写牌池。
 \n\n## 点字成金牌局采集模式\n\n为了训练三家对手的实时动作识别器，先使用“只观察、不自动点击”的牌局采集模式。\n\n### 使用方法\n\n1. 打开欢乐斗地主并进入点字成金牌桌。\n2. 保持游戏窗口在前台。\n3. Telegram 发送 `/game_record_start`。\n4. 正常手动玩完整一局。采集器会在本机高频观察游戏窗口，不调用 OpenAI，不控制鼠标。\n5. 随时发送 `/game_record_status` 查看状态。\n6. 一局结束后发送 `/game_record_stop`。\n\n数据保存到 `game_recordings/YYYYMMDD_HHMMSS/`，包含：\n\n- `meta.json`：本次采集参数和窗口信息。\n- `summary.json`：采样帧、归档帧、事件候选数量等汇总。\n- `frames.jsonl`：每次采样的整体变化与各区域变化分数。\n- `events.jsonl`：事件候选、变化区域、前后关键帧路径。\n- `frames/`：低频连续归档帧，默认约 2 FPS。\n- `events/`：ROI 图像差分检测到明显变化时保存的高质量前后关键帧。\n\n当前 `events.jsonl` 的 `label` 暂为空。下一阶段会把事件自动分类为左家/上家/右家的暗摸、拿亮牌、出牌、机会牌等动作。\n\n采集期间如果切到其他窗口，程序会暂停采样，不会把其他软件截图写入牌局数据；切回欢乐斗地主后自动继续。\n\n### 采集配置\n\n`.env` 可调整：\n\n    GAME_RECORD_FPS=6\n    GAME_RECORD_ARCHIVE_FPS=2\n    GAME_RECORD_DIFF_THRESHOLD=0.028\n    GAME_RECORD_JPEG_QUALITY=78\n\n第一次建议保持默认值。`game_recordings/` 已加入 `.gitignore`，真实牌局截图不会提交到 GitHub。\n\n采集模式不依赖 OpenAI API，因此即使视觉模型尚未配置，也可以先采集真实牌局。
+
+
+## 三家对手实时观察（基于真实牌局校准）
+
+2026-10-04 首轮真实牌局样本：约 250.7 秒、1504 个 6 FPS 采样点、145 个 raw 变化事件。复盘发现大量 raw event 实际属于同一段动画/同一轮动作；按约 1.2 秒间隔聚类只有约 39 个动作簇。因此实时逻辑已经改为：
+
+    6 FPS 本地截屏
+    → 窄 ROI 差分
+    → 合并为一个 MotionEpisode
+    → 保存 BEFORE / PEAK / AFTER 三张关键帧
+    → 过滤“硬气/比翼为邻/金倍率”等全屏特效
+    → 仅对动作片段调用视觉模型
+    → 高置信对手事件写入 TableTracker
+    → 更新三家可能牌型、危险牌和 EV
+
+首轮样本同时用于收紧 left/top/right 的手牌扇区 ROI，避免中央大特效同时污染三家区域。
+
+### 手动观察测试
+
+进入一局点字成金并保持游戏窗口在前台，先不要开启自动点击：
+
+    /game_watch_start
+
+程序会先读取自己的手牌、金牌和牌堆建立基线，然后后台观察三名对手。可随时查看：
+
+    /game_watch_status
+
+状态会显示动作片段数量、已识别数量、已写入记牌器数量、低置信事件、识别队列，以及三家当前已知存牌/未知牌数/可能牌型。
+
+结束后：
+
+    /game_watch_stop
+
+调试文件保存在 `game_recordings/live_watch_时间/`：
+
+- `episodes.jsonl`：本地动作片段及 ROI 峰值。
+- `episodes/*_before.jpg`、`*_peak.jpg`、`*_after.jpg`：三关键帧。
+- `recognized_events.jsonl`：视觉模型的结构化识别、是否写入记牌器、错误信息。
+- `observer_summary.json`：整局观察汇总。
+
+`/game_start` 进入连续自动游戏时，也会自动启动同一套对手观察器；建议先用 `/game_watch_start` 完整手动验证一两局再开启自动执行。
