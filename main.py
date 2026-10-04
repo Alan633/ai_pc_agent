@@ -12,6 +12,7 @@ from agent.session import AgentSession
 from config import load_settings
 from emergency import EmergencyHotkey
 from game_baque.controller import BaqueGameController
+from game_baque.recorder import GameRecorder
 from game_baque.vision import BaqueVision
 from logging_setup import configure_logging
 from telegram_bot.callbacks import ConfirmationStore
@@ -37,6 +38,14 @@ def main() -> None:
     executor = AgentExecutor(planner, registry, security, session, settings.max_steps)
     confirmations = ConfirmationStore()
     emergency = EmergencyHotkey(session)
+    game_recorder = GameRecorder(
+        recordings_dir=settings.game_recordings_dir,
+        window_title_keyword=settings.game_window_title_keyword,
+        fps=settings.game_record_fps,
+        archive_fps=settings.game_record_archive_fps,
+        change_threshold=settings.game_record_diff_threshold,
+        jpeg_quality=settings.game_record_jpeg_quality,
+    )
 
     game: BaqueGameController | None = None
     if settings.openai_api_key:
@@ -68,6 +77,7 @@ def main() -> None:
                     f"Authorized User: {masked}",
                     f"Screen: {width}x{height}",
                     f"点字成金: {'Ready' if game else '需要 OPENAI_API_KEY'}",
+                    "牌局采集器: Ready",
                     "Emergency Stop: Ctrl+Alt+F12",
                     "Agent: READY",
                     "================================",
@@ -78,6 +88,8 @@ def main() -> None:
     async def post_shutdown(application: Application) -> None:
         confirmations.cancel_all()
         session.request_stop()
+        if game_recorder.running:
+            await game_recorder.stop()
         emergency.stop()
 
     application = (
@@ -95,6 +107,7 @@ def main() -> None:
         processes,
         confirmations,
         game=game,
+        game_recorder=game_recorder,
     ).install(application)
     LOGGER.info("启动 Telegram polling")
     application.run_polling(drop_pending_updates=False)
