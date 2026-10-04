@@ -260,13 +260,30 @@ class BaqueGameController:
                 f"- {seat}: 已知存牌[{known_text}]，未知{data['unknown_hand_count']}张，"
                 f"已记录出牌{len(data['discards'])}张"
             )
-        threats = self.ev.opponent_threats(self.tracker, self._round_gold_ranks) if self._round_gold_ranks else []
-        if threats:
-            lines.append("下一摸成牌风险估计：")
-            for item in threats:
+        if self._round_gold_ranks:
+            inferences = self.ev.opponent_model.infer_all(
+                self.tracker,
+                self._round_gold_ranks,
+                samples=max(120, self.ev.simulations // 3),
+                top_patterns=4,
+                top_cards=6,
+            )
+            lines.append("对手可能牌型：")
+            for item in inferences:
+                if item.patterns:
+                    pattern_text = "；".join(
+                        f"{p.pattern} {p.probability_next_draw:.1%}"
+                        for p in item.patterns[:4]
+                    )
+                else:
+                    pattern_text = "暂未形成明确的一摸成牌方向"
+                danger_text = "、".join(
+                    f"{key}({prob:.1%})"
+                    for key, prob in item.dangerous_cards[:5]
+                ) or "无"
                 lines.append(
-                    f"- {item.seat}: {item.win_probability_next_draw:.1%}，"
-                    f"潜在胡牌价值 {item.mean_hu_value:.1f}"
+                    f"- {item.seat}: 下一摸任意胡 {item.any_hu_probability_next_draw:.1%}；"
+                    f"{pattern_text}；危险牌 {danger_text}"
                 )
         return "\n".join(lines)
 
