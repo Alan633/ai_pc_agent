@@ -106,6 +106,18 @@ class TableTracker:
             raise ValueError("牌堆数量不能为负")
         self.deck_count = count
 
+    def record_own_draw_deck(self) -> None:
+        if self.known_deck_top:
+            key = self.known_deck_top.pop(0)
+            self._event("own_draw_known_top", "self", key)
+        else:
+            self._event("own_draw_deck", "self")
+        if self.deck_count is not None:
+            self.deck_count = max(0, self.deck_count - 1)
+
+    def record_own_take_visible(self, card: Card) -> None:
+        self._event("own_take_visible", "self", card_key(card))
+
     def record_opponent_draw_deck(self, seat: str) -> None:
         opp = self._opponent(seat)
         opp.unknown_hand_count += 1
