@@ -66,6 +66,12 @@ def test_phase2_registry_exposes_only_requested_tools(tmp_path: Path) -> None:
     session = AgentSession()
     registry = build_registry(settings, security, ProcessManager(security, catalog), session)
     assert set(registry.names()) == {
+        "launch_app",
+        "is_app_running",
+        "focus_app",
+        "close_app",
+        "list_windows",
+        "focus_window",
         "take_screenshot",
         "get_system_status",
         "get_active_window",
@@ -75,8 +81,8 @@ def test_phase2_registry_exposes_only_requested_tools(tmp_path: Path) -> None:
         "double_click",
         "scroll",
         "type_text",
+        "press_key",
         "hotkey",
-        "launch_app",
         "open_url",
         "list_processes",
         "start_process",
