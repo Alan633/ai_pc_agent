@@ -5,6 +5,7 @@ import copy
 import logging
 import time
 from collections import deque
+from threading import Event
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -65,6 +66,10 @@ class BaqueGameController:
         self._pair_event_dedupe: dict[tuple[str, str, str], float] = {}
         self.external_observer_active = False
         self.opponent_event_count = 0
+        self.inspect_count = 0
+        self.unknown_snapshot_count = 0
+        self.step_count = 0
+        self.validation_rejection_count = 0
 
     async def inspect(self) -> tuple[CapturedFrame, GameSnapshot]:
         frame = await asyncio.to_thread(
@@ -86,11 +91,15 @@ class BaqueGameController:
         # 对手暗摸事件会先按事件语义减 1，这里再用观察值校准，避免双重扣减。
         if snapshot.deck_count is not None and self._tracker_started:
             self.tracker.set_deck_count(snapshot.deck_count)
+        self.inspect_count += 1
+        if snapshot.screen_type == ScreenType.UNKNOWN:
+            self.unknown_snapshot_count += 1
         self.last_snapshot = snapshot
         self.last_message = self._snapshot_summary(snapshot)
         return frame, snapshot
 
     async def step(self, *, execute: bool = True) -> GameStepResult:
+        self.step_count += 1
         frame, snapshot = await self.inspect()
 
         if snapshot.screen_type == ScreenType.RECHARGE:
@@ -127,6 +136,7 @@ class BaqueGameController:
 
         validation_error = self._validate_actionable_snapshot(snapshot, frame)
         if validation_error:
+            self.validation_rejection_count += 1
             return GameStepResult(False, validation_error, snapshot, frame)
 
         fingerprint = snapshot.fingerprint()
@@ -150,10 +160,11 @@ class BaqueGameController:
         self._last_action_at = time.monotonic()
         return GameStepResult(True, message, snapshot, frame)
 
-    async def run_loop(self) -> str:
+    async def run_loop(self, stop_event: Event | None = None) -> str:
         unknown_streak = 0
+        stop_signal = stop_event or self.session.stop_event
         try:
-            while not self.session.stop_event.is_set():
+            while not stop_signal.is_set():
                 result = await self.step(execute=True)
                 self.last_message = result.message
                 LOGGER.info(
@@ -182,6 +193,32 @@ class BaqueGameController:
         if self.last_snapshot is None:
             return "尚未读取游戏画面。"
         return f"{self._snapshot_summary(self.last_snapshot)}\n最近动作：{self.last_message}\n累计动作：{self.action_count}"
+
+    def quality_metrics(self) -> dict[str, object]:
+        unknown_rate = (
+            self.unknown_snapshot_count / self.inspect_count
+            if self.inspect_count
+            else None
+        )
+        rejection_rate = (
+            self.validation_rejection_count / self.step_count
+            if self.step_count
+            else None
+        )
+        return {
+            "inspect_count": self.inspect_count,
+            "unknown_snapshot_count": self.unknown_snapshot_count,
+            "unknown_rate": round(unknown_rate, 4) if unknown_rate is not None else None,
+            "step_count": self.step_count,
+            "validation_rejection_count": self.validation_rejection_count,
+            "validation_rejection_rate": (
+                round(rejection_rate, 4) if rejection_rate is not None else None
+            ),
+            "action_count": self.action_count,
+            "opponent_event_count": self.opponent_event_count,
+            "tracker_started": self._tracker_started,
+            "external_observer_active": self.external_observer_active,
+        }
 
     def _decide(
         self,
