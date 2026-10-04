@@ -10,7 +10,7 @@ from agent.session import AgentSession
 from game_baque.capture import CapturedFrame, assert_game_foreground, capture_game_window
 from game_baque.ev import ExpectedValueEngine
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
-from game_baque.strategy import choose_draw, choose_swap_two
+from game_baque.strategy import choose_swap_two
 from game_baque.tracker import TableTracker
 from game_baque.vision import BaqueVision
 
@@ -161,7 +161,12 @@ class BaqueGameController:
         if snapshot.screen_type == ScreenType.SWAP:
             return choose_swap_two(snapshot.hand, snapshot.gold_ranks)
         if snapshot.screen_type == ScreenType.DRAW:
-            return choose_draw(snapshot.hand, snapshot.visible_cards, snapshot.gold_ranks)
+            return self.ev.choose_draw_action(
+                snapshot.hand,
+                snapshot.visible_cards,
+                snapshot.gold_ranks,
+                self.tracker,
+            )
         if snapshot.screen_type in {ScreenType.DISCARD, ScreenType.HU}:
             decision, values = self.ev.choose_8_card_action(
                 snapshot.hand,
