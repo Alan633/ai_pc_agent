@@ -288,7 +288,7 @@ class BaqueGameController:
                 f"已记录出牌{len(data['discards'])}张"
             )
         if self._round_gold_ranks:
-            inferences = self.ev.opponent_model.infer_all(
+            inferences = self.ev.infer_opponents(
                 self.tracker,
                 self._round_gold_ranks,
                 samples=max(120, self.ev.simulations // 3),
