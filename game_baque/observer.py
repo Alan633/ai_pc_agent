@@ -144,17 +144,35 @@ class OpponentObserver:
         if self._stop_event is not None:
             self._stop_event.set()
 
-        for task in (self._capture_task, self._worker_task):
-            if task is None:
-                continue
+        # 先让捕获循环结束并 flush 最后一个动作片段，再等待识别队列消费完。
+        capture_task = self._capture_task
+        if capture_task is not None:
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=8.0)
+                await asyncio.wait_for(asyncio.shield(capture_task), timeout=5.0)
             except asyncio.TimeoutError:
-                task.cancel()
+                capture_task.cancel()
                 try:
-                    await task
+                    await capture_task
                 except asyncio.CancelledError:
                     pass
+
+        if self._queue is not None:
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=12.0)
+            except asyncio.TimeoutError:
+                LOGGER.warning("停止对手观察时仍有未完成的视觉识别，将取消剩余 worker")
+
+        worker_task = self._worker_task
+        if worker_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(worker_task), timeout=3.0)
+            except asyncio.TimeoutError:
+                worker_task.cancel()
+                try:
+                    await worker_task
+                except asyncio.CancelledError:
+                    pass
+
         self._capture_task = None
         self._worker_task = None
         self._write_summary()
@@ -285,7 +303,8 @@ class OpponentObserver:
         assert self._queue is not None
 
         while True:
-            if self._stop_event.is_set() and self._queue.empty():
+            capture_done = self._capture_task is None or self._capture_task.done()
+            if self._stop_event.is_set() and capture_done and self._queue.empty():
                 break
             try:
                 episode, before, peak, after = await asyncio.wait_for(
