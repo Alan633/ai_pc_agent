@@ -43,6 +43,7 @@ class Card:
 
 
 class ScreenType(str, Enum):
+    START = "start"
     SWAP = "swap"
     DRAW = "draw"
     DISCARD = "discard"
@@ -79,6 +80,7 @@ class GameSnapshot:
     swap_button: Point | None = None
     discard_button: Point | None = None
     hu_button: Point | None = None
+    start_button: Point | None = None
     continue_button: Point | None = None
     close_popup: Point | None = None
     deck_count: int | None = None
