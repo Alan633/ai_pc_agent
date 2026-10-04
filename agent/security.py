@@ -23,6 +23,10 @@ class SecurityPolicy:
         self.settings = settings
 
     def assess(self, tool_name: str, arguments: dict[str, Any]) -> RiskAssessment:
+        if tool_name == "close_app":
+            app_name = str(arguments.get("app_name", "")).strip() or "未知应用"
+            return RiskAssessment(True, "关闭应用可能导致未保存内容丢失", f"关闭应用：{app_name}")
+
         command = arguments.get("command", [])
         tokens = [str(token).lower() for token in command] if isinstance(command, list) else []
         joined = " ".join(tokens)
