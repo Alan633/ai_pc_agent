@@ -49,6 +49,33 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
 """
 
 
+LOCAL_VISION_PROMPT = """识别腾讯欢乐斗地主“百变八雀·点字成金”截图，只输出一个 JSON 对象，不要 Markdown/解释。
+
+规则：
+- screen_type: start/swap/draw/discard/hu/waiting/settlement/recharge/unknown。
+- start=中央有橙色“开始游戏”；recharge=豆子不足/充值/购买，绝不能误点购买。
+- 金牌是左上 3 张黄色小牌，只返回点数；自己的手牌在底部，按左到右。
+- 普通牌 rank=6/7/8/9/10/J/Q/K/A，suit=S/H/C/D；癞子 rank=WILD,suit=NONE,wild=true。
+- 牌和按钮坐标均为当前图片像素坐标；看不清不要猜，低置信时 screen_type=unknown。
+- visible_cards 只放当前真正可选的正面亮牌。
+- 两张图时第一张=上一帧、第二张=当前帧；只记录新发生的对手动作。首次截图 opponent_events=[]。
+- 对手 seat=left/top/right；action=draw_deck/take_visible/discard/finished；看不清具体牌时不要虚构。
+
+必须返回这些字段，缺失按钮用 visible=false，未知 deck_count=-1：
+{"screen_type":"unknown","gold_ranks":[],"hand":[],"visible_cards":[],"opponent_events":[],
+"deck_click":{"x":0,"y":0,"visible":false},"swap_button":{"x":0,"y":0,"visible":false},
+"discard_button":{"x":0,"y":0,"visible":false},"hu_button":{"x":0,"y":0,"visible":false},
+"start_button":{"x":0,"y":0,"visible":false},"continue_button":{"x":0,"y":0,"visible":false},
+"close_popup":{"x":0,"y":0,"visible":false},"deck_count":-1,"message":""}
+
+hand/visible_cards 每项：
+{"rank":"6","suit":"S","wild":false,"x":0,"y":0,"confidence":0.99,"selected":false}
+
+opponent_events 每项：
+{"seat":"left","action":"discard","card_rank":"A","card_suit":"D","card_wild":false,"confidence":0.99,"detail":""}
+"""
+
+
 def _point_schema() -> dict[str, Any]:
     return {
         "type": "object",
@@ -211,21 +238,12 @@ class BaqueVision:
         return response.output_text
 
     async def _parse_chat_completions(self, current_url: str, previous_url: str | None) -> str:
-        content: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": (
-                    VISION_PROMPT
-                    + "\n严格只输出 JSON 对象，不要 Markdown。JSON Schema：\n"
-                    + json.dumps(SNAPSHOT_SCHEMA, ensure_ascii=False)
-                    + (
-                        "\n第一张图片是上一帧，第二张是当前帧。只输出两帧之间新发生的 opponent_events。"
-                        if previous_url
-                        else "\n这是首次截图，opponent_events 必须为空数组。"
-                    )
-                ),
-            }
-        ]
+        prompt = LOCAL_VISION_PROMPT + (
+            "\n当前有两张图片：只比较上一帧→当前帧的新事件。"
+            if previous_url
+            else "\n当前只有一张首次截图：opponent_events 必须为空数组。"
+        )
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         if previous_url:
             content.append({"type": "image_url", "image_url": {"url": previous_url}})
         content.append({"type": "image_url", "image_url": {"url": current_url}})
@@ -240,14 +258,29 @@ class BaqueVision:
                 **kwargs,
                 response_format={"type": "json_object"},
             )
-        except Exception:
+        except Exception as exc:
+            if self._is_context_length_error(exc):
+                raise RuntimeError(
+                    "本地视觉模型上下文仍不足。当前已使用紧凑提示词；"
+                    "请把 Ollama 的 qwen3.5:9b 上下文提高到至少 8192。"
+                ) from exc
             logging.getLogger(__name__).warning(
-                "本地视觉接口不支持 response_format，回退到纯 JSON 提示词",
-                exc_info=True,
+                "本地视觉接口不支持 response_format，已回退到普通 JSON 输出：%s",
+                type(exc).__name__,
             )
             response = await self.client.chat.completions.create(**kwargs)
         raw = response.choices[0].message.content or ""
         return self._extract_json(raw)
+
+    @staticmethod
+    def _is_context_length_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "context size" in text
+            or "context_length" in text
+            or "exceed_context" in text
+            or ("n_ctx" in text and "exceed" in text)
+        )
 
     @staticmethod
     def _extract_json(raw: str) -> str:
