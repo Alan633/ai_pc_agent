@@ -73,6 +73,10 @@ class BaqueGameController:
         self._previous_frame_path = frame.path
         self._sync_tracker(snapshot)
         self._apply_opponent_events(snapshot)
+        # 当前截图里的 deck_count 是视觉观察到的最终状态；
+        # 对手暗摸事件会先按事件语义减 1，这里再用观察值校准，避免双重扣减。
+        if snapshot.deck_count is not None and self._tracker_started:
+            self.tracker.set_deck_count(snapshot.deck_count)
         self.last_snapshot = snapshot
         self.last_message = self._snapshot_summary(snapshot)
         return frame, snapshot
