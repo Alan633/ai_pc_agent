@@ -34,7 +34,8 @@ class Settings:
 
     @property
     def logs_dir(self) -> Path:
-        return self.base_dir / "logs"
+        # 统一使用大写 LOGS 目录保存运行日志，避免与历史小写 logs 混用。
+        return self.base_dir / "LOGS"
 
     @property
     def screenshots_dir(self) -> Path:
