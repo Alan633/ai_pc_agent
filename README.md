@@ -5,7 +5,7 @@
 ## 已实现功能
 
 - Telegram 用户白名单：只有 `.env` 中指定的用户 ID 可以操作。
-- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。\n- 点字成金：/game_state（只识别不点击）、/game_step（单步执行）、/game_start（连续自动游戏）、/game_stop（停止）。
+- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。\n- 点字成金：`/game_state`、`/game_step`、`/game_start`、`/game_stop`。\n- 牌局采集：`/game_record_start`、`/game_record_status`、`/game_record_stop`。
 - OpenAI Responses API 工具调用循环，最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
 - 本地白名单应用启动、网页打开、截图、系统状态、鼠标键盘和受管进程。
 - 自然语言阶段只暴露 16 个明确工具；Playwright、UI Automation、文件和 Git 工具当前不向模型开放。
@@ -242,3 +242,4 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 6. 单步稳定后最后才使用 /game_start。
 
 第一版视觉识别每次判断都会调用远程模型，会产生 API 消耗和网络延迟。后续建议用积累的真实截图训练/制作本地 OpenCV 模板识别，仅在低置信度时调用视觉模型。
+\n\n## 点字成金牌局采集模式\n\n为了训练三家对手的实时动作识别器，先使用“只观察、不自动点击”的牌局采集模式。\n\n### 使用方法\n\n1. 打开欢乐斗地主并进入点字成金牌桌。\n2. 保持游戏窗口在前台。\n3. Telegram 发送 `/game_record_start`。\n4. 正常手动玩完整一局。采集器会在本机高频观察游戏窗口，不调用 OpenAI，不控制鼠标。\n5. 随时发送 `/game_record_status` 查看状态。\n6. 一局结束后发送 `/game_record_stop`。\n\n数据保存到 `game_recordings/YYYYMMDD_HHMMSS/`，包含：\n\n- `meta.json`：本次采集参数和窗口信息。\n- `summary.json`：采样帧、归档帧、事件候选数量等汇总。\n- `frames.jsonl`：每次采样的整体变化与各区域变化分数。\n- `events.jsonl`：事件候选、变化区域、前后关键帧路径。\n- `frames/`：低频连续归档帧，默认约 2 FPS。\n- `events/`：ROI 图像差分检测到明显变化时保存的高质量前后关键帧。\n\n当前 `events.jsonl` 的 `label` 暂为空。下一阶段会把事件自动分类为左家/上家/右家的暗摸、拿亮牌、出牌、机会牌等动作。\n\n采集期间如果切到其他窗口，程序会暂停采样，不会把其他软件截图写入牌局数据；切回欢乐斗地主后自动继续。\n\n### 采集配置\n\n`.env` 可调整：\n\n    GAME_RECORD_FPS=6\n    GAME_RECORD_ARCHIVE_FPS=2\n    GAME_RECORD_DIFF_THRESHOLD=0.028\n    GAME_RECORD_JPEG_QUALITY=78\n\n第一次建议保持默认值。`game_recordings/` 已加入 `.gitignore`，真实牌局截图不会提交到 GitHub。\n\n采集模式不依赖 OpenAI API，因此即使视觉模型尚未配置，也可以先采集真实牌局。
