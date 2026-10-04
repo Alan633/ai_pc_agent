@@ -5,6 +5,7 @@ import random
 from dataclasses import dataclass
 
 from game_baque.models import Card, GameDecision
+from game_baque.opponent_model import OpponentPatternModel
 from game_baque.rules import evaluate_hu
 from game_baque.strategy import hand_potential
 from game_baque.tracker import TableTracker, card_from_key
@@ -50,6 +51,7 @@ class ExpectedValueEngine:
         self.opponent_risk_weight = max(0.0, float(opponent_risk_weight))
         self.discount = min(max(float(discount), 0.1), 1.0)
         self.rng = random.Random(seed)
+        self.opponent_model = OpponentPatternModel(samples=max(160, self.simulations // 2), seed=seed)
 
     def opponent_threats(
         self,
@@ -103,18 +105,14 @@ class ExpectedValueEngine:
         *,
         samples: int | None = None,
     ) -> float:
-        """估计把某张牌暴露给对手后，直接帮助三家成牌的损失风险。"""
-        samples = samples or max(120, self.simulations // 3)
-        total = 0.0
-        for _ in range(samples):
-            hands = tracker.sample_opponent_hands(self.rng)
-            for seat, hand in hands.items():
-                if tracker.opponents[seat].finished or len(hand) != 7:
-                    continue
-                hu = evaluate_hu(hand + [card], gold_ranks)
-                if hu is not None:
-                    total += hu.theoretical_score
-        return total / samples
+        """估计把某张牌暴露给对手后，直接帮助三家成牌的期望损失。"""
+        risks = self.opponent_model.release_risk(
+            card,
+            tracker,
+            gold_ranks,
+            samples=samples or max(120, self.simulations // 3),
+        )
+        return sum(item.expected_hu_score for item in risks)
 
     def choose_8_card_action(
         self,
@@ -126,6 +124,14 @@ class ExpectedValueEngine:
             raise ValueError("收益决策必须输入 8 张手牌")
 
         values: list[ActionValue] = []
+        pattern_inference = self.opponent_model.infer_all(
+            tracker,
+            gold_ranks,
+            samples=max(120, self.simulations // 3),
+            top_patterns=4,
+            top_cards=6,
+        )
+        table_risk = sum(item.expected_hu_score_next_draw for item in pattern_inference)
         immediate = evaluate_hu(hand, gold_ranks)
         if immediate is not None:
             values.append(
@@ -143,10 +149,18 @@ class ExpectedValueEngine:
         for index, discarded in enumerate(hand):
             kept = [card for i, card in enumerate(hand) if i != index]
             future = self._rollout_future_hu(kept, gold_ranks, tracker)
-            danger = self.danger_of_releasing(discarded, tracker, gold_ranks)
+            release_risks = self.opponent_model.release_risk(
+                discarded,
+                tracker,
+                gold_ranks,
+                samples=max(120, self.simulations // 3),
+            )
+            danger = sum(item.expected_hu_score for item in release_risks)
             # 小幅加入结构潜力，避免所有有限 horizon 未胡时全部变成 0。
             structure = hand_potential(kept, gold_ranks) * 0.08
-            ev = future + structure - self.opponent_risk_weight * danger
+            # table_risk 反映继续一轮时三家抢先成牌的总体威胁；
+            # danger 反映当前弃牌本身给三家送胡的增量风险。
+            ev = future + structure - self.opponent_risk_weight * danger - 0.22 * table_risk
             values.append(
                 ActionValue(
                     action="discard",
@@ -157,7 +171,8 @@ class ExpectedValueEngine:
                     opponent_risk=danger,
                     reason=(
                         f"打 {discarded.label}：未来胡牌EV {future:.1f}，"
-                        f"结构价值 {structure:.1f}，放牌风险 {danger:.1f}"
+                        f"结构价值 {structure:.1f}，放牌风险 {danger:.1f}，"
+                        f"全桌下一轮威胁 {table_risk:.1f}"
                     ),
                 )
             )
