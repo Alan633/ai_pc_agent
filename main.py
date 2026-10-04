@@ -38,7 +38,13 @@ def main() -> None:
     session = AgentSession()
     catalog = AppCatalog(settings.base_dir / "config" / "apps.yaml")
     processes = ProcessManager(security, catalog)
+
+    # 专项能力全部走插件层。必须在 Planner 读取 schemas() 前注册，
+    # 这样本地 Qwen 才能直接调用“观察八雀/自动玩/验收报告”等能力。
+    baque = BaquePlugin.build(settings, session)
     registry = build_registry(settings, security, processes, session)
+    baque.register_tools(registry)
+
     planner = OpenAIPlanner(
         settings.openai_api_key,
         settings.openai_model,
@@ -49,9 +55,6 @@ def main() -> None:
 
     confirmations = ConfirmationStore()
     emergency = EmergencyHotkey(session)
-
-    # 专项能力全部走插件层。点字成金只是 Agent 的一个插件，不再作为主程序核心。
-    baque = BaquePlugin.build(settings, session)
 
     async def post_init(application: Application) -> None:
         session.attach_loop(asyncio.get_running_loop())
@@ -106,6 +109,7 @@ def main() -> None:
         game=baque.game,
         game_recorder=baque.recorder,
         game_observer=baque.observer,
+        baque_plugin=baque,
     ).install(application)
     LOGGER.info("启动 Telegram polling")
     application.run_polling(drop_pending_updates=False)
