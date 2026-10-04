@@ -208,7 +208,11 @@ class TelegramHandlers:
             async with self.session.task_lock:
                 result = await self.game.step(execute=False)
             await update.effective_message.reply_text(
-                self.game.state_text() + "\n策略预览：" + result.message
+                self.game.state_text()
+                + "\n"
+                + self.game.opponent_state_text()
+                + "\n策略预览："
+                + result.message
             )
             if result.frame.path.exists():
                 with result.frame.path.open("rb") as image:
