@@ -44,6 +44,43 @@ def _foreground_window() -> tuple[int, str, tuple[int, int, int, int]]:
     return hwnd, title, (rect.left, rect.top, rect.right, rect.bottom)
 
 
+def focus_game_window(title_keyword: str) -> str:
+    """按标题找到欢乐斗地主窗口并切到前台。
+
+    Telegram/本地模型命令可能在抖音、IDE 等窗口前台发出；八雀自动模式不能
+    要求用户手动切窗，因此启动时先主动恢复并聚焦目标游戏窗口。
+    """
+    from pywinauto import Desktop
+
+    keyword = title_keyword.strip().casefold()
+    if not keyword:
+        raise ValueError("游戏窗口标题关键字不能为空")
+
+    matches = []
+    for window in Desktop(backend="win32").windows():
+        try:
+            title = window.window_text().strip()
+            if not title or keyword not in title.casefold() or not window.is_visible():
+                continue
+            rect = window.rectangle()
+            area = max(0, rect.width()) * max(0, rect.height())
+            matches.append((area, window, title))
+        except Exception:
+            continue
+
+    if not matches:
+        raise RuntimeError(f"没有找到包含“{title_keyword}”的游戏窗口")
+
+    _, window, title = max(matches, key=lambda item: item[0])
+    try:
+        if window.is_minimized():
+            window.restore()
+    except Exception:
+        pass
+    window.set_focus()
+    return title
+
+
 def get_game_window(title_keyword: str) -> GameWindow:
     """返回当前前台游戏窗口的位置，并统一做窗口/主屏范围校验。"""
     import pyautogui
