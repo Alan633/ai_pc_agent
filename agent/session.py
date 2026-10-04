@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Coroutine
+from typing import Any, TypeVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+
+
+T = TypeVar("T")
 
 
 class TaskState(str, Enum):
@@ -35,6 +40,31 @@ class AgentSession:
 
     def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        return self._loop
+
+    def run_coroutine_threadsafe(
+        self,
+        coroutine: Coroutine[Any, Any, T],
+        *,
+        timeout: float = 30.0,
+    ) -> T:
+        """从 ToolRegistry 的工作线程安全调用主事件循环中的异步能力。"""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            coroutine.close()
+            raise RuntimeError("Agent 事件循环尚未初始化")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            coroutine.close()
+            raise RuntimeError("不能在主事件循环线程同步等待异步工具")
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        return future.result(timeout=max(1.0, timeout))
 
     def begin(self, task: asyncio.Task[object], description: str) -> None:
         self.stop_event.clear()
