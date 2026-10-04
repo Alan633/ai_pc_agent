@@ -203,6 +203,27 @@ EVENT_PROMPT = """你负责分析腾讯欢乐斗地主“百变八雀·点字成
 """
 
 
+LOCAL_EVENT_PROMPT = """分析百变八雀一个动作片段。输入三张图依次 BEFORE/PEAK/AFTER，只输出 JSON，不要解释。
+
+目标：记录 left/top/right 三家真实的取牌→弃牌动作。
+- actor: left/top/right/self/none
+- event_type: turn/opportunity/hu/settlement/round_start/animation/unknown
+- draw_source: deck/visible/opportunity/none/unknown
+- 普通牌 rank=6/7/8/9/10/J/Q/K/A，suit=S/H/C/D；癞子=WILD/NONE；看不清=NONE/NONE。
+- turn 必须尽量给最终 discard_card；暗摸 drawn_card 不要猜。
+- 全屏“硬气/比翼为邻/金×N”等特效=animation，不要记成玩家动作。
+- actor_hint 只是提示，截图证据优先。
+- deck_before/deck_after 看不清填 -1；机会牌 chosen_index 不确定填 -1。
+
+固定输出：
+{"actor":"none","event_type":"unknown","draw_source":"none",
+"drawn_card":{"rank":"NONE","suit":"NONE","confidence":0.0},
+"discard_card":{"rank":"NONE","suit":"NONE","confidence":0.0},
+"opportunity_cards":[],"opportunity_chosen_index":-1,
+"deck_before":-1,"deck_after":-1,"confidence":0.0,"evidence":""}
+"""
+
+
 class OpponentEventVision:
     def __init__(
         self,
@@ -316,15 +337,17 @@ class OpponentEventVision:
         actor_hint: str,
         peak_scores: dict[str, float],
     ) -> str:
+        compact_scores = {
+            key: round(float(value), 3)
+            for key, value in peak_scores.items()
+            if float(value) >= 0.01
+        }
         prompt = (
-            EVENT_PROMPT
+            LOCAL_EVENT_PROMPT
             + "\nactor_hint="
             + actor_hint
-            + "; local_peak_scores="
-            + json.dumps(peak_scores, ensure_ascii=False)
-            + "\n严格只输出 JSON 对象，不要 Markdown。JSON Schema：\n"
-            + json.dumps(EVENT_SCHEMA, ensure_ascii=False)
-            + "\n下面三张图片依次是 BEFORE、PEAK、AFTER。"
+            + "; scores="
+            + json.dumps(compact_scores, ensure_ascii=False, separators=(",", ":"))
         )
         content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
         for path in (before, peak, after):
@@ -346,9 +369,23 @@ class OpponentEventVision:
                 **kwargs,
                 response_format={"type": "json_object"},
             )
-        except Exception:
+        except Exception as exc:
+            if self._is_context_length_error(exc):
+                raise RuntimeError(
+                    "本地对手视觉模型上下文不足；三关键帧模式建议 Ollama 上下文至少 8192。"
+                ) from exc
             response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""
+
+    @staticmethod
+    def _is_context_length_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "context size" in text
+            or "context_length" in text
+            or "exceed_context" in text
+            or ("n_ctx" in text and "exceed" in text)
+        )
 
     @staticmethod
     def _clean_json(raw: str) -> str:
