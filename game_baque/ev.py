@@ -114,6 +114,67 @@ class ExpectedValueEngine:
         )
         return sum(item.expected_hu_score for item in risks)
 
+    def choose_draw_action(
+        self,
+        hand: list[Card],
+        visible_cards: list[Card],
+        gold_ranks: tuple[str, ...] | list[str],
+        tracker: TableTracker,
+    ) -> GameDecision:
+        """在摸牌堆和桌面亮牌之间做“自己收益 + 阻断对手”的联合决策。"""
+        if len(hand) != 7:
+            raise ValueError("摸牌决策必须输入 7 张手牌")
+
+        def self_value(card: Card) -> float:
+            hand8 = hand + [card]
+            hu = evaluate_hu(hand8, gold_ranks)
+            if hu is not None:
+                return float(hu.theoretical_score)
+            # 非立即胡时使用结构潜力，量纲压到与中低倍成牌收益可比较。
+            return hand_potential(hand8, gold_ranks) * 0.55
+
+        visible_values: list[tuple[float, int, float, float]] = []
+        for index, card in enumerate(visible_cards):
+            own = self_value(card)
+            deny = self.danger_of_releasing(
+                card,
+                tracker,
+                gold_ranks,
+                samples=max(100, self.simulations // 4),
+            )
+            total = own + 0.35 * deny
+            visible_values.append((total, index, own, deny))
+
+        draw_dist = tracker.draw_distribution()
+        deck_own = 0.0
+        for key, probability in draw_dist.items():
+            deck_own += probability * self_value(card_from_key(key))
+        # 摸暗牌意味着当前所有亮牌仍可能被对手利用；作为风险扣分。
+        table_exposure = sum(item[3] for item in visible_values)
+        deck_total = deck_own - 0.18 * table_exposure
+
+        if visible_values:
+            best_total, best_index, own, deny = max(visible_values)
+            if best_total > deck_total:
+                card = visible_cards[best_index]
+                return GameDecision(
+                    "draw_visible",
+                    visible_index=best_index,
+                    reason=(
+                        f"取亮牌 {card.label}：自己价值 {own:.1f}，"
+                        f"同时阻断对手价值 {deny:.1f}；综合 {best_total:.1f} > "
+                        f"摸牌堆 {deck_total:.1f}"
+                    ),
+                )
+
+        return GameDecision(
+            "draw_deck",
+            reason=(
+                f"摸牌堆期望 {deck_own:.1f}，扣除亮牌留给对手的风险后 "
+                f"综合 {deck_total:.1f}，仍优于当前亮牌"
+            ),
+        )
+
     def choose_8_card_action(
         self,
         hand: list[Card],
