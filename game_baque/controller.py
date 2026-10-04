@@ -136,7 +136,8 @@ class BaqueGameController:
         ):
             return GameStepResult(False, "画面尚未变化，等待游戏响应。", snapshot, frame)
 
-        decision = self._decide(snapshot)
+        # EV/蒙特卡洛属于 CPU 密集计算，放到工作线程，避免阻塞 6 FPS 对手观察器。
+        decision = await asyncio.to_thread(self._decide, snapshot)
         if not execute:
             return GameStepResult(False, decision.reason, snapshot, frame)
 
