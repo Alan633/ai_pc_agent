@@ -12,6 +12,8 @@ from agent.session import AgentSession
 from config import load_settings
 from emergency import EmergencyHotkey
 from game_baque.controller import BaqueGameController
+from game_baque.event_vision import OpponentEventVision
+from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
 from game_baque.vision import BaqueVision
 from logging_setup import configure_logging
@@ -69,6 +71,21 @@ def main() -> None:
             auto_next_round=settings.game_auto_next_round,
         )
 
+    game_observer: OpponentObserver | None = None
+    if game is not None:
+        game_observer = OpponentObserver(
+            vision=OpponentEventVision(
+                settings.openai_api_key,
+                settings.game_vision_model,
+                base_url=settings.game_vision_base_url,
+            ),
+            output_root=settings.game_recordings_dir,
+            on_observation=game.apply_opponent_observation,
+            window_title_keyword=settings.game_window_title_keyword,
+            fps=settings.game_record_fps,
+            min_confidence=settings.game_min_event_confidence,
+        )
+
     async def post_init(application: Application) -> None:
         session.attach_loop(asyncio.get_running_loop())
         emergency.start()
@@ -88,6 +105,7 @@ def main() -> None:
                     f"Screen: {width}x{height}",
                     f"点字成金: {'Ready' if game else '需要 OPENAI_API_KEY 或 GAME_VISION_BASE_URL'}",
                     "牌局采集器: Ready",
+                    f"对手观察器: {'Ready' if game_observer else 'Unavailable'}",
                     "Emergency Stop: Ctrl+Alt+F12",
                     "Agent: READY",
                     "================================",
@@ -100,6 +118,8 @@ def main() -> None:
         session.request_stop()
         if game_recorder.running:
             await game_recorder.stop()
+        if game_observer is not None and game_observer.running:
+            await game_observer.stop()
         emergency.stop()
 
     application = (
@@ -118,6 +138,7 @@ def main() -> None:
         confirmations,
         game=game,
         game_recorder=game_recorder,
+        game_observer=game_observer,
     ).install(application)
     LOGGER.info("启动 Telegram polling")
     application.run_polling(drop_pending_updates=False)
