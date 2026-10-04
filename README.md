@@ -82,10 +82,21 @@ TELEGRAM_BOT_TOKEN=BotFather给出的Token
 ALLOWED_TELEGRAM_USER_ID=你的数字UserID
 OPENAI_API_KEY=你的OpenAI_API_Key
 OPENAI_MODEL=gpt-4.1-mini
+OPENAI_BASE_URL=
 AGENT_ALLOWED_ROOTS=D:\Projects;D:\Work
 ```
 
-应用路径和启动参数统一在 `config/apps.yaml` 中维护。模型名称可按账号实际可用模型修改；固定 Telegram 指令不需要 OpenAI Key，自然语言 Agent 必须配置 `OPENAI_API_KEY`。
+应用路径和启动参数统一在 `config/apps.yaml` 中维护。模型名称可按账号实际可用模型修改；固定 Telegram 指令不需要模型。自然语言 Agent 使用 OpenAI 官方接口时配置 `OPENAI_API_KEY`，使用本地兼容接口时配置 `OPENAI_BASE_URL`。
+
+如果使用本机 Ollama，可改为：
+
+```dotenv
+OPENAI_API_KEY=ollama
+OPENAI_MODEL=qwen3.5:9b
+OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+```
+
+Ollama 不校验 `OPENAI_API_KEY`，这里的 `ollama` 只是 OpenAI SDK 要求的占位值。项目通过 Telegram long polling 收到消息后，会把普通文本交给该本地接口；`/status`、`/screen` 等固定指令不经过模型。
 
 ## 5. 安装依赖
 

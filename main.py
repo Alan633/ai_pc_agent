@@ -34,7 +34,12 @@ def main() -> None:
     catalog = AppCatalog(settings.base_dir / "config" / "apps.yaml")
     processes = ProcessManager(security, catalog)
     registry = build_registry(settings, security, processes, session)
-    planner = OpenAIPlanner(settings.openai_api_key, settings.openai_model, registry.schemas())
+    planner = OpenAIPlanner(
+        settings.openai_api_key,
+        settings.openai_model,
+        registry.schemas(),
+        settings.openai_base_url,
+    )
     executor = AgentExecutor(planner, registry, security, session, settings.max_steps)
     confirmations = ConfirmationStore()
     emergency = EmergencyHotkey(session)
@@ -73,7 +78,7 @@ def main() -> None:
                     "AI PC Agent",
                     "================================",
                     f"Telegram: Connected (@{bot.username})",
-                    f"OpenAI: {'Ready' if settings.openai_api_key else 'Not configured (commands only)'}",
+                    f"LLM: {'Ready' if settings.openai_api_key or settings.openai_base_url else 'Not configured (commands only)'}",
                     f"Authorized User: {masked}",
                     f"Screen: {width}x{height}",
                     f"点字成金: {'Ready' if game else '需要 OPENAI_API_KEY'}",

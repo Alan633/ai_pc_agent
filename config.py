@@ -28,6 +28,7 @@ class Settings:
     game_record_archive_fps: float
     game_record_diff_threshold: float
     game_record_jpeg_quality: int
+    openai_base_url: str = ""
 
     @property
     def logs_dir(self) -> Path:
@@ -110,6 +111,7 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_record_archive_fps=max(float(os.getenv("GAME_RECORD_ARCHIVE_FPS", "2")), 0.2),
         game_record_diff_threshold=min(max(float(os.getenv("GAME_RECORD_DIFF_THRESHOLD", "0.028")), 0.001), 0.30),
         game_record_jpeg_quality=min(max(int(os.getenv("GAME_RECORD_JPEG_QUALITY", "78")), 40), 95),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/"),
     )
     settings.prepare_directories()
     return settings
