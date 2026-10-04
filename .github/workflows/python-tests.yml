@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - feature/baque-auto-player
+      - AIAGENT
 
 jobs:
   test:
