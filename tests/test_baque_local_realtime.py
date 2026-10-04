@@ -49,6 +49,7 @@ def test_local_vision_payload_parses_opponent_discard() -> None:
         "swap_button": {"x": 0, "y": 0, "visible": False},
         "discard_button": {"x": 0, "y": 0, "visible": False},
         "hu_button": {"x": 0, "y": 0, "visible": False},
+        "start_button": {"x": 0, "y": 0, "visible": False},
         "continue_button": {"x": 0, "y": 0, "visible": False},
         "close_popup": {"x": 0, "y": 0, "visible": False},
         "deck_count": 50,
@@ -114,3 +115,29 @@ def test_controller_ignores_low_confidence_opponent_event(tmp_path: Path) -> Non
 
     assert controller.tracker.opponents["right"].discards == []
     assert controller.opponent_event_count == 0
+
+
+
+def test_local_vision_payload_parses_start_screen() -> None:
+    payload = {
+        "screen_type": "start",
+        "gold_ranks": [],
+        "hand": [],
+        "visible_cards": [],
+        "opponent_events": [],
+        "deck_click": {"x": 0, "y": 0, "visible": False},
+        "swap_button": {"x": 0, "y": 0, "visible": False},
+        "discard_button": {"x": 0, "y": 0, "visible": False},
+        "hu_button": {"x": 0, "y": 0, "visible": False},
+        "start_button": {"x": 512, "y": 402, "visible": True},
+        "continue_button": {"x": 0, "y": 0, "visible": False},
+        "close_popup": {"x": 0, "y": 0, "visible": False},
+        "deck_count": -1,
+        "message": "百变八雀开始页面",
+    }
+
+    snapshot = BaqueVision._to_snapshot(payload)
+    assert snapshot.screen_type == ScreenType.START
+    assert snapshot.start_button is not None
+    assert snapshot.start_button.x == 512
+    assert snapshot.start_button.y == 402
