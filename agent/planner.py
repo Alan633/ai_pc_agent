@@ -174,7 +174,9 @@ class OpenAIPlanner:
         if assistant_tool_calls:
             assistant_message["tool_calls"] = assistant_tool_calls
         history.append(assistant_message)
-        self._chat_histories[response_id] = history
+        # 只有仍需回传工具结果时才保留会话，避免已完成任务长期占用内存。
+        if calls:
+            self._chat_histories[response_id] = history
         return PlanResponse(response_id, calls, final_text)
 
     def _parse_text_tool_call(self, text: str) -> ToolCall | None:
