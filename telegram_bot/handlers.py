@@ -123,6 +123,7 @@ class TelegramHandlers:
                     f"任务状态：{session.state.value}",
                     f"牌局采集：{'RUNNING' if self.game_recorder and self.game_recorder.running else 'IDLE'}",
                     f"对手观察：{'RUNNING' if self.game_observer and self.game_observer.running else 'IDLE'}",
+                    f"八雀自动：{'RUNNING' if self.baque_plugin and self.baque_plugin.auto_running else 'IDLE'}",
                 ]
             )
         )
@@ -213,20 +214,38 @@ class TelegramHandlers:
             return
         self.confirmations.cancel_all()
         stopped_agent = self.session.request_stop()
+        stopped_auto = False
         stopped_recording = False
         stopped_observer = False
+
+        if self.baque_plugin is not None and self.baque_plugin.auto_running:
+            result = await self.baque_plugin.auto_stop()
+            stopped_auto = bool(result.get("stopped"))
+
         if self.game_recorder is not None and self.game_recorder.running:
             await self.game_recorder.stop()
             stopped_recording = True
-        if self.game_observer is not None and self.game_observer.running:
+
+        # 全局 /stop 会把手动观察模式也停掉。
+        if self.baque_plugin is not None:
+            if self.game_observer is not None and self.game_observer.running:
+                try:
+                    result = await self.baque_plugin.watch_stop()
+                    stopped_observer = bool(result.get("stopped"))
+                except RuntimeError:
+                    pass
+        elif self.game_observer is not None and self.game_observer.running:
             await self.game_observer.stop()
             stopped_observer = True
             if self.game is not None:
                 self.game.set_external_observer_active(False)
-        if stopped_agent or stopped_recording or stopped_observer:
+
+        if stopped_agent or stopped_auto or stopped_recording or stopped_observer:
             parts = []
             if stopped_agent:
                 parts.append("Agent 任务")
+            if stopped_auto:
+                parts.append("八雀自动游戏")
             if stopped_recording:
                 parts.append("牌局采集")
             if stopped_observer:
@@ -287,146 +306,237 @@ class TelegramHandlers:
     async def game_watch_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        if self.game is None or self.game_observer is None:
-            await update.effective_message.reply_text("对手观察器需要可用的游戏视觉模型。")
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
             return
-        if self.game_observer.running:
-            await update.effective_message.reply_text(self.game_observer.status().to_text())
-            return
-        if self.session.status().busy:
-            await update.effective_message.reply_text(BUSY)
-            return
-
         try:
-            # 先关闭旧的“两帧差分事件”路径，避免上一张历史截图被误当成本局事件。
-            self.game.set_external_observer_active(True)
-            async with self.session.task_lock:
-                # 只读取当前帧，建立自己的 7/8 张手牌、金牌和牌堆基线。
-                await self.game.inspect()
-            status = await self.game_observer.start()
+            result = await self.baque_plugin.watch_start()
             await update.effective_message.reply_text(
-                status.to_text()
-                + "\n\n现在可以继续手动玩。程序会后台识别三家完整回合，"
-                + "高置信事件会自动写入记牌器。"
+                result.get("message", "观察器状态已更新。")
+                + "\n\n"
+                + result.get("observer", "")
             )
         except Exception as exc:
-            self.game.set_external_observer_active(False)
-            LOGGER.exception("启动对手观察器失败")
+            LOGGER.exception("启动八雀观察器失败")
             await update.effective_message.reply_text(
-                f"启动对手观察失败：{type(exc).__name__}: {exc}"
+                f"启动观察失败：{type(exc).__name__}: {exc}"
             )
 
     async def game_watch_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        if self.game_observer is None:
-            await update.effective_message.reply_text("对手观察器未初始化。")
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
             return
-        parts = [self.game_observer.status().to_text()]
-        if self.game is not None:
-            parts.append(self.game.opponent_state_text())
-            parts.append(self.game.recent_opponent_events_text())
-        await update.effective_message.reply_text("\n\n".join(parts))
+        data = self.baque_plugin.watch_status()
+        await update.effective_message.reply_text(
+            "\n\n".join(
+                [
+                    str(data.get("observer", "")),
+                    str(data.get("opponents", "")),
+                    str(data.get("recent_events", "")),
+                ]
+            )
+        )
 
     async def game_watch_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        if self.game_observer is None or not self.game_observer.running:
-            await update.effective_message.reply_text("当前没有运行中的对手观察器。")
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
             return
-        status = await self.game_observer.stop()
-        if self.game is not None:
-            self.game.set_external_observer_active(False)
-        await update.effective_message.reply_text(status.to_text())
+        try:
+            result = await self.baque_plugin.watch_stop()
+            await update.effective_message.reply_text(
+                str(result.get("observer") or result.get("message") or "观察器已停止。")
+            )
+        except Exception as exc:
+            await update.effective_message.reply_text(
+                f"停止观察失败：{type(exc).__name__}: {exc}"
+            )
 
     async def game_state(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        if self.game is None:
-            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
-            return
-        if self.session.status().busy:
-            await update.effective_message.reply_text(BUSY)
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
             return
         try:
-            async with self.session.task_lock:
-                result = await self.game.step(execute=False)
+            result = await self.baque_plugin.get_state()
+            if not result.ok:
+                await update.effective_message.reply_text(result.error or "八雀状态读取失败")
+                return
+            data = result.data
             await update.effective_message.reply_text(
-                self.game.state_text()
-                + "\n"
-                + self.game.opponent_state_text()
-                + "\n策略预览："
-                + result.message
+                "\n\n".join(
+                    [
+                        str(data.get("state", "")),
+                        str(data.get("opponents", "")),
+                        "策略预览：" + str(data.get("strategy_preview") or data.get("message") or ""),
+                    ]
+                )
             )
-            if result.frame.path.exists():
-                with result.frame.path.open("rb") as image:
-                    await update.effective_message.reply_photo(image, caption="点字成金识别截图")
+            if result.artifact and result.artifact.exists():
+                with result.artifact.open("rb") as image:
+                    await update.effective_message.reply_photo(image, caption="八雀识别截图")
         except Exception as exc:
-            LOGGER.exception("读取点字成金状态失败")
-            await update.effective_message.reply_text(f"识别失败：{type(exc).__name__}: {exc}")
+            LOGGER.exception("读取八雀状态失败")
+            await update.effective_message.reply_text(
+                f"识别失败：{type(exc).__name__}: {exc}"
+            )
 
     async def game_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        if self.game is None:
-            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
-            return
-        if self.session.status().busy:
-            await update.effective_message.reply_text(BUSY)
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
             return
         try:
-            async with self.session.task_lock:
-                result = await self.game.step(execute=True)
-            await update.effective_message.reply_text(result.message)
+            result = await self.baque_plugin.step_once()
+            await update.effective_message.reply_text(str(result.get("message", "单步完成。")))
         except Exception as exc:
-            LOGGER.exception("执行点字成金单步失败")
-            await update.effective_message.reply_text(f"执行失败：{type(exc).__name__}: {exc}")
+            LOGGER.exception("执行八雀单步失败")
+            await update.effective_message.reply_text(
+                f"执行失败：{type(exc).__name__}: {exc}"
+            )
 
     async def game_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
             return
-        if self.game is None:
-            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
             return
-        if self.session.status().busy or self.session.task_lock.locked():
-            await update.effective_message.reply_text(BUSY)
-            return
-        task = context.application.create_task(self._run_game_loop(update), update=update)
-        self.session.begin(task, "点字成金自动游戏")
-        await update.effective_message.reply_text(
-            "点字成金自动游戏已启动。请保持欢乐斗地主窗口在前台；/game_stop 或 /stop 可停止。"
-        )
+        try:
+            result = await self.baque_plugin.auto_start()
+            await update.effective_message.reply_text(str(result.get("message", "八雀自动游戏已启动。")))
+        except Exception as exc:
+            LOGGER.exception("启动八雀自动游戏失败")
+            await update.effective_message.reply_text(
+                f"启动失败：{type(exc).__name__}: {exc}"
+            )
 
     async def game_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await self.stop(update, context)
+        if not await self._authorized(update):
+            return
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
+            return
+        parts: list[str] = []
+        if self.baque_plugin.auto_running:
+            result = await self.baque_plugin.auto_stop()
+            parts.append(str(result.get("message", "自动游戏已停止。")))
+        if self.game_observer is not None and self.game_observer.running:
+            try:
+                result = await self.baque_plugin.watch_stop()
+                parts.append(str(result.get("message") or result.get("observer") or "观察器已停止。"))
+            except RuntimeError:
+                pass
+        await update.effective_message.reply_text("\n".join(parts) if parts else "当前没有运行中的八雀任务。")
 
-    async def _run_game_loop(self, update: Update) -> None:
-        observer_started_here = False
-        try:
-            async with self.session.task_lock:
-                if self.game is None:
-                    await update.effective_message.reply_text("游戏模块不可用。")
-                    return
+    async def game_acceptance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
+            return
+        report = self.baque_plugin.acceptance_report()
+        await update.effective_message.reply_text(self._format_acceptance(report))
 
-                if self.game_observer is not None and not self.game_observer.running:
-                    # 先关闭旧两帧事件路径，再用单帧建立本局基线，避免历史截图污染记牌。
-                    self.game.set_external_observer_active(True)
-                    await self.game.inspect()
-                    await self.game_observer.start()
-                    observer_started_here = True
+    async def game_accept(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
+            return
+        if len(context.args) < 2:
+            await update.effective_message.reply_text(
+                "用法：/game_accept own|opponent|action ok|bad [备注]"
+            )
+            return
 
-                message = await self.game.run_loop()
-            await update.effective_message.reply_text(message)
-        finally:
-            if (
-                observer_started_here
-                and self.game_observer is not None
-                and self.game_observer.running
-            ):
-                await self.game_observer.stop()
-            if observer_started_here and self.game is not None:
-                self.game.set_external_observer_active(False)
-            self.session.finish()
+        category_map = {
+            "own": "own_state",
+            "自己": "own_state",
+            "opponent": "opponent_event",
+            "对手": "opponent_event",
+            "action": "action",
+            "动作": "action",
+            "点击": "action",
+        }
+        result_map = {
+            "ok": True,
+            "对": True,
+            "正确": True,
+            "bad": False,
+            "错": False,
+            "错误": False,
+        }
+        category = category_map.get(context.args[0].lower())
+        correct = result_map.get(context.args[1].lower())
+        if category is None or correct is None:
+            await update.effective_message.reply_text(
+                "用法：/game_accept own|opponent|action ok|bad [备注]"
+            )
+            return
+        note = " ".join(context.args[2:])
+        result = self.baque_plugin.acceptance_mark(category, correct, note)
+        accuracy = result.get("accuracy")
+        accuracy_text = f"{float(accuracy) * 100:.1f}%" if accuracy is not None else "暂无"
+        await update.effective_message.reply_text(
+            f"已记录：{category} {'正确' if correct else '错误'}；"
+            f"样本 {result['checks']}，当前准确率 {accuracy_text}。"
+        )
+
+    async def game_accept_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
+            return
+        result = self.baque_plugin.acceptance.reset_session()
+        await update.effective_message.reply_text(
+            "已开始新一轮八雀验收统计；历史标签仍保留。\n"
+            + str(result.get("labels_path", ""))
+        )
+
+    @staticmethod
+    def _format_acceptance(report: dict[str, Any]) -> str:
+        manual = report.get("manual_accuracy", {})
+        automatic = report.get("automatic_checks", {})
+
+        def metric(name: str, label: str) -> str:
+            item = manual.get(name, {})
+            accuracy = item.get("accuracy")
+            accuracy_text = "暂无" if accuracy is None else f"{float(accuracy) * 100:.1f}%"
+            return (
+                f"{label}：{accuracy_text} "
+                f"({item.get('correct', 0)}/{item.get('checks', 0)})"
+            )
+
+        lines = [
+            f"八雀验收：{report.get('verdict', 'UNKNOWN')}",
+            metric("own_state", "自己牌面"),
+            metric("opponent_event", "对手动作"),
+            metric("action", "决策/点击"),
+        ]
+        own_auto = automatic.get("own_unknown_rate", {})
+        observer_auto = automatic.get("observer_stability", {})
+        tracker = automatic.get("tracker_consistency", {})
+        unknown = own_auto.get("value")
+        low = observer_auto.get("low_confidence_rate")
+        lines.extend(
+            [
+                "自动指标：",
+                f"- 牌池一致性：{tracker.get('status', 'UNKNOWN')}",
+                f"- 画面 unknown 率：{'暂无' if unknown is None else f'{float(unknown) * 100:.1f}%'} "
+                f"[{own_auto.get('status', 'UNKNOWN')}]",
+                f"- 对手低置信率：{'暂无' if low is None else f'{float(low) * 100:.1f}%'} "
+                f"[{observer_auto.get('status', 'UNKNOWN')}]",
+            ]
+        )
+        if report.get("verdict") == "INSUFFICIENT_DATA":
+            lines.append("还需要继续打真值标签，达到样本门槛后才会给 PASS/FAIL。")
+        return "\n".join(lines)
 
     async def natural_language(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
