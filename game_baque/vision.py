@@ -312,18 +312,33 @@ class BaqueVision:
             cls._to_opponent_event(item)
             for item in payload.get("opponent_events", [])
         ]
+        deck_click = cls._to_point(payload["deck_click"])
+        swap_button = cls._to_point(payload["swap_button"])
+        discard_button = cls._to_point(payload["discard_button"])
+        hu_button = cls._to_point(payload["hu_button"])
+        continue_button = cls._to_point(payload["continue_button"])
+        start_value = payload.get("start_button")
+        start_button = (
+            cls._to_point(start_value)
+            if isinstance(start_value, dict)
+            else None
+        )
+        # 兼容本地模型偶尔仍把“开始游戏”填入旧的 continue_button 字段。
+        if screen_type == ScreenType.START and start_button is None:
+            start_button = continue_button
+
         return GameSnapshot(
             screen_type=screen_type,
             gold_ranks=tuple(str(rank) for rank in payload.get("gold_ranks", [])),
             hand=hand,
             visible_cards=visible,
             opponent_events=events,
-            deck_click=cls._to_point(payload["deck_click"]),
-            swap_button=cls._to_point(payload["swap_button"]),
-            discard_button=cls._to_point(payload["discard_button"]),
-            hu_button=cls._to_point(payload["hu_button"]),
-            start_button=cls._to_point(payload["start_button"]),
-            continue_button=cls._to_point(payload["continue_button"]),
+            deck_click=deck_click,
+            swap_button=swap_button,
+            discard_button=discard_button,
+            hu_button=hu_button,
+            start_button=start_button,
+            continue_button=continue_button,
             close_popup=cls._to_point(payload["close_popup"]),
             deck_count=None if int(payload.get("deck_count", -1)) < 0 else int(payload["deck_count"]),
             message=str(payload.get("message", "")),
