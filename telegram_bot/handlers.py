@@ -115,6 +115,7 @@ class TelegramHandlers:
             getattr(user, "id", None),
             getattr(chat, "id", None),
             log_text,
+            extra={"console_red": True},
         )
 
     async def _authorized(self, update: Update) -> bool:
