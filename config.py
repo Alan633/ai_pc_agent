@@ -19,6 +19,18 @@ class Settings:
     confirm_timeout_seconds: int
     allowed_roots: tuple[Path, ...]
     allowed_executables: frozenset[str]
+    game_vision_model: str = "gpt-4.1-mini"
+    game_window_title_keyword: str = "欢乐斗地主"
+    game_action_interval_seconds: float = 1.5
+    game_min_card_confidence: float = 0.72
+    game_auto_next_round: bool = False
+    game_record_fps: float = 6.0
+    game_record_archive_fps: float = 2.0
+    game_record_diff_threshold: float = 0.028
+    game_record_jpeg_quality: int = 78
+    openai_base_url: str = ""
+    game_vision_base_url: str = ""
+    game_min_event_confidence: float = 0.80
 
     @property
     def logs_dir(self) -> Path:
@@ -28,9 +40,18 @@ class Settings:
     def screenshots_dir(self) -> Path:
         return self.base_dir / "screenshots"
 
+    @property
+    def game_recordings_dir(self) -> Path:
+        return self.base_dir / "game_recordings"
+
     def prepare_directories(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.screenshots_dir.mkdir(parents=True, exist_ok=True)
+        self.game_recordings_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _env_bool(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True) -> Settings:
@@ -70,17 +91,34 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         if item.strip()
     )
     max_steps = min(max(int(os.getenv("MAX_STEPS", "15")), 1), 15)
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    game_vision_base_url = os.getenv("GAME_VISION_BASE_URL", openai_base_url).strip().rstrip("/")
+    game_confidence = min(max(float(os.getenv("GAME_MIN_CARD_CONFIDENCE", "0.72")), 0.0), 1.0)
+    event_confidence = min(max(float(os.getenv("GAME_MIN_EVENT_CONFIDENCE", "0.80")), 0.0), 1.0)
     settings = Settings(
         base_dir=root,
         telegram_bot_token=token,
         allowed_telegram_user_id=allowed_user_id,
         openai_api_key=api_key,
-        openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip(),
-        playwright_headless=os.getenv("PLAYWRIGHT_HEADLESS", "false").strip().lower() in {"1", "true", "yes"},
+        openai_model=openai_model,
+        playwright_headless=_env_bool("PLAYWRIGHT_HEADLESS"),
         max_steps=max_steps,
         confirm_timeout_seconds=max(int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120")), 10),
         allowed_roots=roots,
         allowed_executables=executables,
+        game_vision_model=os.getenv("GAME_VISION_MODEL", openai_model).strip(),
+        game_window_title_keyword=os.getenv("GAME_WINDOW_TITLE", "欢乐斗地主").strip(),
+        game_action_interval_seconds=max(float(os.getenv("GAME_ACTION_INTERVAL_SECONDS", "1.5")), 0.5),
+        game_min_card_confidence=game_confidence,
+        game_auto_next_round=_env_bool("GAME_AUTO_NEXT_ROUND"),
+        game_record_fps=min(max(float(os.getenv("GAME_RECORD_FPS", "6")), 1.0), 12.0),
+        game_record_archive_fps=max(float(os.getenv("GAME_RECORD_ARCHIVE_FPS", "2")), 0.2),
+        game_record_diff_threshold=min(max(float(os.getenv("GAME_RECORD_DIFF_THRESHOLD", "0.028")), 0.001), 0.30),
+        game_record_jpeg_quality=min(max(int(os.getenv("GAME_RECORD_JPEG_QUALITY", "78")), 40), 95),
+        openai_base_url=openai_base_url,
+        game_vision_base_url=game_vision_base_url,
+        game_min_event_confidence=event_confidence,
     )
     settings.prepare_directories()
     return settings

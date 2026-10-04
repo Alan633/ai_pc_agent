@@ -15,6 +15,9 @@ from agent.executor import AgentExecutor
 from agent.session import AgentSession
 from agent.tool_registry import ToolRegistry
 from config import Settings
+from game_baque.controller import BaqueGameController
+from game_baque.observer import OpponentObserver
+from game_baque.recorder import GameRecorder
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.messages import BUSY, NO_TASK, UNAUTHORIZED, command_usage
 from tools.process import ProcessManager
@@ -31,6 +34,9 @@ class TelegramHandlers:
         session: AgentSession,
         processes: ProcessManager,
         confirmations: ConfirmationStore,
+        game: BaqueGameController | None = None,
+        game_recorder: GameRecorder | None = None,
+        game_observer: OpponentObserver | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -38,6 +44,9 @@ class TelegramHandlers:
         self.session = session
         self.processes = processes
         self.confirmations = confirmations
+        self.game = game
+        self.game_recorder = game_recorder
+        self.game_observer = game_observer
 
     def install(self, application: Application) -> None:
         commands = {
@@ -52,6 +61,16 @@ class TelegramHandlers:
             "type": self.type_text,
             "hotkey": self.hotkey,
             "process": self.process,
+            "game_state": self.game_state,
+            "game_step": self.game_step,
+            "game_start": self.game_start,
+            "game_stop": self.game_stop,
+            "game_record_start": self.game_record_start,
+            "game_record_status": self.game_record_status,
+            "game_record_stop": self.game_record_stop,
+            "game_watch_start": self.game_watch_start,
+            "game_watch_status": self.game_watch_status,
+            "game_watch_stop": self.game_watch_stop,
             "stop": self.stop,
         }
         for name, callback in commands.items():
@@ -96,6 +115,8 @@ class TelegramHandlers:
                     f"当前前台窗口：{title}",
                     f"Agent 已运行：{str(uptime).split('.')[0]}",
                     f"任务状态：{session.state.value}",
+                    f"牌局采集：{'RUNNING' if self.game_recorder and self.game_recorder.running else 'IDLE'}",
+                    f"对手观察：{'RUNNING' if self.game_observer and self.game_observer.running else 'IDLE'}",
                 ]
             )
         )
@@ -185,8 +206,221 @@ class TelegramHandlers:
         if not await self._authorized(update):
             return
         self.confirmations.cancel_all()
-        stopped = self.session.request_stop()
-        await update.effective_message.reply_text("已发送停止信号。" if stopped else NO_TASK)
+        stopped_agent = self.session.request_stop()
+        stopped_recording = False
+        stopped_observer = False
+        if self.game_recorder is not None and self.game_recorder.running:
+            await self.game_recorder.stop()
+            stopped_recording = True
+        if self.game_observer is not None and self.game_observer.running:
+            await self.game_observer.stop()
+            stopped_observer = True
+            if self.game is not None:
+                self.game.set_external_observer_active(False)
+        if stopped_agent or stopped_recording or stopped_observer:
+            parts = []
+            if stopped_agent:
+                parts.append("Agent 任务")
+            if stopped_recording:
+                parts.append("牌局采集")
+            if stopped_observer:
+                parts.append("对手观察")
+            await update.effective_message.reply_text("已停止：" + "、".join(parts))
+        else:
+            await update.effective_message.reply_text(NO_TASK)
+
+    async def game_record_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_recorder is None:
+            await update.effective_message.reply_text("牌局采集器未初始化。")
+            return
+        if self.game_recorder.running:
+            await update.effective_message.reply_text(
+                "牌局采集已经在运行。\n" + self.game_recorder.status().to_text()
+            )
+            return
+        try:
+            status = await self.game_recorder.start()
+            await update.effective_message.reply_text(
+                status.to_text()
+                + "\n\n请保持欢乐斗地主窗口在前台，正常手动玩完整一局。"
+                + "\n结束后发送 /game_record_stop。"
+            )
+        except Exception as exc:
+            LOGGER.exception("启动牌局采集失败")
+            await update.effective_message.reply_text(
+                f"启动采集失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def game_record_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_recorder is None:
+            await update.effective_message.reply_text("牌局采集器未初始化。")
+            return
+        await update.effective_message.reply_text(self.game_recorder.status().to_text())
+
+    async def game_record_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_recorder is None:
+            await update.effective_message.reply_text("牌局采集器未初始化。")
+            return
+        if not self.game_recorder.running:
+            await update.effective_message.reply_text(
+                "当前没有正在进行的牌局采集。\n" + self.game_recorder.status().to_text()
+            )
+            return
+        status = await self.game_recorder.stop()
+        await update.effective_message.reply_text(
+            status.to_text()
+            + "\n\n本局数据已保存。后续可根据 events.jsonl 和关键帧训练/调试三家动作识别器。"
+        )
+
+    async def game_watch_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None or self.game_observer is None:
+            await update.effective_message.reply_text("对手观察器需要可用的游戏视觉模型。")
+            return
+        if self.game_observer.running:
+            await update.effective_message.reply_text(self.game_observer.status().to_text())
+            return
+        if self.session.status().busy:
+            await update.effective_message.reply_text(BUSY)
+            return
+
+        try:
+            # 先关闭旧的“两帧差分事件”路径，避免上一张历史截图被误当成本局事件。
+            self.game.set_external_observer_active(True)
+            async with self.session.task_lock:
+                # 只读取当前帧，建立自己的 7/8 张手牌、金牌和牌堆基线。
+                await self.game.inspect()
+            status = await self.game_observer.start()
+            await update.effective_message.reply_text(
+                status.to_text()
+                + "\n\n现在可以继续手动玩。程序会后台识别三家完整回合，"
+                + "高置信事件会自动写入记牌器。"
+            )
+        except Exception as exc:
+            self.game.set_external_observer_active(False)
+            LOGGER.exception("启动对手观察器失败")
+            await update.effective_message.reply_text(
+                f"启动对手观察失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def game_watch_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_observer is None:
+            await update.effective_message.reply_text("对手观察器未初始化。")
+            return
+        parts = [self.game_observer.status().to_text()]
+        if self.game is not None:
+            parts.append(self.game.opponent_state_text())
+            parts.append(self.game.recent_opponent_events_text())
+        await update.effective_message.reply_text("\n\n".join(parts))
+
+    async def game_watch_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game_observer is None or not self.game_observer.running:
+            await update.effective_message.reply_text("当前没有运行中的对手观察器。")
+            return
+        status = await self.game_observer.stop()
+        if self.game is not None:
+            self.game.set_external_observer_active(False)
+        await update.effective_message.reply_text(status.to_text())
+
+    async def game_state(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None:
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
+            return
+        if self.session.status().busy:
+            await update.effective_message.reply_text(BUSY)
+            return
+        try:
+            async with self.session.task_lock:
+                result = await self.game.step(execute=False)
+            await update.effective_message.reply_text(
+                self.game.state_text()
+                + "\n"
+                + self.game.opponent_state_text()
+                + "\n策略预览："
+                + result.message
+            )
+            if result.frame.path.exists():
+                with result.frame.path.open("rb") as image:
+                    await update.effective_message.reply_photo(image, caption="点字成金识别截图")
+        except Exception as exc:
+            LOGGER.exception("读取点字成金状态失败")
+            await update.effective_message.reply_text(f"识别失败：{type(exc).__name__}: {exc}")
+
+    async def game_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None:
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
+            return
+        if self.session.status().busy:
+            await update.effective_message.reply_text(BUSY)
+            return
+        try:
+            async with self.session.task_lock:
+                result = await self.game.step(execute=True)
+            await update.effective_message.reply_text(result.message)
+        except Exception as exc:
+            LOGGER.exception("执行点字成金单步失败")
+            await update.effective_message.reply_text(f"执行失败：{type(exc).__name__}: {exc}")
+
+    async def game_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.game is None:
+            await update.effective_message.reply_text("点字成金模块需要配置 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL。")
+            return
+        if self.session.status().busy or self.session.task_lock.locked():
+            await update.effective_message.reply_text(BUSY)
+            return
+        task = context.application.create_task(self._run_game_loop(update), update=update)
+        self.session.begin(task, "点字成金自动游戏")
+        await update.effective_message.reply_text(
+            "点字成金自动游戏已启动。请保持欢乐斗地主窗口在前台；/game_stop 或 /stop 可停止。"
+        )
+
+    async def game_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self.stop(update, context)
+
+    async def _run_game_loop(self, update: Update) -> None:
+        observer_started_here = False
+        try:
+            async with self.session.task_lock:
+                if self.game is None:
+                    await update.effective_message.reply_text("游戏模块不可用。")
+                    return
+
+                if self.game_observer is not None and not self.game_observer.running:
+                    # 先关闭旧两帧事件路径，再用单帧建立本局基线，避免历史截图污染记牌。
+                    self.game.set_external_observer_active(True)
+                    await self.game.inspect()
+                    await self.game_observer.start()
+                    observer_started_here = True
+
+                message = await self.game.run_loop()
+            await update.effective_message.reply_text(message)
+        finally:
+            if (
+                observer_started_here
+                and self.game_observer is not None
+                and self.game_observer.running
+            ):
+                await self.game_observer.stop()
+            if observer_started_here and self.game is not None:
+                self.game.set_external_observer_active(False)
+            self.session.finish()
 
     async def natural_language(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):

@@ -5,7 +5,7 @@
 ## 已实现功能
 
 - Telegram 用户白名单：只有 `.env` 中指定的用户 ID 可以操作。
-- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。
+- `/start`、`/status`、`/screen`、`/mouse`、`/click`、`/doubleclick`、`/move`、`/scroll`、`/type`、`/hotkey`、`/process`、`/stop`。\n- 点字成金：`/game_state`、`/game_step`、`/game_start`、`/game_stop`。\n- 牌局采集：`/game_record_start`、`/game_record_status`、`/game_record_stop`。
 - OpenAI Responses API 工具调用循环，最多 15 步，不执行模型生成的 Python、PowerShell、CMD、`eval`、`exec` 或任意 Shell。
 - 本地白名单应用启动、网页打开、截图、系统状态、鼠标键盘和受管进程。
 - 自然语言阶段只暴露 16 个明确工具；Playwright、UI Automation、文件和 Git 工具当前不向模型开放。
@@ -81,11 +81,22 @@ notepad .env
 TELEGRAM_BOT_TOKEN=BotFather给出的Token
 ALLOWED_TELEGRAM_USER_ID=你的数字UserID
 OPENAI_API_KEY=你的OpenAI_API_Key
-OPENAI_MODEL=gpt-4.1-mini
+OPENAI_MODEL=qwen3.5:9b
+OPENAI_BASE_URL=
 AGENT_ALLOWED_ROOTS=D:\Projects;D:\Work
 ```
 
-应用路径和启动参数统一在 `config/apps.yaml` 中维护。模型名称可按账号实际可用模型修改；固定 Telegram 指令不需要 OpenAI Key，自然语言 Agent 必须配置 `OPENAI_API_KEY`。
+应用路径和启动参数统一在 `config/apps.yaml` 中维护。模型名称可按账号实际可用模型修改；固定 Telegram 指令不需要模型。自然语言 Agent 使用 OpenAI 官方接口时配置 `OPENAI_API_KEY`，使用本地兼容接口时配置 `OPENAI_BASE_URL`。
+
+如果使用本机 Ollama，可改为：
+
+```dotenv
+OPENAI_API_KEY=ollama
+OPENAI_MODEL=qwen3.5:9b
+OPENAI_BASE_URL=http://127.0.0.1:11434/v1
+```
+
+Ollama 不校验 `OPENAI_API_KEY`，这里的 `ollama` 只是 OpenAI SDK 要求的占位值。项目通过 Telegram long polling 收到消息后，会把普通文本交给该本地接口；`/status`、`/screen` 等固定指令不经过模型。
 
 ## 5. 安装依赖
 
@@ -197,3 +208,95 @@ ai_pc_agent/
 - Playwright 使用独立受控 Chromium，不复用个人 Chrome 登录态。
 - UIA 调用无法安全强杀；已设置工具超时的地方会优先超时，`/stop` 会等待正在运行的原生调用收尾。
 - Windows 应用版本、显示器布局和网页 DOM 差异仍需在目标电脑上做一次真实验收。
+
+
+## 点字成金自动游戏（实验功能）
+
+该模块针对腾讯欢乐斗地主中的“百变八雀·点字成金”。实现方式仅为截图识别 + 普通鼠标点击，不读取游戏进程内存、不注入 DLL、不修改客户端、不绕过反作弊。
+
+工作流程：
+
+    欢乐斗地主前台窗口
+    → 截取游戏窗口
+    → 本地/远程视觉模型识别金牌/手牌/亮牌/按钮/当前阶段与对手事件
+    → 本地 rules.py 判断 19 种胡牌牌型
+    → 本地 strategy.py 决定换牌、摸牌、出牌或胡牌
+    → PyAutoGUI 点击
+    → 等待新画面后继续
+
+规则引擎当前按项目约定实现：点数为 6、7、8、9、10、J、Q、K、A；6~10 为 10 分，J/Q/K 与癞子 20 分，A 30 分；金牌数 0~1/2/3/4/5/6+ 对应倍率 1/2/4/8/16/32；支持 8 张同点/同花顺、6+2、5+3、4+4、3+3+2，以及癞子补牌。当前暂按硬气胡额外 ×2 处理。
+
+Telegram 命令：
+
+- /game_state：只截图识别并返回状态，不点击。第一次务必先用它核对识别结果。
+- /game_step：只执行一个动作，适合调试。
+- /game_start：连续执行，并自动启动三家高频观察器。
+- /game_stop：停止连续自动游戏和本次对手观察。
+- /game_watch_start：只启动三家实时观察/记牌，不自动点击，适合先手动玩一局验证。
+- /game_watch_status：查看采样帧、动作片段、模型识别结果和当前三家记牌/危险牌推断。
+- /game_watch_stop：停止三家实时观察器。
+
+在 .env 可配置：
+
+    GAME_VISION_MODEL=qwen3.5:9b
+    GAME_VISION_BASE_URL=http://127.0.0.1:11434/v1
+    GAME_WINDOW_TITLE=欢乐斗地主
+    GAME_ACTION_INTERVAL_SECONDS=1.5
+    GAME_MIN_CARD_CONFIDENCE=0.72
+    GAME_MIN_EVENT_CONFIDENCE=0.80
+    GAME_AUTO_NEXT_ROUND=false
+
+GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子不足/充值/购买”弹窗也会直接停止，不会自动购买豆子、钻石或执行充值。
+
+第一次真实测试顺序：
+
+1. 启动游戏并进入点字成金牌桌，保持游戏窗口在前台。
+2. Telegram 发送 /game_state。
+3. 核对 3 个金牌、7/8 张手牌、花色和亮牌是否全部正确。
+4. 发送 /game_watch_start，先手动玩一局；期间用 /game_watch_status 检查左/上/右三家的摸牌、拿亮牌和弃牌是否正确写入 TableTracker。
+5. 对手观察稳定后停止 /game_watch_stop，再用 /game_step 一次只执行一步，核对 EV 决策与点击。
+6. 单步稳定后最后才使用 /game_start；自动模式会同时启动高频对手观察器。
+
+当前已支持通过 Ollama 使用本地 `qwen3.5:9b` 进行视觉识别，不需要远程视觉 API。自动模式包含两条并行链路：主链识别自己的手牌/按钮并计算动作；后台观察器以约 GAME_RECORD_FPS 的频率做本地图像差分，把连续动画合并成 BEFORE/PEAK/AFTER 三关键帧，只在检测到真实动作片段时调用 Qwen3.5。高置信度的 left/top/right 完整回合会原子写入 TableTracker，EV 使用当时牌局状态的独立快照计算，因此不会阻塞后台采样，也不会在计算过程中被新事件改写牌池。
+\n\n## 点字成金牌局采集模式\n\n为了训练三家对手的实时动作识别器，先使用“只观察、不自动点击”的牌局采集模式。\n\n### 使用方法\n\n1. 打开欢乐斗地主并进入点字成金牌桌。\n2. 保持游戏窗口在前台。\n3. Telegram 发送 `/game_record_start`。\n4. 正常手动玩完整一局。采集器会在本机高频观察游戏窗口，不调用 OpenAI，不控制鼠标。\n5. 随时发送 `/game_record_status` 查看状态。\n6. 一局结束后发送 `/game_record_stop`。\n\n数据保存到 `game_recordings/YYYYMMDD_HHMMSS/`，包含：\n\n- `meta.json`：本次采集参数和窗口信息。\n- `summary.json`：采样帧、归档帧、事件候选数量等汇总。\n- `frames.jsonl`：每次采样的整体变化与各区域变化分数。\n- `events.jsonl`：事件候选、变化区域、前后关键帧路径。\n- `frames/`：低频连续归档帧，默认约 2 FPS。\n- `events/`：ROI 图像差分检测到明显变化时保存的高质量前后关键帧。\n\n当前 `events.jsonl` 的 `label` 暂为空。下一阶段会把事件自动分类为左家/上家/右家的暗摸、拿亮牌、出牌、机会牌等动作。\n\n采集期间如果切到其他窗口，程序会暂停采样，不会把其他软件截图写入牌局数据；切回欢乐斗地主后自动继续。\n\n### 采集配置\n\n`.env` 可调整：\n\n    GAME_RECORD_FPS=6\n    GAME_RECORD_ARCHIVE_FPS=2\n    GAME_RECORD_DIFF_THRESHOLD=0.028\n    GAME_RECORD_JPEG_QUALITY=78\n\n第一次建议保持默认值。`game_recordings/` 已加入 `.gitignore`，真实牌局截图不会提交到 GitHub。\n\n采集模式不依赖 OpenAI API，因此即使视觉模型尚未配置，也可以先采集真实牌局。
+
+
+## 三家对手实时观察（基于真实牌局校准）
+
+2026-10-04 首轮真实牌局样本：约 250.7 秒、1504 个 6 FPS 采样点、145 个 raw 变化事件。复盘发现大量 raw event 实际属于同一段动画/同一轮动作；按约 1.2 秒间隔聚类只有约 39 个动作簇。因此实时逻辑已经改为：
+
+    6 FPS 本地截屏
+    → 窄 ROI 差分
+    → 合并为一个 MotionEpisode
+    → 保存 BEFORE / PEAK / AFTER 三张关键帧
+    → 过滤“硬气/比翼为邻/金倍率”等全屏特效
+    → 仅对动作片段调用视觉模型
+    → 高置信对手事件写入 TableTracker
+    → 更新三家可能牌型、危险牌和 EV
+
+首轮样本同时用于收紧 left/top/right 的手牌扇区 ROI，避免中央大特效同时污染三家区域。
+
+### 手动观察测试
+
+进入一局点字成金并保持游戏窗口在前台，先不要开启自动点击：
+
+    /game_watch_start
+
+程序会先读取自己的手牌、金牌和牌堆建立基线，然后后台观察三名对手。可随时查看：
+
+    /game_watch_status
+
+状态会显示动作片段数量、已识别数量、已写入记牌器数量、低置信事件、识别队列，以及三家当前已知存牌/未知牌数/可能牌型。
+
+结束后：
+
+    /game_watch_stop
+
+调试文件保存在 `game_recordings/live_watch_时间/`：
+
+- `episodes.jsonl`：本地动作片段及 ROI 峰值。
+- `episodes/*_before.jpg`、`*_peak.jpg`、`*_after.jpg`：三关键帧。
+- `recognized_events.jsonl`：视觉模型的结构化识别、是否写入记牌器、错误信息。
+- `observer_summary.json`：整局观察汇总。
+
+`/game_start` 进入连续自动游戏时，也会自动启动同一套对手观察器；建议先用 `/game_watch_start` 完整手动验证一两局再开启自动执行。

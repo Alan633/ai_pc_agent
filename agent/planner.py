@@ -18,8 +18,20 @@ cmd 和 powershell 只能通过 launch_app 打开空窗口，禁止传入或输�
 
 
 class OpenAIPlanner:
-    def __init__(self, api_key: str, model: str, tool_schemas: list[dict[str, Any]]) -> None:
-        self.client = AsyncOpenAI(api_key=api_key) if api_key else None
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        tool_schemas: list[dict[str, Any]],
+        base_url: str = "",
+    ) -> None:
+        # Ollama and other OpenAI-compatible local servers usually do not verify
+        # the key, but the OpenAI SDK still requires a non-empty value.
+        client_key = api_key or ("local-model" if base_url else "")
+        client_options: dict[str, Any] = {"api_key": client_key}
+        if base_url:
+            client_options["base_url"] = base_url
+        self.client = AsyncOpenAI(**client_options) if client_key else None
         self.model = model
         self.tool_schemas = tool_schemas
 
