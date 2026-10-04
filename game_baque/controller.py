@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
 from agent.session import AgentSession
 from game_baque.capture import CapturedFrame, assert_game_foreground, capture_game_window
 from game_baque.ev import ExpectedValueEngine
+from game_baque.event_vision import TableObservation
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
 from game_baque.strategy import choose_swap_two
 from game_baque.tracker import TableTracker
@@ -56,6 +58,8 @@ class BaqueGameController:
         self._round_gold_ranks: tuple[str, ...] = ()
         self._last_action_fingerprint: tuple[object, ...] | None = None
         self._last_action_at = 0.0
+        self._observation_dedupe: deque[tuple[float, tuple[object, ...]]] = deque(maxlen=24)
+        self._recent_opponent_events: deque[str] = deque(maxlen=12)
         self._previous_frame_path: Path | None = None
         self._recent_opponent_events: dict[tuple[str, str, str], float] = {}
         self.opponent_event_count = 0
@@ -398,6 +402,92 @@ class BaqueGameController:
             return
         self.tracker.update_own_hand(snapshot.hand)
         self.tracker.set_deck_count(snapshot.deck_count)
+
+    def apply_opponent_observation(self, observation: TableObservation) -> bool:
+        """把高置信度的三家动作写入 TableTracker。
+
+        观察器只负责“看到什么”；这里负责保守落账。任何关键牌看不清时宁可不写，
+        避免一次误识别污染整局的剩余牌池。
+        """
+        if not self._tracker_started:
+            LOGGER.info("记牌器尚未初始化，暂不采用对手事件：%s", observation.summary())
+            return False
+        if observation.actor not in {"left", "top", "right"}:
+            return False
+
+        signature = (
+            observation.actor,
+            observation.event_type,
+            observation.draw_source,
+            observation.drawn_card.rank,
+            observation.drawn_card.suit,
+            observation.discard_card.rank,
+            observation.discard_card.suit,
+            observation.opportunity_chosen_index,
+            observation.deck_after,
+        )
+        now = time.monotonic()
+        while self._observation_dedupe and now - self._observation_dedupe[0][0] > 5.0:
+            self._observation_dedupe.popleft()
+        if any(old_signature == signature for _, old_signature in self._observation_dedupe):
+            LOGGER.info("跳过重复对手事件：%s", observation.summary())
+            return False
+
+        applied = False
+        if observation.event_type == "turn":
+            discard = observation.discard_card.to_card()
+            if discard is None or observation.discard_card.confidence < 0.76:
+                return False
+            drawn = observation.drawn_card.to_card()
+            draw_source = observation.draw_source
+            if draw_source == "visible" and (
+                drawn is None or observation.drawn_card.confidence < 0.72
+            ):
+                # 明确知道“拿了亮牌”但看不清具体牌时，不伪造成某张已知牌。
+                draw_source = "unknown"
+                drawn = None
+            self.tracker.record_opponent_turn(
+                observation.actor,
+                draw_source=draw_source,
+                drawn_card=drawn,
+                discard=discard,
+            )
+            applied = True
+
+        elif observation.event_type == "opportunity":
+            options = [card.to_card() for card in observation.opportunity_cards]
+            if (
+                len(options) == 4
+                and all(card is not None for card in options)
+                and 0 <= observation.opportunity_chosen_index < 4
+            ):
+                self.tracker.record_opportunity_reveal(
+                    observation.actor,
+                    [card for card in options if card is not None],
+                    observation.opportunity_chosen_index,
+                )
+                applied = True
+
+        elif observation.event_type == "hu":
+            self.tracker.mark_finished(observation.actor, True)
+            applied = True
+
+        if not applied:
+            return False
+
+        if observation.deck_after >= 0:
+            self.tracker.set_deck_count(observation.deck_after)
+        self._observation_dedupe.append((now, signature))
+        self._recent_opponent_events.append(observation.summary())
+        LOGGER.info("已采用对手事件：%s", observation.summary())
+        return True
+
+    def recent_opponent_events_text(self) -> str:
+        if not self._recent_opponent_events:
+            return "最近对手事件：暂无"
+        return "最近对手事件：\n" + "\n".join(
+            f"- {item}" for item in list(self._recent_opponent_events)[-6:]
+        )
 
     async def _click_card(self, frame: CapturedFrame, card: Card) -> None:
         if card.x is None or card.y is None:
