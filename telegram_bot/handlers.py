@@ -79,11 +79,43 @@ class TelegramHandlers:
             "game_accept_reset": self.game_accept_reset,
             "stop": self.stop,
         }
+        # group=-1 先统一记录所有 Telegram 文本输入；后续新增命令无需再单独补日志。
+        application.add_handler(
+            MessageHandler(filters.TEXT, self.log_incoming_command),
+            group=-1,
+        )
         for name, callback in commands.items():
             application.add_handler(CommandHandler(name, callback))
         application.add_handler(CallbackQueryHandler(self.confirm_callback, pattern=r"^confirm:"))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.natural_language))
         application.add_error_handler(self.on_error)
+
+    async def log_incoming_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """把每一条 Telegram 文本命令/自然语言输入写入 LOGS/agent.log。"""
+        message = update.effective_message
+        if message is None:
+            return
+        raw_text = (message.text or "").strip()
+        if not raw_text:
+            return
+
+        # 保持一条用户输入对应一行日志，便于 grep/排查；超长文本限制长度。
+        log_text = raw_text.replace("\r", "\\r").replace("\n", "\\n")
+        if len(log_text) > 4000:
+            log_text = log_text[:4000] + "...<truncated>"
+
+        user = update.effective_user
+        chat = update.effective_chat
+        LOGGER.info(
+            "收到用户命令 source=telegram user_id=%s chat_id=%s text=%s",
+            getattr(user, "id", None),
+            getattr(chat, "id", None),
+            log_text,
+        )
 
     async def _authorized(self, update: Update) -> bool:
         user = update.effective_user
