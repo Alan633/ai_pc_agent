@@ -8,8 +8,10 @@ from pathlib import Path
 
 from agent.session import AgentSession
 from game_baque.capture import CapturedFrame, assert_game_foreground, capture_game_window
+from game_baque.ev import ExpectedValueEngine
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
-from game_baque.strategy import choose_discard, choose_draw, choose_swap_two
+from game_baque.strategy import choose_draw, choose_swap_two
+from game_baque.tracker import TableTracker
 from game_baque.vision import BaqueVision
 
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +48,10 @@ class BaqueGameController:
         self.last_snapshot: GameSnapshot | None = None
         self.last_message = "尚未识别"
         self.action_count = 0
+        self.tracker = TableTracker()
+        self.ev = ExpectedValueEngine()
+        self._tracker_started = False
+        self._round_gold_ranks: tuple[str, ...] = ()
         self._last_action_fingerprint: tuple[object, ...] | None = None
         self._last_action_at = 0.0
 
@@ -56,6 +62,7 @@ class BaqueGameController:
             self.window_title_keyword,
         )
         snapshot = await self.vision.parse(frame.path)
+        self._sync_tracker(snapshot)
         self.last_snapshot = snapshot
         self.last_message = self._snapshot_summary(snapshot)
         return frame, snapshot
@@ -155,12 +162,27 @@ class BaqueGameController:
             return choose_swap_two(snapshot.hand, snapshot.gold_ranks)
         if snapshot.screen_type == ScreenType.DRAW:
             return choose_draw(snapshot.hand, snapshot.visible_cards, snapshot.gold_ranks)
-        if snapshot.screen_type == ScreenType.DISCARD:
-            return choose_discard(snapshot.hand, snapshot.gold_ranks)
-        if snapshot.screen_type == ScreenType.HU:
-            decision = choose_discard(snapshot.hand, snapshot.gold_ranks)
-            if decision.action != "hu":
-                raise RuntimeError("视觉判断为胡牌状态，但规则引擎未确认成牌；为避免误操作已停止。")
+        if snapshot.screen_type in {ScreenType.DISCARD, ScreenType.HU}:
+            decision, values = self.ev.choose_8_card_action(
+                snapshot.hand,
+                snapshot.gold_ranks,
+                self.tracker,
+            )
+            LOGGER.info(
+                "八雀EV候选 %s",
+                [
+                    {
+                        "action": item.action,
+                        "card_index": item.card_index,
+                        "ev": round(item.expected_value, 2),
+                        "future": round(item.future_hu_value, 2),
+                        "risk": round(item.opponent_risk, 2),
+                    }
+                    for item in values[:5]
+                ],
+            )
+            if snapshot.screen_type == ScreenType.HU and decision.action != "hu":
+                LOGGER.info("当前虽可胡，但EV模型选择继续做牌：%s", decision.reason)
             return decision
         raise RuntimeError(f"当前状态不可决策：{snapshot.screen_type.value}")
 
@@ -190,12 +212,14 @@ class BaqueGameController:
                 raise RuntimeError("draw_visible 缺少 visible_index")
             card = snapshot.visible_cards[decision.visible_index]
             await self._click_card(frame, card)
+            self.tracker.record_own_take_visible(card)
             return decision.reason + "；已取亮牌。"
 
         if decision.action == "draw_deck":
             if snapshot.deck_click is None:
                 raise RuntimeError("未识别到牌堆点击位置")
             await self._click(frame, snapshot.deck_click)
+            self.tracker.record_own_draw_deck()
             return decision.reason + "；已摸牌堆。"
 
         if decision.action == "hu":
@@ -220,9 +244,54 @@ class BaqueGameController:
                 await self._click_card(frame, desired)
                 await asyncio.sleep(0.12)
             await self._click(frame, snapshot.discard_button)
+            self.tracker.record_own_discard(desired)
             return decision.reason + "；已出牌。"
 
         raise RuntimeError(f"未知游戏动作：{decision.action}")
+
+    def opponent_state_text(self) -> str:
+        if not self._tracker_started:
+            return "对手记牌：尚未建立本局状态。"
+        lines = ["对手记牌："]
+        for seat, data in self.tracker.opponent_known_summary().items():
+            known = data["known_hand"]
+            known_text = "、".join(f"{key}×{count}" for key, count in known.items()) or "无"
+            lines.append(
+                f"- {seat}: 已知存牌[{known_text}]，未知{data['unknown_hand_count']}张，"
+                f"已记录出牌{len(data['discards'])}张"
+            )
+        threats = self.ev.opponent_threats(self.tracker, self._round_gold_ranks) if self._round_gold_ranks else []
+        if threats:
+            lines.append("下一摸成牌风险估计：")
+            for item in threats:
+                lines.append(
+                    f"- {item.seat}: {item.win_probability_next_draw:.1%}，"
+                    f"潜在胡牌价值 {item.mean_hu_value:.1f}"
+                )
+        return "\n".join(lines)
+
+    def _sync_tracker(self, snapshot: GameSnapshot) -> None:
+        if len(snapshot.gold_ranks) != 3 or len(snapshot.hand) not in {7, 8}:
+            return
+        new_gold = tuple(snapshot.gold_ranks)
+        should_reset = (
+            not self._tracker_started
+            or (self._round_gold_ranks and new_gold != self._round_gold_ranks)
+            or (
+                snapshot.deck_count is not None
+                and self.tracker.deck_count is not None
+                and snapshot.deck_count >= 55
+                and self.tracker.deck_count < 20
+            )
+        )
+        if should_reset:
+            self.tracker.reset_round(snapshot.hand, snapshot.deck_count)
+            self._tracker_started = True
+            self._round_gold_ranks = new_gold
+            LOGGER.info("建立新一局记牌状态 gold=%s deck=%s", new_gold, snapshot.deck_count)
+            return
+        self.tracker.update_own_hand(snapshot.hand)
+        self.tracker.set_deck_count(snapshot.deck_count)
 
     async def _click_card(self, frame: CapturedFrame, card: Card) -> None:
         if card.x is None or card.y is None:
