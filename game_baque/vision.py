@@ -262,7 +262,7 @@ class BaqueVision:
             if self._is_context_length_error(exc):
                 raise RuntimeError(
                     "本地视觉模型上下文仍不足。当前已使用紧凑提示词；"
-                    "请把 Ollama 的 qwen3.5:9b 上下文提高到至少 8192。"
+                    "请运行 scripts/setup_ollama_qwen16k.bat 创建 16K 上下文模型，并重启 Agent。"
                 ) from exc
             logging.getLogger(__name__).warning(
                 "本地视觉接口不支持 response_format，已回退到普通 JSON 输出：%s",
