@@ -19,15 +19,15 @@ class Settings:
     confirm_timeout_seconds: int
     allowed_roots: tuple[Path, ...]
     allowed_executables: frozenset[str]
-    game_vision_model: str
-    game_window_title_keyword: str
-    game_action_interval_seconds: float
-    game_min_card_confidence: float
-    game_auto_next_round: bool
-    game_record_fps: float
-    game_record_archive_fps: float
-    game_record_diff_threshold: float
-    game_record_jpeg_quality: int
+    game_vision_model: str = "gpt-4.1-mini"
+    game_window_title_keyword: str = "欢乐斗地主"
+    game_action_interval_seconds: float = 1.5
+    game_min_card_confidence: float = 0.72
+    game_auto_next_round: bool = False
+    game_record_fps: float = 6.0
+    game_record_archive_fps: float = 2.0
+    game_record_diff_threshold: float = 0.028
+    game_record_jpeg_quality: int = 78
     openai_base_url: str = ""
     game_vision_base_url: str = ""
     game_min_event_confidence: float = 0.80
