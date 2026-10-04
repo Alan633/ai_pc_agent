@@ -1,27 +1,54 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import asyncio
+from dataclasses import dataclass, field
+from pathlib import Path
+from threading import Event
+from typing import Any
 
+from agent.models import ToolResult
 from agent.session import AgentSession
+from agent.tool_registry import ToolRegistry, ToolSpec
 from config import Settings
-from game_baque.controller import BaqueGameController
+from game_baque.acceptance import BaqueAcceptanceTracker
+from game_baque.controller import BaqueGameController, GameStepResult
 from game_baque.event_vision import OpponentEventVision
 from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
 from game_baque.vision import BaqueVision
 
 
+OBJECT = {"type": "object", "additionalProperties": False}
+
+
+def _schema(
+    properties: dict[str, Any] | None = None,
+    required: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        **OBJECT,
+        "properties": properties or {},
+        "required": required or [],
+    }
+
+
 @dataclass(slots=True)
 class BaquePlugin:
-    """点字成金能力插件。
+    """百变八雀·点字成金插件。
 
-    这里只负责组装和生命周期管理。通用 Agent 主程序不再直接关心
-    game_baque 内部的 vision/tracker/EV/controller 实现。
+    插件同时服务 Telegram 固定命令和自然语言 Agent Tool，确保两种入口共享
+    同一套观察器、自动循环、验收统计和停止逻辑。
     """
 
     game: BaqueGameController | None
     recorder: GameRecorder
     observer: OpponentObserver | None
+    session: AgentSession
+    acceptance: BaqueAcceptanceTracker
+    _auto_task: asyncio.Task[str] | None = field(default=None, init=False, repr=False)
+    _auto_stop_event: Event = field(default_factory=Event, init=False, repr=False)
+    _auto_started_observer: bool = field(default=False, init=False, repr=False)
+    _last_auto_message: str = field(default="尚未启动自动游戏", init=False)
 
     @classmethod
     def build(cls, settings: Settings, session: AgentSession) -> "BaquePlugin":
@@ -66,12 +93,348 @@ class BaquePlugin:
                 min_confidence=settings.game_min_event_confidence,
             )
 
-        return cls(game=game, recorder=recorder, observer=observer)
+        return cls(
+            game=game,
+            recorder=recorder,
+            observer=observer,
+            session=session,
+            acceptance=BaqueAcceptanceTracker(settings.game_recordings_dir),
+        )
+
+    @property
+    def auto_running(self) -> bool:
+        return self._auto_task is not None and not self._auto_task.done()
+
+    def register_tools(self, registry: ToolRegistry) -> None:
+        """向通用 Agent 注册八雀能力，必须在 Planner 获取 schemas() 前调用。"""
+
+        def add(
+            name: str,
+            description: str,
+            parameters: dict[str, Any],
+            function: Any,
+        ) -> None:
+            registry.register(ToolSpec(name, description, parameters, function))
+
+        add(
+            "baque_get_state",
+            "读取当前百变八雀/点字成金画面和策略预览，不点击。用户说“看看八雀状态/现在该怎么打/识别一下牌面”时使用。",
+            _schema(),
+            self.tool_get_state,
+        )
+        add(
+            "baque_step",
+            "让八雀只执行一个当前最佳动作，然后立即返回。适合调试和半自动玩法；不要用于连续自动游戏。",
+            _schema(),
+            self.tool_step,
+        )
+        add(
+            "baque_watch_start",
+            "启动八雀三家对手实时观察和记牌，但不自动点击自己的牌。用户说“只记牌/只观察/我自己玩你帮我算”时使用。",
+            _schema(),
+            self.tool_watch_start,
+        )
+        add(
+            "baque_watch_status",
+            "查看八雀观察器采样、动作片段、识别、写入记牌器、低置信事件以及三家可能牌型。",
+            _schema(),
+            self.tool_watch_status,
+        )
+        add(
+            "baque_watch_stop",
+            "停止八雀只观察/记牌模式。自动游戏运行中不能单独停观察器，应使用 baque_auto_stop。",
+            _schema(),
+            self.tool_watch_stop,
+        )
+        add(
+            "baque_auto_start",
+            "启动八雀连续自动游戏，同时自动启动三家对手观察器。只在用户明确要求“自动玩/开始八雀自动游戏”时使用。",
+            _schema(),
+            self.tool_auto_start,
+        )
+        add(
+            "baque_auto_stop",
+            "停止八雀连续自动游戏。若观察器是自动游戏启动的，也一并停止。",
+            _schema(),
+            self.tool_auto_stop,
+        )
+        add(
+            "baque_acceptance_report",
+            "生成八雀真实牌局验收报告：unknown率、低置信率、牌池一致性，以及人工真值准确率。",
+            _schema(),
+            self.tool_acceptance_report,
+        )
+        add(
+            "baque_acceptance_mark",
+            "给刚才的八雀结果打真值标签，用于真实准确率统计。category: own_state=自己牌面，opponent_event=对手动作，action=点击/决策。",
+            _schema(
+                {
+                    "category": {
+                        "type": "string",
+                        "enum": ["own_state", "opponent_event", "action"],
+                    },
+                    "correct": {"type": "boolean"},
+                    "note": {"type": "string"},
+                },
+                ["category", "correct", "note"],
+            ),
+            self.tool_acceptance_mark,
+        )
+        add(
+            "baque_acceptance_reset",
+            "开始新一轮八雀验收统计；历史标签不会删除，只在日志中写入 reset 分界。",
+            _schema(),
+            self.tool_acceptance_reset,
+        )
+
+    def _require_game(self) -> BaqueGameController:
+        if self.game is None:
+            raise RuntimeError(
+                "八雀插件未配置视觉模型，请检查 GAME_VISION_BASE_URL / GAME_VISION_MODEL"
+            )
+        return self.game
+
+    def _run(self, coroutine: Any, *, timeout: float = 60.0) -> Any:
+        return self.session.run_coroutine_threadsafe(coroutine, timeout=timeout)
+
+    async def get_state(self) -> ToolResult:
+        game = self._require_game()
+        if self.auto_running:
+            return ToolResult(
+                True,
+                "baque_get_state",
+                data={
+                    "auto_running": True,
+                    "state": game.state_text(),
+                    "opponents": game.opponent_state_text(),
+                    "message": "自动游戏运行中，返回缓存状态，避免与实时点击并发识别。",
+                },
+            )
+
+        result = await game.step(execute=False)
+        data = {
+            "auto_running": False,
+            "state": game.state_text(),
+            "opponents": game.opponent_state_text(),
+            "strategy_preview": result.message,
+            "screen_type": result.snapshot.screen_type.value,
+        }
+        return ToolResult(
+            True,
+            "baque_get_state",
+            data=data,
+            artifact=result.frame.path if result.frame.path.exists() else None,
+        )
+
+    async def step_once(self) -> dict[str, Any]:
+        game = self._require_game()
+        if self.auto_running:
+            raise RuntimeError("八雀自动游戏正在运行，不能同时执行单步")
+        result = await game.step(execute=True)
+        return self._step_dict(result)
+
+    async def watch_start(self) -> dict[str, Any]:
+        game = self._require_game()
+        observer = self.observer
+        if observer is None:
+            raise RuntimeError("八雀对手观察器不可用")
+        if self.auto_running:
+            return {
+                "running": True,
+                "message": "自动游戏正在运行，三家观察器已由自动模式管理。",
+                "observer": observer.status().to_text(),
+            }
+        if observer.running:
+            return {
+                "running": True,
+                "message": "三家观察器已经在运行。",
+                "observer": observer.status().to_text(),
+            }
+
+        game.set_external_observer_active(True)
+        try:
+            await game.inspect()
+            status = await observer.start()
+        except Exception:
+            game.set_external_observer_active(False)
+            raise
+        return {
+            "running": True,
+            "message": "已启动三家实时观察/记牌，不会自动点击。",
+            "observer": status.to_text(),
+        }
+
+    def watch_status(self) -> dict[str, Any]:
+        game = self._require_game()
+        observer = self.observer
+        status_text = observer.status().to_text() if observer is not None else "观察器不可用"
+        return {
+            "auto_running": self.auto_running,
+            "observer_running": bool(observer and observer.running),
+            "observer": status_text,
+            "opponents": game.opponent_state_text(),
+            "recent_events": game.recent_opponent_events_text(),
+        }
+
+    async def watch_stop(self) -> dict[str, Any]:
+        game = self._require_game()
+        observer = self.observer
+        if self.auto_running:
+            raise RuntimeError("自动游戏运行中，请使用 baque_auto_stop")
+        if observer is None or not observer.running:
+            game.set_external_observer_active(False)
+            return {"stopped": False, "message": "当前没有运行中的三家观察器。"}
+        status = await observer.stop()
+        game.set_external_observer_active(False)
+        return {"stopped": True, "observer": status.to_text()}
+
+    async def auto_start(self) -> dict[str, Any]:
+        game = self._require_game()
+        if self.auto_running:
+            return {
+                "running": True,
+                "message": "八雀自动游戏已经在运行。",
+                "state": game.state_text(),
+            }
+
+        self._auto_stop_event = Event()
+        self._auto_started_observer = False
+        observer = self.observer
+        if observer is not None:
+            if not observer.running:
+                game.set_external_observer_active(True)
+                await game.inspect()
+                await observer.start()
+                self._auto_started_observer = True
+            else:
+                game.set_external_observer_active(True)
+
+        self._auto_task = asyncio.create_task(
+            self._auto_loop(),
+            name="baque-plugin-auto-game",
+        )
+        return {
+            "running": True,
+            "message": "八雀自动游戏已启动；三家观察和EV计算同步运行。",
+            "auto_next_round": game.auto_next_round,
+        }
+
+    async def _auto_loop(self) -> str:
+        game = self._require_game()
+        try:
+            message = await game.run_loop(self._auto_stop_event)
+            self._last_auto_message = message
+            return message
+        finally:
+            observer = self.observer
+            if self._auto_started_observer and observer is not None and observer.running:
+                try:
+                    await observer.stop()
+                except Exception:
+                    pass
+            if observer is None or not observer.running:
+                game.set_external_observer_active(False)
+            self._auto_started_observer = False
+
+    async def auto_stop(self) -> dict[str, Any]:
+        task = self._auto_task
+        if task is None or task.done():
+            self._auto_task = None
+            return {
+                "stopped": False,
+                "message": self._last_auto_message,
+            }
+
+        self._auto_stop_event.set()
+        try:
+            message = await asyncio.wait_for(asyncio.shield(task), timeout=10.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+            try:
+                message = await task
+            except asyncio.CancelledError:
+                message = "自动游戏任务已强制取消。"
+        self._auto_task = None
+        self._last_auto_message = message
+        return {"stopped": True, "message": message}
+
+    def acceptance_report(self) -> dict[str, Any]:
+        return self.acceptance.report(self.game, self.observer)
+
+    def acceptance_mark(
+        self,
+        category: str,
+        correct: bool,
+        note: str = "",
+    ) -> dict[str, Any]:
+        game = self._require_game()
+        if category == "own_state":
+            context = game.state_text()
+        elif category == "opponent_event":
+            context = game.recent_opponent_events_text()
+        elif category == "action":
+            context = game.last_message
+        else:
+            context = ""
+        return self.acceptance.mark(
+            category,
+            correct,
+            note=note,
+            context=context,
+        )
+
+    # ---- ToolRegistry 同步入口：AgentExecutor 会在工作线程调用 ----
+
+    def tool_get_state(self) -> ToolResult:
+        return self._run(self.get_state(), timeout=90.0)
+
+    def tool_step(self) -> dict[str, Any]:
+        return self._run(self.step_once(), timeout=90.0)
+
+    def tool_watch_start(self) -> dict[str, Any]:
+        return self._run(self.watch_start(), timeout=90.0)
+
+    def tool_watch_status(self) -> dict[str, Any]:
+        return self.watch_status()
+
+    def tool_watch_stop(self) -> dict[str, Any]:
+        return self._run(self.watch_stop(), timeout=30.0)
+
+    def tool_auto_start(self) -> dict[str, Any]:
+        return self._run(self.auto_start(), timeout=90.0)
+
+    def tool_auto_stop(self) -> dict[str, Any]:
+        return self._run(self.auto_stop(), timeout=20.0)
+
+    def tool_acceptance_report(self) -> dict[str, Any]:
+        return self.acceptance_report()
+
+    def tool_acceptance_mark(
+        self,
+        category: str,
+        correct: bool,
+        note: str,
+    ) -> dict[str, Any]:
+        return self.acceptance_mark(category, correct, note)
+
+    def tool_acceptance_reset(self) -> dict[str, Any]:
+        return self.acceptance.reset_session()
 
     async def shutdown(self) -> None:
+        if self.auto_running:
+            await self.auto_stop()
         if self.recorder.running:
             await self.recorder.stop()
         if self.observer is not None and self.observer.running:
             await self.observer.stop()
         if self.game is not None:
             self.game.set_external_observer_active(False)
+
+    @staticmethod
+    def _step_dict(result: GameStepResult) -> dict[str, Any]:
+        return {
+            "acted": result.acted,
+            "message": result.message,
+            "screen_type": result.snapshot.screen_type.value,
+            "stop_loop": result.stop_loop,
+        }
