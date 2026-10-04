@@ -4,22 +4,71 @@ apps:
       - "C:/Program Files/Google/Chrome/Application/chrome.exe"
       - "C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"
       - "%LOCALAPPDATA%/Google/Chrome/Application/chrome.exe"
+    aliases:
+      - "谷歌浏览器"
+    process_names:
+      - "chrome.exe"
     allow_extra_args: false
 
   edge:
     paths:
       - "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
       - "C:/Program Files/Microsoft/Edge/Application/msedge.exe"
+    aliases:
+      - "微软edge"
+    process_names:
+      - "msedge.exe"
+    allow_extra_args: false
+
+  wechat:
+    paths:
+      - "C:/Program Files/Tencent/Weixin/Weixin.exe"
+      - "C:/Program Files (x86)/Tencent/Weixin/Weixin.exe"
+      - "C:/Program Files/Tencent/WeChat/WeChat.exe"
+      - "C:/Program Files (x86)/Tencent/WeChat/WeChat.exe"
+      - "%LOCALAPPDATA%/Tencent/Weixin/Weixin.exe"
+      - "%LOCALAPPDATA%/Tencent/WeChat/WeChat.exe"
+    aliases:
+      - "微信"
+      - "weixin"
+      - "weixin.exe"
+      - "wechat.exe"
+    process_names:
+      - "Weixin.exe"
+      - "WeChat.exe"
+      - "WeChatAppEx.exe"
+    allow_extra_args: false
+
+  douyin:
+    paths:
+      - "C:/Program Files/Douyin/Douyin.exe"
+      - "C:/Program Files (x86)/Douyin/Douyin.exe"
+      - "%LOCALAPPDATA%/Programs/Douyin/Douyin.exe"
+      - "%LOCALAPPDATA%/Douyin/Douyin.exe"
+    aliases:
+      - "抖音"
+      - "douyin.exe"
+    process_names:
+      - "Douyin.exe"
     allow_extra_args: false
 
   notepad:
     paths:
       - "%WINDIR%/System32/notepad.exe"
+    aliases:
+      - "记事本"
+    process_names:
+      - "notepad.exe"
     allow_extra_args: false
 
   explorer:
     paths:
       - "%WINDIR%/explorer.exe"
+    aliases:
+      - "资源管理器"
+      - "文件管理器"
+    process_names:
+      - "explorer.exe"
     allow_extra_args: false
 
   cmd:
@@ -42,6 +91,11 @@ apps:
     paths:
       - "C:/Program Files/JetBrains/IntelliJ IDEA/bin/idea64.exe"
       - "%LOCALAPPDATA%/JetBrains/Toolbox/apps/IDEA-U/ch-0/bin/idea64.exe"
+    aliases:
+      - "intellij"
+      - "intellij idea"
+    process_names:
+      - "idea64.exe"
     allow_extra_args: false
 
   a_share_recommend:
@@ -50,5 +104,10 @@ apps:
     cwd: "F:/AAA/a_share_recommend"
     default_args:
       - "F:/AAA/a_share_recommend/main.py"
+    aliases:
+      - "股票程序"
+      - "股票推荐程序"
+    process_names:
+      - "python.exe"
     allow_extra_args: false
     new_console: true
