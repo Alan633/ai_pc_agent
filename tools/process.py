@@ -45,7 +45,64 @@ class ProcessManager:
 
     def launch_app(self, app_name: str) -> dict[str, Any]:
         result = self.start_process(app_name, [])
-        return {"launched": True, "app": app_name.strip().lower(), **result}
+        return {"launched": True, "app": result["program"], **result}
+
+    def is_app_running(self, app_name: str) -> dict[str, Any]:
+        canonical = self.catalog.canonical_name(app_name)
+        names = set(self.catalog.process_names(canonical))
+        pids: list[int] = []
+        matched_names: list[str] = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                name = str(proc.info.get("name") or "")
+                if name.casefold() in names:
+                    pids.append(int(proc.info["pid"]))
+                    matched_names.append(name)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return {
+            "app": canonical,
+            "running": bool(pids),
+            "pids": pids,
+            "process_names": list(dict.fromkeys(matched_names)),
+        }
+
+    def focus_app(self, app_name: str) -> dict[str, Any]:
+        state = self.is_app_running(app_name)
+        if not state["running"]:
+            raise RuntimeError(f"应用未运行：{state['app']}")
+
+        from pywinauto import Desktop
+
+        pid_set = set(state["pids"])
+        candidates = []
+        for window in Desktop(backend="uia").windows():
+            try:
+                process_id = int(window.element_info.process_id)
+                if process_id not in pid_set or not window.is_visible():
+                    continue
+                title = window.window_text().strip()
+                candidates.append((window, title))
+            except Exception:
+                continue
+
+        if not candidates:
+            raise RuntimeError(f"应用正在运行，但没有找到可置前窗口：{state['app']}")
+
+        # 优先选择有标题的顶层窗口，避免把隐藏辅助窗口切到前台。
+        window, title = next(((w, t) for w, t in candidates if t), candidates[0])
+        try:
+            if window.is_minimized():
+                window.restore()
+        except Exception:
+            pass
+        window.set_focus()
+        return {
+            "app": state["app"],
+            "focused": True,
+            "title": title,
+            "pid": int(window.element_info.process_id),
+        }
 
     def stop_managed_process(self, pid: int) -> dict[str, Any]:
         with self._lock:
