@@ -98,7 +98,7 @@ class BaquePlugin:
             recorder=recorder,
             observer=observer,
             session=session,
-            acceptance=BaqueAcceptanceTracker(settings.game_recordings_dir),
+            acceptance=BaqueAcceptanceTracker(settings.logs_dir / "baque"),
         )
 
     @property
