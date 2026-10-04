@@ -29,6 +29,8 @@ class Settings:
     game_record_diff_threshold: float
     game_record_jpeg_quality: int
     openai_base_url: str = ""
+    game_vision_base_url: str = ""
+    game_min_event_confidence: float = 0.80
 
     @property
     def logs_dir(self) -> Path:
@@ -90,7 +92,10 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
     )
     max_steps = min(max(int(os.getenv("MAX_STEPS", "15")), 1), 15)
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+    openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+    game_vision_base_url = os.getenv("GAME_VISION_BASE_URL", openai_base_url).strip().rstrip("/")
     game_confidence = min(max(float(os.getenv("GAME_MIN_CARD_CONFIDENCE", "0.72")), 0.0), 1.0)
+    event_confidence = min(max(float(os.getenv("GAME_MIN_EVENT_CONFIDENCE", "0.80")), 0.0), 1.0)
     settings = Settings(
         base_dir=root,
         telegram_bot_token=token,
@@ -111,7 +116,9 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_record_archive_fps=max(float(os.getenv("GAME_RECORD_ARCHIVE_FPS", "2")), 0.2),
         game_record_diff_threshold=min(max(float(os.getenv("GAME_RECORD_DIFF_THRESHOLD", "0.028")), 0.001), 0.30),
         game_record_jpeg_quality=min(max(int(os.getenv("GAME_RECORD_JPEG_QUALITY", "78")), 40), 95),
-        openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/"),
+        openai_base_url=openai_base_url,
+        game_vision_base_url=game_vision_base_url,
+        game_min_event_confidence=event_confidence,
     )
     settings.prepare_directories()
     return settings
