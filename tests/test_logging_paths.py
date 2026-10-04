@@ -45,6 +45,7 @@ def test_console_only_errors_use_stderr(
         logger = logging.getLogger("tests.console_color")
         logger.info("普通信息")
         logger.warning("普通警告")
+        logger.info("用户命令", extra={"console_red": True})
         logger.error("重要错误")
 
         for handler in root.handlers:
@@ -52,8 +53,10 @@ def test_console_only_errors_use_stderr(
 
         assert "普通信息" in stdout.getvalue()
         assert "普通警告" in stdout.getvalue()
+        assert "用户命令" not in stdout.getvalue()
         assert "重要错误" not in stdout.getvalue()
 
+        assert "用户命令" in stderr.getvalue()
         assert "重要错误" in stderr.getvalue()
         assert "普通信息" not in stderr.getvalue()
         assert "普通警告" not in stderr.getvalue()
@@ -61,6 +64,8 @@ def test_console_only_errors_use_stderr(
         log_text = (tmp_path / "LOGS" / "agent.log").read_text(encoding="utf-8")
         assert "普通信息" in log_text
         assert "普通警告" in log_text
+        assert "用户命令" in log_text
+        assert "| INFO |" in log_text
         assert "重要错误" in log_text
     finally:
         for handler in list(root.handlers):
