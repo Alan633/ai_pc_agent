@@ -8,7 +8,7 @@ from game_baque.models import Card, GameDecision
 from game_baque.opponent_model import OpponentPatternModel
 from game_baque.rules import evaluate_hu
 from game_baque.strategy import hand_potential
-from game_baque.tracker import TableTracker, card_from_key
+from game_baque.tracker import TableTracker, card_from_key, card_key
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +52,77 @@ class ExpectedValueEngine:
         self.discount = min(max(float(discount), 0.1), 1.0)
         self.rng = random.Random(seed)
         self.opponent_model = OpponentPatternModel(samples=max(160, self.simulations // 2), seed=seed)
+        self._inference_cache: dict[tuple[object, ...], object] = {}
+        self._release_cache: dict[tuple[object, ...], object] = {}
+        self._rollout_cache: dict[tuple[object, ...], float] = {}
+
+    @staticmethod
+    def _gold_key(gold_ranks: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+        return tuple(gold_ranks)
+
+    @staticmethod
+    def _bounded_put(cache: dict, key: tuple[object, ...], value: object, limit: int = 512) -> None:
+        if len(cache) >= limit:
+            cache.clear()
+        cache[key] = value
+
+    def _cached_infer_all(
+        self,
+        tracker: TableTracker,
+        gold_ranks: tuple[str, ...] | list[str],
+        *,
+        samples: int,
+        top_patterns: int,
+        top_cards: int,
+    ):
+        key = (
+            "infer",
+            tracker.state_fingerprint(),
+            self._gold_key(gold_ranks),
+            samples,
+            top_patterns,
+            top_cards,
+        )
+        cached = self._inference_cache.get(key)
+        if cached is not None:
+            return cached
+        value = self.opponent_model.infer_all(
+            tracker,
+            gold_ranks,
+            samples=samples,
+            top_patterns=top_patterns,
+            top_cards=top_cards,
+        )
+        self._bounded_put(self._inference_cache, key, value)
+        return value
+
+    def _cached_release_risk(
+        self,
+        card: Card,
+        tracker: TableTracker,
+        gold_ranks: tuple[str, ...] | list[str],
+        *,
+        samples: int,
+    ):
+        key = (
+            "release",
+            tracker.state_fingerprint(),
+            self._gold_key(gold_ranks),
+            card_key(card),
+            samples,
+        )
+        cached = self._release_cache.get(key)
+        if cached is not None:
+            return cached
+        value = self.opponent_model.release_risk(
+            card,
+            tracker,
+            gold_ranks,
+            samples=samples,
+        )
+        self._bounded_put(self._release_cache, key, value)
+        return value
+
 
     def opponent_threats(
         self,
@@ -106,7 +177,7 @@ class ExpectedValueEngine:
         samples: int | None = None,
     ) -> float:
         """估计把某张牌暴露给对手后，直接帮助三家成牌的期望损失。"""
-        risks = self.opponent_model.release_risk(
+        risks = self._cached_release_risk(
             card,
             tracker,
             gold_ranks,
@@ -185,7 +256,7 @@ class ExpectedValueEngine:
             raise ValueError("收益决策必须输入 8 张手牌")
 
         values: list[ActionValue] = []
-        pattern_inference = self.opponent_model.infer_all(
+        pattern_inference = self._cached_infer_all(
             tracker,
             gold_ranks,
             samples=max(120, self.simulations // 3),
@@ -210,7 +281,7 @@ class ExpectedValueEngine:
         for index, discarded in enumerate(hand):
             kept = [card for i, card in enumerate(hand) if i != index]
             future = self._rollout_future_hu(kept, gold_ranks, tracker)
-            release_risks = self.opponent_model.release_risk(
+            release_risks = self._cached_release_risk(
                 discarded,
                 tracker,
                 gold_ranks,
@@ -272,6 +343,19 @@ class ExpectedValueEngine:
         gold_ranks: tuple[str, ...] | list[str],
         tracker: TableTracker,
     ) -> float:
+        cache_key = (
+            "rollout",
+            tracker.state_fingerprint(),
+            self._gold_key(gold_ranks),
+            tuple(sorted(card_key(card) for card in kept)),
+            self.simulations,
+            self.horizon_own_draws,
+            self.discount,
+        )
+        cached = self._rollout_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         draw_dist = tracker.draw_distribution()
         if not draw_dist:
             return 0.0
@@ -302,4 +386,6 @@ class ExpectedValueEngine:
                     )
                     hand = [card for j, card in enumerate(hand8) if j != best_discard]
             total += best_value
-        return total / self.simulations
+        value = total / self.simulations
+        self._bounded_put(self._rollout_cache, cache_key, value)
+        return value
