@@ -104,6 +104,30 @@ class ProcessManager:
             "pid": int(window.element_info.process_id),
         }
 
+    def close_app(self, app_name: str) -> dict[str, Any]:
+        state = self.is_app_running(app_name)
+        if not state["running"]:
+            return {"app": state["app"], "closed": False, "already_stopped": True, "pids": []}
+
+        targets = []
+        for pid in state["pids"]:
+            try:
+                targets.append(psutil.Process(pid))
+            except psutil.NoSuchProcess:
+                continue
+        for proc in targets:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        _, alive = psutil.wait_procs(targets, timeout=5)
+        for proc in alive:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return {"app": state["app"], "closed": True, "pids": state["pids"]}
+
     def stop_managed_process(self, pid: int) -> dict[str, Any]:
         with self._lock:
             process = self._managed.get(pid)
