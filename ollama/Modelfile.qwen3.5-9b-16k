@@ -1,0 +1,8 @@
+FROM qwen3.5:9b
+
+# 八雀视觉输入包含截图，4096 token 上下文不够。
+# 16K 给单帧牌面识别和三关键帧对手识别留足余量。
+PARAMETER num_ctx 16384
+
+# 自动化识别优先稳定、可复现。
+PARAMETER temperature 0
