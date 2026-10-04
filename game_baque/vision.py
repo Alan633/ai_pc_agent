@@ -244,11 +244,20 @@ class BaqueVision:
             )
             response = await self.client.chat.completions.create(**kwargs)
         raw = response.choices[0].message.content or ""
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.removeprefix("```json").removeprefix("```").strip()
-            raw = raw.removesuffix("```").strip()
-        return raw
+        return self._extract_json(raw)
+
+    @staticmethod
+    def _extract_json(raw: str) -> str:
+        text = raw.strip()
+        if text.startswith("```"):
+            text = text.removeprefix("```json").removeprefix("```").strip()
+            text = text.removesuffix("```").strip()
+        # Qwen thinking/兼容接口偶尔会在 JSON 前后附加说明；只截取最外层对象。
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return text[start : end + 1]
+        return text
 
     @staticmethod
     def _to_point(value: dict[str, Any]) -> Point | None:
@@ -272,13 +281,15 @@ class BaqueVision:
     @staticmethod
     def _to_opponent_event(value: dict[str, Any]) -> OpponentEvent:
         rank = str(value.get("card_rank", "NONE"))
+        suit = str(value.get("card_suit", "NONE"))
         wild = bool(value.get("card_wild", False)) or rank == "WILD"
         card: Card | None = None
-        if rank != "NONE":
+        if wild:
+            card = Card(wild=True, confidence=float(value.get("confidence", 0.0)))
+        elif rank in RANKS and suit in SUITS:
             card = Card(
-                rank=None if wild else rank,
-                suit=None if wild else str(value.get("card_suit", "NONE")),
-                wild=wild,
+                rank=rank,
+                suit=suit,
                 confidence=float(value.get("confidence", 0.0)),
             )
         return OpponentEvent(
