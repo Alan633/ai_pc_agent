@@ -230,8 +230,11 @@ Telegram 命令：
 
 - /game_state：只截图识别并返回状态，不点击。第一次务必先用它核对识别结果。
 - /game_step：只执行一个动作，适合调试。
-- /game_start：连续执行。
-- /game_stop：停止连续自动游戏。
+- /game_start：连续执行，并自动启动三家高频观察器。
+- /game_stop：停止连续自动游戏和本次对手观察。
+- /game_watch_start：只启动三家实时观察/记牌，不自动点击，适合先手动玩一局验证。
+- /game_watch_status：查看采样帧、动作片段、模型识别结果和当前三家记牌/危险牌推断。
+- /game_watch_stop：停止三家实时观察器。
 
 在 .env 可配置：
 
@@ -250,9 +253,9 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 1. 启动游戏并进入点字成金牌桌，保持游戏窗口在前台。
 2. Telegram 发送 /game_state。
 3. 核对 3 个金牌、7/8 张手牌、花色和亮牌是否全部正确。
-4. 连续测试 5~10 次 /game_state，确认视觉稳定。
-5. 再用 /game_step 一次只执行一步。
-6. 单步稳定后最后才使用 /game_start。
+4. 发送 /game_watch_start，先手动玩一局；期间用 /game_watch_status 检查左/上/右三家的摸牌、拿亮牌和弃牌是否正确写入 TableTracker。
+5. 对手观察稳定后停止 /game_watch_stop，再用 /game_step 一次只执行一步，核对 EV 决策与点击。
+6. 单步稳定后最后才使用 /game_start；自动模式会同时启动高频对手观察器。
 
-当前已支持通过 Ollama 使用本地 `qwen3.5:9b` 进行视觉识别，不需要远程视觉 API。自动游戏会把上一帧与当前帧一起交给视觉模型，识别 left/top/right 三家的暗摸、拿亮牌、出牌和结束事件；高置信度事件直接写入 TableTracker，随后对手牌型概率与 EV 基于最新剩余牌池重新计算。后续仍建议继续使用真实截图训练更轻量的本地牌面/动作识别器，把 Qwen3.5 降级为低置信度兜底，以进一步降低延迟。
+当前已支持通过 Ollama 使用本地 `qwen3.5:9b` 进行视觉识别，不需要远程视觉 API。自动模式包含两条并行链路：主链识别自己的手牌/按钮并计算动作；后台观察器以约 GAME_RECORD_FPS 的频率做本地图像差分，把连续动画合并成 BEFORE/PEAK/AFTER 三关键帧，只在检测到真实动作片段时调用 Qwen3.5。高置信度的 left/top/right 完整回合会原子写入 TableTracker，EV 使用当时牌局状态的独立快照计算，因此不会阻塞后台采样，也不会在计算过程中被新事件改写牌池。
 \n\n## 点字成金牌局采集模式\n\n为了训练三家对手的实时动作识别器，先使用“只观察、不自动点击”的牌局采集模式。\n\n### 使用方法\n\n1. 打开欢乐斗地主并进入点字成金牌桌。\n2. 保持游戏窗口在前台。\n3. Telegram 发送 `/game_record_start`。\n4. 正常手动玩完整一局。采集器会在本机高频观察游戏窗口，不调用 OpenAI，不控制鼠标。\n5. 随时发送 `/game_record_status` 查看状态。\n6. 一局结束后发送 `/game_record_stop`。\n\n数据保存到 `game_recordings/YYYYMMDD_HHMMSS/`，包含：\n\n- `meta.json`：本次采集参数和窗口信息。\n- `summary.json`：采样帧、归档帧、事件候选数量等汇总。\n- `frames.jsonl`：每次采样的整体变化与各区域变化分数。\n- `events.jsonl`：事件候选、变化区域、前后关键帧路径。\n- `frames/`：低频连续归档帧，默认约 2 FPS。\n- `events/`：ROI 图像差分检测到明显变化时保存的高质量前后关键帧。\n\n当前 `events.jsonl` 的 `label` 暂为空。下一阶段会把事件自动分类为左家/上家/右家的暗摸、拿亮牌、出牌、机会牌等动作。\n\n采集期间如果切到其他窗口，程序会暂停采样，不会把其他软件截图写入牌局数据；切回欢乐斗地主后自动继续。\n\n### 采集配置\n\n`.env` 可调整：\n\n    GAME_RECORD_FPS=6\n    GAME_RECORD_ARCHIVE_FPS=2\n    GAME_RECORD_DIFF_THRESHOLD=0.028\n    GAME_RECORD_JPEG_QUALITY=78\n\n第一次建议保持默认值。`game_recordings/` 已加入 `.gitignore`，真实牌局截图不会提交到 GitHub。\n\n采集模式不依赖 OpenAI API，因此即使视觉模型尚未配置，也可以先采集真实牌局。
