@@ -222,6 +222,8 @@ class OpponentEventVision:
             kwargs["base_url"] = base_url
         self.client = AsyncOpenAI(**kwargs)
         self.model = model
+        self.base_url = base_url.rstrip("/")
+        self._prefer_chat_completions = bool(self.base_url)
 
     async def classify(
         self,
