@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from game_balatro.balatrobot import BalatroBotClient, snapshot_from_gamestate
 from game_balatro.models import BalatroDecision, ScreenType
+from game_balatro.solver import BalatroSolver
 
 
 def test_balatrobot_state_maps_to_solver_snapshot() -> None:
@@ -199,3 +200,76 @@ def test_round_eval_maps_to_cash_out_screen() -> None:
         }
     )
     assert snapshot.screen_type == ScreenType.ROUND_EVAL
+
+
+def test_api_shop_candidates_keep_leave_and_reroll_separate() -> None:
+    snapshot = snapshot_from_gamestate(
+        {
+            "state": "SHOP",
+            "money": 20,
+            "round": {"reroll_cost": 5},
+            "blinds": {},
+            "hand": {"cards": []},
+            "jokers": {"cards": []},
+            "shop": {
+                "cards": [
+                    {
+                        "label": "Joker A",
+                        "set": "JOKER",
+                        "value": {},
+                        "modifier": {},
+                        "state": {},
+                        "cost": {"buy": 4},
+                    }
+                ]
+            },
+            "vouchers": {"cards": []},
+            "packs": {"cards": []},
+            "pack": {"cards": []},
+        }
+    )
+    candidates = BalatroSolver(reserve_money=5).rank_candidates(
+        snapshot,
+        top_n=6,
+    )
+    kinds = {
+        str(decision.metadata.get("candidate_type") or "")
+        for decision in candidates
+    }
+
+    assert "shop_buy" in kinds
+    assert "shop_leave" in kinds
+    assert "shop_reroll" in kinds
+
+
+def test_api_shop_booster_baseline_keeps_buy_group_and_index() -> None:
+    snapshot = snapshot_from_gamestate(
+        {
+            "state": "SHOP",
+            "money": 20,
+            "round": {"reroll_cost": 5},
+            "blinds": {},
+            "hand": {"cards": []},
+            "jokers": {"cards": []},
+            "shop": {"cards": []},
+            "vouchers": {"cards": []},
+            "packs": {
+                "cards": [
+                    {
+                        "label": "Arcana Pack",
+                        "set": "BOOSTER",
+                        "value": {},
+                        "modifier": {},
+                        "state": {},
+                        "cost": {"buy": 4},
+                    }
+                ]
+            },
+            "pack": {"cards": []},
+        }
+    )
+    decision = BalatroSolver(reserve_money=5).decide(snapshot)
+
+    assert decision.metadata["candidate_type"] == "shop_buy"
+    assert decision.metadata["api_group"] == "pack"
+    assert decision.metadata["api_index"] == 0
