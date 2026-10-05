@@ -57,6 +57,7 @@ class BaqueGameController:
         min_event_confidence: float = 0.80,
         auto_next_round: bool = False,
         decision_budget_seconds: float = 4.0,
+        fast_vision_enabled: bool = True,
     ) -> None:
         self.vision = vision
         self.screenshots_dir = screenshots_dir
@@ -66,6 +67,7 @@ class BaqueGameController:
         self.min_card_confidence = min(max(float(min_card_confidence), 0.0), 1.0)
         self.min_event_confidence = min(max(float(min_event_confidence), 0.0), 1.0)
         self.auto_next_round = bool(auto_next_round)
+        self.fast_vision_enabled = bool(fast_vision_enabled)
         # 回合约 20 秒，识别占 4~6 秒；EV 决策必须在预算内给出结果。
         self.decision_budget_seconds = max(0.5, float(decision_budget_seconds))
         self.last_snapshot: GameSnapshot | None = None
@@ -111,11 +113,16 @@ class BaqueGameController:
         include_previous: bool,
     ) -> GameSnapshot:
         """固定 UI 先走 OpenCV；只有牌面/异常页面才调用 Qwen。"""
-        fast = await asyncio.to_thread(analyze_image_path, frame.path)
+        fast = (
+            await asyncio.to_thread(analyze_image_path, frame.path)
+            if self.fast_vision_enabled
+            else None
+        )
 
         # 开始页完全不需要多模态模型：OpenCV 直接给出按钮中心。
         if (
-            fast.screen_type == ScreenType.START
+            fast is not None
+            and fast.screen_type == ScreenType.START
             and fast.start_button is not None
             and fast.confidence >= 0.72
         ):
@@ -137,7 +144,7 @@ class BaqueGameController:
         # 启动流程或外部观察器运行时，不再用整图 Qwen 判断“是不是轮到我”。
         # OpenCV 只判断阶段；真正牌面仍交给专用快速视觉协议。
         can_use_fast_turn = not include_previous or self.external_observer_active
-        if fast.action_state is not None and can_use_fast_turn:
+        if fast is not None and fast.action_state is not None and can_use_fast_turn:
             self.fast_ui_count += 1
             self.qwen_vision_count += 1
             LOGGER.info(
@@ -149,7 +156,7 @@ class BaqueGameController:
             return snapshot
 
         # 牌局进行中但不是自己回合时，自动模式无需浪费数秒让 Qwen重复确认。
-        if fast.round_in_progress and can_use_fast_turn:
+        if fast is not None and fast.round_in_progress and can_use_fast_turn:
             self.fast_ui_count += 1
             snapshot = GameSnapshot(
                 screen_type=ScreenType.WAITING,
@@ -640,6 +647,7 @@ class BaqueGameController:
             "fast_ui_count": self.fast_ui_count,
             "qwen_vision_count": self.qwen_vision_count,
             "fast_ui_fallback_count": self.fast_ui_fallback_count,
+            "fast_vision_enabled": self.fast_vision_enabled,
         }
 
     def _decide(
