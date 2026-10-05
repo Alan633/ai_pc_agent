@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -261,6 +262,8 @@ class BalatroBotClient:
         game_executable_path: str = "",
         lovely_path: str = "",
         audio: bool = True,
+        preserve_user_settings: bool = True,
+        mod_path: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = max(1.0, min(float(timeout_seconds), 60.0))
@@ -269,6 +272,8 @@ class BalatroBotClient:
         self.game_executable_path = game_executable_path.strip()
         self.lovely_path = lovely_path.strip()
         self.audio = bool(audio)
+        self.preserve_user_settings = bool(preserve_user_settings)
+        self.mod_path = mod_path.strip()
         self._request_id = 0
         self._serve_process: subprocess.Popen[bytes] | None = None
 
@@ -399,8 +404,6 @@ class BalatroBotClient:
             except OSError:
                 continue
             # VDF 中 path 常见形式："path" "D:\\SteamLibrary"
-            import re
-
             for match in re.finditer(
                 r'"path"\s*"([^"]+)"',
                 text,
@@ -490,8 +493,144 @@ class BalatroBotClient:
             "windows",
         ]
 
+    def _resolve_mod_settings_path(self) -> Path | None:
+        """定位用户安装的 BalatroBot settings.lua。"""
+        explicit = (
+            self.mod_path
+            or os.getenv("BALATROBOT_MOD_PATH", "").strip()
+        )
+        candidates: list[Path] = []
+        if explicit:
+            path = Path(explicit).expanduser()
+            if path.name.lower() == "settings.lua":
+                candidates.append(path)
+            else:
+                candidates.append(path / "src" / "lua" / "settings.lua")
+
+        appdata = os.getenv("APPDATA", "").strip()
+        if appdata:
+            candidates.append(
+                Path(appdata)
+                / "Balatro"
+                / "Mods"
+                / "balatrobot"
+                / "src"
+                / "lua"
+                / "settings.lua"
+            )
+
+        for candidate in candidates:
+            found = self._existing_file(candidate)
+            if found is not None:
+                return found
+        return None
+
+    def _patch_preserve_user_settings(self) -> str:
+        """避免 BalatroBot 覆盖 Balatro 的持久化用户设置。
+
+        BalatroBot 1.5.2 默认会把声音、CRT、阴影、VSync、震动等 G.SETTINGS
+        改写为机器人专用值，Balatro 随后可能把这些值保存到磁盘。这里在启动前
+        对用户安装的 Mod 做幂等兼容补丁，并保留一次原文件备份。
+        """
+        if not self.preserve_user_settings:
+            return "disabled"
+
+        path = self._resolve_mod_settings_path()
+        if path is None:
+            return "not_found"
+
+        marker = "-- AIAGENT_PRESERVE_USER_SETTINGS_V1"
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise BalatroBotError(
+                f"读取 BalatroBot settings.lua 失败：{exc}"
+            ) from exc
+
+        if marker in source:
+            return "already_patched"
+
+        settings_pattern = re.compile(
+            r"local function configure_settings\(\)\n.*?\nend\n\n"
+            r"--- Configures headless mode",
+            flags=re.DOTALL,
+        )
+        audio_pattern = re.compile(
+            r"local function configure_audio\(\)\n.*?\nend\n\n"
+            r"--- Initializes and applies",
+            flags=re.DOTALL,
+        )
+        if not settings_pattern.search(source) or not audio_pattern.search(source):
+            raise BalatroBotError(
+                "BalatroBot settings.lua 结构与已知版本不一致，"
+                "为避免破坏 Mod 已停止自动补丁。"
+            )
+
+        preserved_settings = f'''{marker}
+local function configure_settings()
+  -- 保留玩家自己的 G.SETTINGS，避免退出游戏时把机器人配置写回存档。
+  -- 仅保留不会覆盖用户偏好的运行时标志。
+  G.FPS_CAP = BB_SETTINGS.fps_cap
+  G.ANIMATION_FPS = BB_SETTINGS.animation_fps
+  G.F_SKIP_TUTORIAL = true
+  G.F_VERBOSE = true
+
+  if not BB_SETTINGS.audio then
+    G.F_SOUND_THREAD = false
+    G.F_MUTE = true
+  end
+end
+
+--- Configures headless mode'''
+
+        preserved_audio = '''local function configure_audio()
+  -- 不改玩家保存的音量；只确保声音没有被 BalatroBot 主动静音。
+  G.F_MUTE = false
+  G.F_SOUND_THREAD = true
+
+  -- 如果之前已被旧版 BalatroBot 整体写成 0，恢复到可听的基础值。
+  G.SETTINGS.SOUND = G.SETTINGS.SOUND or {}
+  local master = tonumber(G.SETTINGS.SOUND.volume) or 0
+  local music = tonumber(G.SETTINGS.SOUND.music_volume) or 0
+  local effects = tonumber(G.SETTINGS.SOUND.game_sounds_volume) or 0
+  if master <= 0 and music <= 0 and effects <= 0 then
+    G.SETTINGS.SOUND.volume = 50
+    G.SETTINGS.SOUND.music_volume = 100
+    G.SETTINGS.SOUND.game_sounds_volume = 100
+  end
+end
+
+--- Initializes and applies'''
+
+        patched = settings_pattern.sub(
+            preserved_settings,
+            source,
+            count=1,
+        )
+        patched = audio_pattern.sub(
+            preserved_audio,
+            patched,
+            count=1,
+        )
+
+        backup = path.with_name(path.name + ".aiagent.bak")
+        try:
+            if not backup.exists():
+                backup.write_text(source, encoding="utf-8")
+            temp = path.with_name(path.name + ".aiagent.tmp")
+            temp.write_text(patched, encoding="utf-8")
+            temp.replace(path)
+        except OSError as exc:
+            raise BalatroBotError(
+                f"写入 BalatroBot 设置兼容补丁失败：{exc}"
+            ) from exc
+
+        return "patched"
+
     def _serve_command(self, logs_dir: Path) -> list[str]:
         """构造后台启动 BalatroBot 的命令，优先 uvx，兼容只有 uv 的环境。"""
+        self._patch_preserve_user_settings()
+
         uvx = shutil.which("uvx")
         if uvx:
             command = [uvx, "balatrobot", "serve"]
