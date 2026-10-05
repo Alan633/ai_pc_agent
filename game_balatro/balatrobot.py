@@ -260,6 +260,7 @@ class BalatroBotClient:
         stake: str = "WHITE",
         game_executable_path: str = "",
         lovely_path: str = "",
+        audio: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = max(1.0, min(float(timeout_seconds), 60.0))
@@ -267,6 +268,7 @@ class BalatroBotClient:
         self.stake = stake.strip().upper() or "WHITE"
         self.game_executable_path = game_executable_path.strip()
         self.lovely_path = lovely_path.strip()
+        self.audio = bool(audio)
         self._request_id = 0
         self._serve_process: subprocess.Popen[bytes] | None = None
 
@@ -503,6 +505,9 @@ class BalatroBotClient:
 
         if os.name == "nt":
             command.extend(self._windows_launch_args())
+
+        if self.audio:
+            command.append("--audio")
 
         parsed = urlparse(self.base_url)
         if parsed.hostname and parsed.hostname not in {"127.0.0.1", "localhost"}:
