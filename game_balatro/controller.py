@@ -373,6 +373,8 @@ class BalatroController:
             "expected_strength": (
                 decision.expected_strength
             ),
+            "decision_source": self.last_decision_source,
+            "strategy_memory": list(self.strategy_memory),
             "metadata": decision.metadata,
         }
         path = (
