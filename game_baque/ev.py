@@ -663,9 +663,17 @@ class ExpectedValueEngine:
                 hand8 = hand + [card_from_key(key)]
                 hu = evaluate_hu(hand8, gold_ranks)
                 if hu is not None:
+                    # 未来 rollout 只能按“一次结算”的可实现上限计值。
+                    # hu_value() 会精确处理当前无癞子胡的多次支付；但把这种
+                    # hard_multiplier 原样带进未来路径，会在封顶场景里把
+                    # 尚未发生的后续胡牌价值重复放大，导致继续做牌过度乐观。
+                    future_value = min(
+                        self.hu_value(hu),
+                        self.capped(hu.theoretical_score),
+                    )
                     best_value = max(
                         best_value,
-                        self.hu_value(hu) * (self.discount ** depth),
+                        future_value * (self.discount ** depth),
                     )
                 # 即使当前能胡，也允许比较“继续做更大牌”的路线。
                 if depth + 1 < self.horizon_own_draws:
