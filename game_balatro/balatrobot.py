@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from game_balatro.models import (
     BalatroDecision,
@@ -304,9 +304,19 @@ class BalatroBotClient:
             if timeout_seconds is None
             else max(0.2, float(timeout_seconds))
         )
+        parsed = urlparse(self.base_url)
+        is_local = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
         try:
-            with urlopen(request, timeout=timeout) as response:
-                raw = response.read().decode("utf-8")
+            if is_local:
+                # BalatroBot 是本机 JSON-RPC 服务。Windows/VPN 环境里若存在
+                # HTTP(S)_PROXY，urllib 默认也可能把 127.0.0.1 发给代理，
+                # 造成假性超时。localhost 通信强制禁用代理。
+                opener = build_opener(ProxyHandler({}))
+                with opener.open(request, timeout=timeout) as response:
+                    raw = response.read().decode("utf-8")
+            else:
+                with urlopen(request, timeout=timeout) as response:
+                    raw = response.read().decode("utf-8")
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
             raise BalatroBotError(
                 f"BalatroBot 连接失败：{type(exc).__name__}: {exc}"
@@ -689,6 +699,21 @@ end
                     0,
                 )
 
+            child_env = os.environ.copy()
+            bypass = ["127.0.0.1", "localhost", "::1"]
+            for key in ("NO_PROXY", "no_proxy"):
+                current = [
+                    item.strip()
+                    for item in child_env.get(key, "").split(",")
+                    if item.strip()
+                ]
+                lowered = {item.lower() for item in current}
+                for item in bypass:
+                    if item.lower() not in lowered:
+                        current.append(item)
+                        lowered.add(item.lower())
+                child_env[key] = ",".join(current)
+
             with log_path.open("ab") as log_handle:
                 self._serve_process = subprocess.Popen(
                     command,
@@ -696,6 +721,7 @@ end
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     creationflags=creationflags,
+                    env=child_env,
                 )
 
         deadline = time.monotonic() + max(
