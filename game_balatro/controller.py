@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from game_balatro.capture import (
     click_frame_point,
     focus_balatro_window,
 )
+from game_balatro.local_strategy import BalatroLocalStrategist
 from game_balatro.models import (
     BalatroDecision,
     BalatroSnapshot,
@@ -44,6 +46,8 @@ class BalatroController:
         *,
         vision: BalatroVision,
         solver: BalatroSolver,
+        strategist: BalatroLocalStrategist | None = None,
+        decision_mode: str = "python",
         screenshots_dir: Path,
         logs_dir: Path,
         session: AgentSession,
@@ -53,6 +57,11 @@ class BalatroController:
     ) -> None:
         self.vision = vision
         self.solver = solver
+        self.strategist = strategist
+        normalized_mode = decision_mode.strip().lower()
+        if normalized_mode not in {"python", "hybrid"}:
+            raise ValueError("Balatro decision_mode 必须是 python 或 hybrid")
+        self.decision_mode = normalized_mode
         self.screenshots_dir = screenshots_dir / "balatro"
         self.logs_dir = logs_dir / "balatro"
         self.logs_dir.mkdir(
@@ -75,6 +84,10 @@ class BalatroController:
         self.unknown_count = 0
         self.run_count = 0
         self.game_over_count = 0
+        self.qwen_strategy_count = 0
+        self.qwen_fallback_count = 0
+        self.last_decision_source = "none"
+        self.strategy_memory: deque[str] = deque(maxlen=12)
         self._last_action_fingerprint: (
             tuple[object, ...] | None
         ) = None
@@ -378,13 +391,83 @@ class BalatroController:
                 + "\n"
             )
 
+    async def _choose_decision(
+        self,
+        snapshot: BalatroSnapshot,
+    ) -> BalatroDecision:
+        top_n = (
+            self.strategist.top_n
+            if self.strategist is not None
+            else 6
+        )
+        candidates = self.solver.rank_candidates(
+            snapshot,
+            top_n=top_n,
+        )
+        if not candidates:
+            self.last_decision_source = "python"
+            return self.solver.decide(snapshot)
+
+        baseline = candidates[0]
+        can_use_qwen = (
+            self.decision_mode == "hybrid"
+            and self.strategist is not None
+            and len(candidates) >= 2
+            and snapshot.screen_type
+            in {
+                ScreenType.PLAY,
+                ScreenType.SHOP,
+                ScreenType.PACK,
+                ScreenType.BLIND_SELECT,
+            }
+        )
+        if not can_use_qwen:
+            self.last_decision_source = "python"
+            return baseline
+
+        result = await self.strategist.rerank(
+            snapshot=snapshot,
+            candidates=candidates,
+            strategy_memory=tuple(self.strategy_memory),
+        )
+        if result.used_model:
+            self.qwen_strategy_count += 1
+            self.last_decision_source = "qwen_hybrid"
+            if result.build_plan:
+                memory = (
+                    f"Ante {snapshot.ante}/Round {snapshot.round_no}: "
+                    f"{result.build_plan}"
+                )
+                if (
+                    not self.strategy_memory
+                    or self.strategy_memory[-1] != memory
+                ):
+                    self.strategy_memory.append(memory)
+            LOGGER.info(
+                "Balatro HYBRID choice=%s confidence=%.2f plan=%s reason=%s",
+                result.choice_id,
+                result.confidence,
+                result.build_plan,
+                result.reason,
+            )
+            return result.decision
+
+        self.qwen_fallback_count += 1
+        self.last_decision_source = "python_fallback"
+        LOGGER.info(
+            "Balatro HYBRID回退Python confidence=%.2f reason=%s",
+            result.confidence,
+            result.reason,
+        )
+        return baseline
+
     async def step(
         self,
         *,
         execute: bool,
     ) -> BalatroStepResult:
         frame, snapshot = await self.inspect()
-        decision = self.solver.decide(
+        decision = await self._choose_decision(
             snapshot
         )
         self.last_decision = decision
@@ -519,6 +602,11 @@ class BalatroController:
             "unknown": self.unknown_count,
             "actions": self.action_count,
             "game_overs": self.game_over_count,
+            "decision_mode": self.decision_mode,
+            "last_decision_source": self.last_decision_source,
+            "qwen_strategy_count": self.qwen_strategy_count,
+            "qwen_fallback_count": self.qwen_fallback_count,
+            "strategy_memory": list(self.strategy_memory),
             "last_state": self.state_text(),
             "last_decision": (
                 {
