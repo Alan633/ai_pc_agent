@@ -14,6 +14,7 @@ from config import Settings
 from game_baque.acceptance import BaqueAcceptanceTracker
 from game_baque.controller import BaqueGameController, GameStepResult
 from game_baque.event_vision import OpponentEventVision
+from game_baque.local_decision import LocalDecisionReranker
 from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
 from game_baque.vision import BaqueVision
@@ -67,6 +68,20 @@ class BaquePlugin:
 
         game: BaqueGameController | None = None
         if settings.openai_api_key or settings.game_vision_base_url:
+            decision_reranker = None
+            if (
+                settings.game_decision_mode == "hybrid"
+                and settings.game_decision_base_url
+            ):
+                decision_reranker = LocalDecisionReranker(
+                    base_url=settings.game_decision_base_url,
+                    model=settings.game_decision_model,
+                    api_key=settings.openai_api_key,
+                    timeout_seconds=settings.game_decision_timeout_seconds,
+                    top_n=settings.game_decision_top_n,
+                    min_confidence=settings.game_decision_min_confidence,
+                    max_ev_drop=settings.game_hybrid_max_ev_drop,
+                )
             game = BaqueGameController(
                 vision=BaqueVision(
                     settings.openai_api_key,
@@ -81,6 +96,8 @@ class BaquePlugin:
                 min_event_confidence=settings.game_min_event_confidence,
                 auto_next_round=settings.game_auto_next_round,
                 fast_vision_enabled=settings.game_fast_vision,
+                decision_mode=settings.game_decision_mode,
+                decision_reranker=decision_reranker,
             )
 
         observer: OpponentObserver | None = None
