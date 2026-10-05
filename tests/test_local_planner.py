@@ -48,3 +48,10 @@ def test_chat_tool_schema_conversion() -> None:
     tool = planner.chat_tools[0]
     assert tool["type"] == "function"
     assert tool["function"]["name"] == "launch_app"
+
+
+def test_discard_removes_unfinished_local_history() -> None:
+    planner = _planner()
+    planner._chat_histories["response-1"] = [{"role": "user", "content": "test"}]
+    planner.discard("response-1")
+    assert planner._chat_histories == {}

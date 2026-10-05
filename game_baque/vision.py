@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
+from PIL import Image
 
 from game_baque.models import Card, GameSnapshot, OpponentEvent, Point, RANKS, ScreenType, SUITS
+
+
+LOCAL_VISION_SIZE = (1280, 720)
+LOCAL_COORDINATE_RANGE = 1000
 
 
 VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点字成金”游戏截图，不负责制定策略。
@@ -21,8 +28,8 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
 3. 癞子单独返回 rank=WILD、suit=NONE、wild=true。
 4. 普通牌点数只可能是 6、7、8、9、10、J、Q、K、A；花色 S/H/C/D 分别表示黑桃/红桃/梅花/方片。
 5. 每张手牌的 x/y 要放在“该牌自己可点击的暴露区域”中心，优先取牌面上方的点数/花色附近，避免落在被右侧牌遮住的区域。若手牌明显被抬高/高亮表示已选中，selected=true。
-6. visible_cards 只返回当前提示“请从牌堆或亮牌中选择一张牌”时，桌面上真正正面朝上且可选择的亮牌；问号背面牌、对手手牌、历史弃牌不要放进去。
-7. deck_click 是当前牌堆（蓝色背面、通常带剩余张数）的可点击中心。
+6. visible_cards 只返回当前提示“请从牌堆或亮牌中选择一张牌”时，桌面上真正正面朝上且可选择的普通亮牌；对手手牌、历史弃牌不要放进去。
+7. opportunity_click 是当前玩家底部手牌区中、正面显示橙色“?”和骰子图案的“选牌”卡中心。它不是癞子、不是普通手牌，也不是中央牌堆旁较小的“?”预览。可见时必须返回；deck_click 是中央蓝色背面牌堆中心。使用选牌卡时必须先选择中央牌堆或亮牌，再点击这张底部“?”卡。
 8. 识别按钮中心：开始游戏、换牌、出牌、胡牌、继续/再来一局。不可见时 visible=false。
 9. 若出现“豆子不足啦”、充值、钻石购买等弹窗，screen_type 必须为 recharge。不要把任何购买按钮当作 start_button 或 continue_button。
 10. screen_type：
@@ -52,18 +59,24 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
 LOCAL_VISION_PROMPT = """识别腾讯欢乐斗地主“百变八雀·点字成金”截图，只输出一个 JSON 对象，不要 Markdown/解释。
 
 规则：
+- 所有牌和按钮坐标使用 Qwen 视觉的 0-1000 归一化坐标：左上=(0,0)，右下=(1000,1000)。
 - screen_type: start/swap/draw/discard/hu/waiting/settlement/recharge/unknown。
 - start=中央有橙色“开始游戏”；recharge=豆子不足/充值/购买，绝不能误点购买。
-- 金牌是左上 3 张黄色小牌，只返回点数；自己的手牌在底部，按左到右。
+- gold_ranks 必须是三个点数字符串，例如 ["6","8","9"]，绝不能返回对象。
+- 金牌是左上 3 张黄色小牌；自己的手牌在底部，按左到右。
 - 普通牌 rank=6/7/8/9/10/J/Q/K/A，suit=S/H/C/D；癞子 rank=WILD,suit=NONE,wild=true。
-- 牌和按钮坐标均为当前图片像素坐标；看不清不要猜，低置信时 screen_type=unknown。
+- swap 阶段 hand 只返回底部 6 张普通明牌。最左侧带“?”和骰子图案的是“选牌/机会牌入口”，不是手牌、不是癞子，绝不能放进 hand；visible_cards=[]。
+- draw 阶段通常有 7 张普通手牌；若底部最左侧有橙色“?”选牌卡，则 opportunity_click 填它的中心，hand 只返回其余 6 张普通牌。discard/hu 阶段 hand 必须有 8 张普通牌。
+- 中央蓝色牌背上的 56 等数字是 deck_count，不是 visible_cards，也不是牌的 rank。
+- 底部手牌区最左侧、正面为橙色“?”加骰子的牌是自己的“选牌”卡：填写 opportunity_click。它不是癞子、不是普通手牌；中央牌堆右侧较小的“?”只是预览，绝不能当作 opportunity_click。
+- 看不清不要猜，低置信时 screen_type=unknown。
 - visible_cards 只放当前真正可选的正面亮牌。
 - 两张图时第一张=上一帧、第二张=当前帧；只记录新发生的对手动作。首次截图 opponent_events=[]。
 - 对手 seat=left/top/right；action=draw_deck/take_visible/discard/finished；看不清具体牌时不要虚构。
 
 必须返回这些字段，缺失按钮用 visible=false，未知 deck_count=-1：
 {"screen_type":"unknown","gold_ranks":[],"hand":[],"visible_cards":[],"opponent_events":[],
-"deck_click":{"x":0,"y":0,"visible":false},"swap_button":{"x":0,"y":0,"visible":false},
+"opportunity_click":{"x":0,"y":0,"visible":false},"deck_click":{"x":0,"y":0,"visible":false},"swap_button":{"x":0,"y":0,"visible":false},
 "discard_button":{"x":0,"y":0,"visible":false},"hu_button":{"x":0,"y":0,"visible":false},
 "start_button":{"x":0,"y":0,"visible":false},"continue_button":{"x":0,"y":0,"visible":false},
 "close_popup":{"x":0,"y":0,"visible":false},"deck_count":-1,"message":""}
@@ -74,6 +87,37 @@ hand/visible_cards 每项：
 opponent_events 每项：
 {"seat":"left","action":"discard","card_rank":"A","card_suit":"D","card_wild":false,"confidence":0.99,"detail":""}
 """
+
+
+LOCAL_SWAP_PROMPT = """只识别腾讯欢乐斗地主“百变八雀”换牌页，只输出 JSON，不要解释。
+格式：{"gold_ranks":["6","7","J"],"hand":[{"rank":"?","suit":"NONE","x":0,"y":0},{"rank":"A","suit":"H","x":0,"y":0}],"swap_button":{"x":0,"y":0}}。
+坐标使用 0-1000：左上=(0,0)，右下=(1000,1000)。
+gold_ranks 读取左上三张金牌。hand 按底部所有可见项从左到右返回；橙色“?”加骰子是选牌入口，必须用 rank="?"、suit="NONE" 作为位置占位，后续不会把它当手牌。
+普通牌 rank 仅限 6/7/8/9/10/J/Q/K/A，suit 仅限 S/H/C/D；写着“癞子”的牌是真实手牌，用 rank="WILD"、suit="NONE"，不能漏掉。x/y 取每张牌上方可点击的点数花色处。
+swap_button 返回灰色“换牌”按钮中心。"""
+
+
+LOCAL_TURN_PROMPT = """只识别腾讯欢乐斗地主“百变八雀”自己回合截图，只输出 JSON，不要解释。
+格式：{"gold_ranks":["6","7","J"],"hand":[{"rank":"?","suit":"NONE"},{"rank":"A","suit":"H","up":false}],"table":[{"rank":"9","suit":"D","x":490}],"deck_count":52,"hu_button":null}
+gold_ranks：左上三张黄色金牌的点数。
+hand：底部自己的牌从左到右逐张返回，通常共 7 或 8 张，牌互相遮挡也必须数全，每张只返回一次。橙色“?”加骰子的选牌卡用 rank="?"、suit="NONE" 占位。牌被明显抬高时 up=true。
+table：中央长框内蓝色牌堆右侧正面朝上的亮牌，x 为其中心横坐标（0-1000），没有则 []。中央牌堆右侧的小“?”不是亮牌。
+deck_count：蓝色牌堆背面上的数字。
+hu_button：画面有“胡”按钮时返回 {"x":0,"y":0}（0-1000 坐标），否则 null。
+普通牌 rank 仅限 6/7/8/9/10/J/Q/K/A，suit 仅限 S/H/C/D；癞子 rank="WILD"、suit="NONE"。"""
+
+
+# 回合专用识别的固定布局（0-1000 归一化，按 1936x1088 实图标定）。扇形手牌
+# 互相遮挡，模型坐标越靠右误差越大；牌位只由总张数决定，模型只负责读牌面。
+TURN_HAND_Y = 850
+TURN_HAND_SLOTS: dict[int, tuple[int, ...]] = {
+    7: tuple(283 + index * 62 for index in range(7)),
+    8: tuple(round(282 + index * 53.4) for index in range(8)),
+}
+TURN_TABLE_SLOTS: tuple[int, ...] = (438, 492, 546, 600)
+TURN_TABLE_Y = 386
+TURN_DECK_POINT = Point(384, 386)
+TURN_DISCARD_BUTTON = Point(536, 677)
 
 
 def _point_schema() -> dict[str, Any]:
@@ -136,6 +180,7 @@ SNAPSHOT_SCHEMA = {
         "hand": {"type": "array", "items": CARD_SCHEMA, "maxItems": 8},
         "visible_cards": {"type": "array", "items": CARD_SCHEMA, "maxItems": 8},
         "opponent_events": {"type": "array", "items": OPPONENT_EVENT_SCHEMA, "maxItems": 6},
+        "opportunity_click": _point_schema(),
         "deck_click": _point_schema(),
         "swap_button": _point_schema(),
         "discard_button": _point_schema(),
@@ -152,6 +197,7 @@ SNAPSHOT_SCHEMA = {
         "hand",
         "visible_cards",
         "opponent_events",
+        "opportunity_click",
         "deck_click",
         "swap_button",
         "discard_button",
@@ -183,21 +229,40 @@ class BaqueVision:
         image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
         return f"data:image/png;base64,{image_b64}"
 
+    @staticmethod
+    def _local_data_url(image_path: Path) -> tuple[str, tuple[int, int]]:
+        """把本地视觉输入固定为 1280x720，并保留原图尺寸供坐标反算。"""
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            original_size = image.size
+            resized = image.resize(LOCAL_VISION_SIZE, Image.Resampling.LANCZOS)
+            buffer = io.BytesIO()
+            resized.save(buffer, "JPEG", quality=90, optimize=True)
+        image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{image_b64}", original_size
+
     async def parse(
         self,
         image_path: Path,
         previous_image_path: Path | None = None,
     ) -> GameSnapshot:
-        current_url = self._data_url(image_path)
-        previous_url = (
-            self._data_url(previous_image_path)
-            if previous_image_path is not None and previous_image_path.exists()
-            else None
-        )
-
         if self._prefer_chat_completions:
+            current_url, original_size = self._local_data_url(image_path)
+            previous_url = (
+                self._local_data_url(previous_image_path)[0]
+                if previous_image_path is not None and previous_image_path.exists()
+                else None
+            )
             raw = await self._parse_chat_completions(current_url, previous_url)
+            payload = json.loads(raw)
+            return self._scale_local_snapshot(self._to_snapshot(payload), original_size)
         else:
+            current_url = self._data_url(image_path)
+            previous_url = (
+                self._data_url(previous_image_path)
+                if previous_image_path is not None and previous_image_path.exists()
+                else None
+            )
             try:
                 raw = await self._parse_responses(current_url, previous_url)
             except Exception:
@@ -206,6 +271,245 @@ class BaqueVision:
 
         payload = json.loads(raw)
         return self._to_snapshot(payload)
+
+    async def parse_swap(self, image_path: Path) -> GameSnapshot:
+        """使用最小输出专门识别短倒计时的开局换牌页。"""
+        if not self._prefer_chat_completions:
+            return await self.parse(image_path)
+
+        current_url, original_size = self._local_data_url(image_path)
+        payload = await self._quick_json(LOCAL_SWAP_PROMPT, current_url, "换牌")
+        hand_values = payload.get("hand", [])
+        if isinstance(hand_values, list):
+            placeholder = next(
+                (
+                    item
+                    for item in hand_values
+                    if isinstance(item, dict) and str(item.get("rank", "")) == "?"
+                ),
+                None,
+            )
+            # 癞子是真实手牌；只按普通点数过滤会把它丢掉，6 张手牌变 5 张，
+            # 换牌校验失败并错过倒计时。
+            hand_values = [
+                {**item, "rank": rank, "wild": rank == "WILD"}
+                for item in hand_values
+                if isinstance(item, dict)
+                for rank in [self._normalize_rank(item.get("rank"))]
+                if rank in RANKS or rank == "WILD"
+            ]
+            # 扇形手牌互相遮挡，Qwen 给出的 x 越靠右误差越大。游戏在换牌页
+            # 使用固定牌位：问号+6张普通牌时普通牌从 350 开始；选牌已经翻成
+            # 普通牌、共7张时从 285 开始。牌面仍由模型识别，点击点使用实图
+            # 标定后的稳定暴露区域中心。
+            if len(hand_values) == 7 and placeholder is None:
+                for index, item in enumerate(hand_values):
+                    item["x"] = 285 + index * 58
+                    item["y"] = 850
+            elif len(hand_values) == 6:
+                for index, item in enumerate(hand_values):
+                    item["x"] = 350 + index * 60
+                    item["y"] = 850
+            for item in hand_values:
+                # 专用协议刻意省略这些恒定字段以减少输出 token；合法普通牌已
+                # 经过 rank/suit 白名单约束，赋予可执行识别的默认置信度。
+                item.setdefault("wild", False)
+                item.setdefault("confidence", 0.95)
+                item.setdefault("selected", False)
+        snapshot = GameSnapshot(
+            screen_type=ScreenType.SWAP,
+            gold_ranks=self._to_gold_ranks(payload.get("gold_ranks", [])),
+            hand=self._to_cards(hand_values, field_name="swap_hand"),
+            swap_button=self._to_point(
+                {
+                    **(payload.get("swap_button") or {}),
+                    "visible": True,
+                }
+            ),
+            deck_count=56,
+            message="开局换牌专用快速识别",
+        )
+        return self._scale_local_snapshot(snapshot, original_size)
+
+    async def parse_turn(self, image_path: Path, action_state: str) -> GameSnapshot:
+        """自己回合专用快速识别；阶段由本地像素门给出，模型只读牌面。
+
+        完整提示词需要模型输出全部按钮/坐标，本地 9B 模型单帧约 13 秒，
+        而一个回合倒计时只有约 20 秒。这里只让模型转录牌面，按钮和牌位
+        使用固定布局，显著缩短输出长度。
+        """
+        if action_state == "swap":
+            return await self.parse_swap(image_path)
+        if not self._prefer_chat_completions:
+            return await self.parse(image_path)
+        current_url, original_size = self._local_data_url(image_path)
+        payload = await self._quick_json(LOCAL_TURN_PROMPT, current_url, "回合")
+        return self._scale_local_snapshot(
+            self._turn_snapshot(payload, action_state),
+            original_size,
+        )
+
+    async def _quick_json(self, prompt: str, image_url: str, label: str) -> dict[str, Any]:
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            temperature=0,
+            reasoning_effort="none",
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or ""
+        if not raw.strip():
+            raise RuntimeError(f"本地视觉模型未返回{label}识别结果")
+        payload = json.loads(self._extract_json(raw))
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"本地视觉模型{label}识别结果不是 JSON 对象")
+        return payload
+
+    @staticmethod
+    def _normalize_rank(value: Any) -> str:
+        rank = str(value or "").strip()
+        return "WILD" if rank.upper() == "WILD" or rank in {"癞子", "赖子"} else rank
+
+    @classmethod
+    def _turn_snapshot(cls, payload: dict[str, Any], action_state: str) -> GameSnapshot:
+        """把回合专用协议转换为 0-1000 坐标下的 GameSnapshot。"""
+        raw_hand = payload.get("hand", [])
+        items = (
+            [item for item in raw_hand if isinstance(item, dict)]
+            if isinstance(raw_hand, list)
+            else []
+        )
+        slots = TURN_HAND_SLOTS.get(len(items))
+        opportunity_click: Point | None = None
+        hand_values: list[dict[str, Any]] = []
+        for index, item in enumerate(items):
+            # 张数不符合任何已知布局时不给坐标，控制器会按张数校验拒绝执行。
+            x = slots[index] if slots is not None else 0
+            rank = cls._normalize_rank(item.get("rank"))
+            if rank == "?":
+                if slots is not None:
+                    opportunity_click = Point(x, TURN_HAND_Y)
+                continue
+            hand_values.append(
+                {
+                    "rank": rank,
+                    "suit": item.get("suit"),
+                    "wild": rank == "WILD",
+                    "x": x,
+                    "y": TURN_HAND_Y,
+                    "confidence": 0.95,
+                    "selected": bool(item.get("up", False)),
+                }
+            )
+        hand = cls._to_cards(hand_values, field_name="turn_hand")
+
+        visible: list[Card] = []
+        if action_state == "draw":
+            used_slots: set[int] = set()
+            raw_table = payload.get("table", [])
+            for item in raw_table if isinstance(raw_table, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    raw_x = int(item.get("x", -1))
+                except (TypeError, ValueError):
+                    continue
+                slot_x = min(TURN_TABLE_SLOTS, key=lambda value: abs(value - raw_x))
+                if abs(slot_x - raw_x) > 40 or slot_x in used_slots:
+                    continue
+                rank = cls._normalize_rank(item.get("rank"))
+                cards = cls._to_cards(
+                    [
+                        {
+                            "rank": rank,
+                            "suit": item.get("suit"),
+                            "wild": rank == "WILD",
+                            "x": slot_x,
+                            "y": TURN_TABLE_Y,
+                            "confidence": 0.95,
+                        }
+                    ],
+                    field_name="turn_table",
+                )
+                if cards:
+                    used_slots.add(slot_x)
+                    visible.extend(cards)
+            visible.sort(key=lambda card: card.x or 0)
+
+        hu_value = payload.get("hu_button")
+        hu_button = (
+            cls._to_point({**hu_value, "visible": True})
+            if isinstance(hu_value, dict) and action_state == "discard"
+            else None
+        )
+        if action_state == "draw":
+            screen_type = ScreenType.DRAW
+        elif hu_button is not None:
+            screen_type = ScreenType.HU
+        else:
+            screen_type = ScreenType.DISCARD
+
+        return GameSnapshot(
+            screen_type=screen_type,
+            gold_ranks=cls._to_gold_ranks(payload.get("gold_ranks", [])),
+            hand=hand,
+            visible_cards=visible,
+            opportunity_click=opportunity_click,
+            deck_click=TURN_DECK_POINT if action_state == "draw" else None,
+            discard_button=TURN_DISCARD_BUTTON if action_state == "discard" else None,
+            hu_button=hu_button,
+            deck_count=cls._to_deck_count(payload.get("deck_count", -1)),
+            message="回合专用快速识别",
+        )
+
+    @staticmethod
+    def _scale_local_snapshot(
+        snapshot: GameSnapshot,
+        original_size: tuple[int, int],
+    ) -> GameSnapshot:
+        target_width, target_height = original_size
+        scale_x = target_width / LOCAL_COORDINATE_RANGE
+        scale_y = target_height / LOCAL_COORDINATE_RANGE
+
+        def point(value: Point | None) -> Point | None:
+            if value is None:
+                return None
+            return Point(round(value.x * scale_x), round(value.y * scale_y))
+
+        def card(value: Card) -> Card:
+            if value.x is None or value.y is None:
+                return value
+            return replace(
+                value,
+                x=round(value.x * scale_x),
+                y=round(value.y * scale_y),
+            )
+
+        return GameSnapshot(
+            screen_type=snapshot.screen_type,
+            gold_ranks=snapshot.gold_ranks,
+            hand=[card(value) for value in snapshot.hand],
+            visible_cards=[card(value) for value in snapshot.visible_cards],
+            opponent_events=snapshot.opponent_events,
+            opportunity_click=point(snapshot.opportunity_click),
+            deck_click=point(snapshot.deck_click),
+            swap_button=point(snapshot.swap_button),
+            discard_button=point(snapshot.discard_button),
+            hu_button=point(snapshot.hu_button),
+            start_button=point(snapshot.start_button),
+            continue_button=point(snapshot.continue_button),
+            close_popup=point(snapshot.close_popup),
+            deck_count=snapshot.deck_count,
+            message=snapshot.message,
+        )
 
     async def _parse_responses(self, current_url: str, previous_url: str | None) -> str:
         content: list[dict[str, Any]] = [
@@ -252,6 +556,9 @@ class BaqueVision:
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0,
+            # Ollama/Qwen 默认会输出很长的隐藏推理；视觉状态只需要结构化转录。
+            # 关闭思考可显著降低延迟，并避免推理耗尽输出预算后 content 为空。
+            "reasoning_effort": "none",
         }
         try:
             response = await self.client.chat.completions.create(
@@ -270,6 +577,14 @@ class BaqueVision:
             )
             response = await self.client.chat.completions.create(**kwargs)
         raw = response.choices[0].message.content or ""
+        if not raw.strip():
+            logging.getLogger(__name__).warning(
+                "本地视觉模型返回空 content，取消 response_format 后重试一次"
+            )
+            response = await self.client.chat.completions.create(**kwargs)
+            raw = response.choices[0].message.content or ""
+        if not raw.strip():
+            raise RuntimeError("本地视觉模型连续两次返回空内容")
         return self._extract_json(raw)
 
     @staticmethod
@@ -306,16 +621,58 @@ class BaqueVision:
 
     @staticmethod
     def _to_card(value: dict[str, Any]) -> Card:
-        wild = bool(value["wild"]) or value["rank"] == "WILD"
+        rank = str(value.get("rank", ""))
+        suit = str(value.get("suit", ""))
+        wild = bool(value.get("wild", False)) or rank == "WILD"
+        if not wild and (rank not in RANKS or suit not in SUITS):
+            raise ValueError(f"非法牌：rank={rank!r} suit={suit!r}")
         return Card(
-            rank=None if wild else str(value["rank"]),
-            suit=None if wild else str(value["suit"]),
+            rank=None if wild else rank,
+            suit=None if wild else suit,
             wild=wild,
-            x=int(value["x"]),
-            y=int(value["y"]),
-            confidence=float(value["confidence"]),
+            x=int(value.get("x", 0)),
+            y=int(value.get("y", 0)),
+            confidence=float(value.get("confidence", 0.0)),
             selected=bool(value.get("selected", False)),
         )
+
+    @classmethod
+    def _to_cards(cls, values: Any, *, field_name: str) -> list[Card]:
+        cards: list[Card] = []
+        if not isinstance(values, list):
+            return cards
+        for index, value in enumerate(values):
+            if not isinstance(value, dict):
+                logging.getLogger(__name__).warning(
+                    "忽略非对象牌字段 field=%s index=%s value=%r",
+                    field_name,
+                    index,
+                    value,
+                )
+                continue
+            try:
+                cards.append(cls._to_card(value))
+            except (KeyError, TypeError, ValueError) as exc:
+                logging.getLogger(__name__).warning(
+                    "忽略非法牌字段 field=%s index=%s value=%r error=%s",
+                    field_name,
+                    index,
+                    value,
+                    exc,
+                )
+        return cards
+
+    @staticmethod
+    def _to_gold_ranks(values: Any) -> tuple[str, ...]:
+        if not isinstance(values, list):
+            return ()
+        ranks: list[str] = []
+        for value in values:
+            raw = value.get("rank") if isinstance(value, dict) else value
+            rank = str(raw)
+            if rank in RANKS:
+                ranks.append(rank)
+        return tuple(ranks)
 
     @staticmethod
     def _to_opponent_event(value: dict[str, Any]) -> OpponentEvent:
@@ -349,15 +706,93 @@ class BaqueVision:
 
     @classmethod
     def _to_snapshot(cls, payload: dict[str, Any]) -> GameSnapshot:
-        screen_type = ScreenType(str(payload["screen_type"]))
-        hand = [cls._to_card(item) for item in payload.get("hand", [])]
-        visible = [cls._to_card(item) for item in payload.get("visible_cards", [])]
+        try:
+            screen_type = ScreenType(str(payload.get("screen_type", "unknown")))
+        except ValueError:
+            screen_type = ScreenType.UNKNOWN
+        hand = cls._to_cards(payload.get("hand", []), field_name="hand")
+
+        # 本地 Qwen 偶尔会在已经发牌后仍把整局标成 start。牌局阶段的手牌数是
+        # 更强、也更稳定的结构信号：换牌固定 6 张，摸牌固定 7 张，取牌后固定
+        # 8 张。必须先纠正阶段，再决定是否保留 visible_cards，否则错误的 start
+        # 标签会把真正可选的亮牌清空，并让启动流程持续寻找“开始游戏”。
+        raw_swap_button = cls._to_point(payload.get("swap_button"))
+        if raw_swap_button is not None:
+            # “换牌”按钮是最直接的阶段证据。换牌时可能是 6 张普通牌加一个
+            # 尚未完成的“选牌”入口，也可能已经选牌完成而显示 7 张普通牌；
+            # 不能再用“7 张牌=摸牌”覆盖这个明确按钮。
+            screen_type = ScreenType.SWAP
+        elif len(hand) == 6:
+            screen_type = ScreenType.SWAP
+        elif len(hand) == 7:
+            screen_type = ScreenType.DRAW
+        elif len(hand) == 8:
+            screen_type = (
+                ScreenType.HU
+                if cls._to_point(payload.get("hu_button")) is not None
+                else ScreenType.DISCARD
+            )
+
+        if screen_type == ScreenType.SWAP and len(hand) in {6, 7}:
+            # 游戏通过“牌向上抬起”表示已选中。模型有时能给出正确坐标却漏掉
+            # selected=true，因此用同一排牌的纵坐标差补充判断。这里的坐标仍是
+            # 0-1000 归一化值，30 对应画面高度约 3%，足以排除轻微扇形差异。
+            ys = sorted(card.y for card in hand if card.y is not None)
+            if len(ys) == len(hand) and ys[-1] - ys[0] >= 40:
+                baseline_y = ys[len(ys) // 2]
+                hand = [
+                    replace(
+                        card,
+                        selected=(
+                            card.selected
+                            or (card.y is not None and card.y <= baseline_y - 30)
+                        ),
+                    )
+                    for card in hand
+                ]
+
+        visible = cls._to_cards(
+            payload.get("visible_cards", []),
+            field_name="visible_cards",
+        )
+        raw_opportunity_click = cls._to_point(payload.get("opportunity_click"))
+        if raw_opportunity_click is not None:
+            # 本地模型可能同时把同一个“?”入口错误抄成 WILD 亮牌。按坐标去重，
+            # 保留独立的选牌入口，不能让它参与普通牌 EV 或被当成癞子。
+            visible = [
+                card
+                for card in visible
+                if not (
+                    card.wild
+                    and card.x is not None
+                    and card.y is not None
+                    and abs(card.x - raw_opportunity_click.x) <= 80
+                    and abs(card.y - raw_opportunity_click.y) <= 80
+                )
+            ]
+            # “?”选牌卡位于自己的手牌区。本地模型有时为了满足 draw=7 张的
+            # 提示，又把它重复抄成 WILD 手牌；去掉这份重复表示。选牌卡不是
+            # 癞子，控制器通过 opportunity_click 单独执行它。
+            hand = [
+                card
+                for card in hand
+                if not (
+                    card.wild
+                    and card.x is not None
+                    and card.y is not None
+                    and abs(card.x - raw_opportunity_click.x) <= 100
+                    and abs(card.y - raw_opportunity_click.y) <= 100
+                )
+            ]
+        if screen_type != ScreenType.DRAW:
+            visible = []
         events = [
             cls._to_opponent_event(item)
             for item in payload.get("opponent_events", [])
         ]
+        opportunity_click = raw_opportunity_click
         deck_click = cls._to_point(payload.get("deck_click"))
-        swap_button = cls._to_point(payload.get("swap_button"))
+        swap_button = raw_swap_button
         discard_button = cls._to_point(payload.get("discard_button"))
         hu_button = cls._to_point(payload.get("hu_button"))
         continue_button = cls._to_point(payload.get("continue_button"))
@@ -370,13 +805,31 @@ class BaqueVision:
         # 兼容本地模型偶尔仍把“开始游戏”填入旧的 continue_button 字段。
         if screen_type == ScreenType.START and start_button is None:
             start_button = continue_button
+        message = str(payload.get("message", ""))
+
+        # 正式牌局里不存在“开始游戏”按钮。清除模型在头像、计时器等区域上
+        # 臆造的 start_button，避免控制器误点并让日志准确反映当前阶段。
+        if screen_type in {
+            ScreenType.SWAP,
+            ScreenType.DRAW,
+            ScreenType.DISCARD,
+            ScreenType.HU,
+        }:
+            start_button = None
+
+        if screen_type == ScreenType.START and start_button is None:
+            # 匹配/发牌动画有时会被本地模型误标为 start；真正开始页必须存在
+            # 可点击按钮。没有按钮时保守等待，不能中断自动启动或盲点坐标。
+            screen_type = ScreenType.WAITING
+            message = message or "未检测到开始按钮，按匹配/发牌等待状态处理。"
 
         return GameSnapshot(
             screen_type=screen_type,
-            gold_ranks=tuple(str(rank) for rank in payload.get("gold_ranks", [])),
+            gold_ranks=cls._to_gold_ranks(payload.get("gold_ranks", [])),
             hand=hand,
             visible_cards=visible,
             opponent_events=events,
+            opportunity_click=opportunity_click,
             deck_click=deck_click,
             swap_button=swap_button,
             discard_button=discard_button,
@@ -385,5 +838,5 @@ class BaqueVision:
             continue_button=continue_button,
             close_popup=cls._to_point(payload.get("close_popup")),
             deck_count=cls._to_deck_count(payload.get("deck_count", -1)),
-            message=str(payload.get("message", "")),
+            message=message,
         )

@@ -60,14 +60,14 @@ async def test_prepare_auto_round_clicks_start_once_then_waits_for_real_game(
                     _card("9", "D"),
                     _card("10"),
                     _card("J", "H"),
-                    _card("Q", "C"),
                 ],
                 deck_count=56,
             ),
         ]
     )
 
-    async def fake_inspect() -> tuple[CapturedFrame, GameSnapshot]:
+    async def fake_inspect(*, include_previous: bool = True) -> tuple[CapturedFrame, GameSnapshot]:
+        assert include_previous is False
         return frame, next(snapshots)
 
     clicks: list[Point] = []
@@ -77,6 +77,11 @@ async def test_prepare_auto_round_clicks_start_once_then_waits_for_real_game(
 
     controller.inspect = fake_inspect  # type: ignore[method-assign]
     controller._click = fake_click  # type: ignore[method-assign]
+
+    async def no_fast_swap_frame(timeout_seconds: float = 25.0) -> None:
+        return None
+
+    controller._wait_for_swap_frame = no_fast_swap_frame  # type: ignore[method-assign]
 
     result = await controller.prepare_auto_round(timeout_seconds=5)
 
@@ -109,7 +114,8 @@ async def test_prepare_auto_round_refuses_start_without_reliable_button(
         window_title="欢乐斗地主",
     )
 
-    async def fake_inspect() -> tuple[CapturedFrame, GameSnapshot]:
+    async def fake_inspect(*, include_previous: bool = True) -> tuple[CapturedFrame, GameSnapshot]:
+        assert include_previous is False
         return frame, GameSnapshot(screen_type=ScreenType.START)
 
     controller.inspect = fake_inspect  # type: ignore[method-assign]

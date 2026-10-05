@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -55,7 +56,9 @@ class OpponentPatternModel:
         samples: int | None = None,
         top_patterns: int = 5,
         top_cards: int = 8,
+        deadline: float | None = None,
     ) -> list[OpponentInference]:
+        """deadline 为 time.monotonic() 截止时刻；到点后按已完成样本数归一化。"""
         sample_count = max(40, samples or self.samples)
         if not tracker.draw_distribution():
             return [
@@ -86,7 +89,11 @@ class OpponentPatternModel:
         any_hu_mass = Counter()
         hu_score_mass = Counter()
 
+        completed = 0
         for _ in range(sample_count):
+            if completed and deadline is not None and time.monotonic() >= deadline:
+                break
+            completed += 1
             hands, remaining_pool = tracker.sample_world(self.rng)
             if tracker.known_deck_top:
                 sample_draw_dist = {tracker.known_deck_top[0]: 1.0}
@@ -119,6 +126,7 @@ class OpponentPatternModel:
                 any_hu_mass[seat] += sample_hu_probability
                 hu_score_mass[seat] += sample_score
 
+        sample_count = completed
         output: list[OpponentInference] = []
         for seat, opp in tracker.opponents.items():
             hypotheses: list[PatternHypothesis] = []
@@ -164,6 +172,7 @@ class OpponentPatternModel:
         gold_ranks: tuple[str, ...] | list[str],
         *,
         samples: int | None = None,
+        deadline: float | None = None,
     ) -> list[ReleaseSeatRisk]:
         """如果把这张牌放到桌面，估算每一家能直接利用它成牌的概率与牌型。"""
         sample_count = max(40, samples or self.samples)
@@ -173,7 +182,11 @@ class OpponentPatternModel:
             seat: Counter() for seat in tracker.opponents
         }
 
+        completed = 0
         for _ in range(sample_count):
+            if completed and deadline is not None and time.monotonic() >= deadline:
+                break
+            completed += 1
             hands = tracker.sample_opponent_hands(self.rng)
             for seat, hand in hands.items():
                 opp = tracker.opponents[seat]
@@ -186,6 +199,7 @@ class OpponentPatternModel:
                 scores[seat] += hu.theoretical_score
                 patterns[seat][hu.pattern] += 1
 
+        sample_count = completed
         result: list[ReleaseSeatRisk] = []
         for seat in tracker.opponents:
             probability = wins[seat] / sample_count

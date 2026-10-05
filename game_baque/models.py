@@ -76,6 +76,7 @@ class GameSnapshot:
     hand: list[Card] = field(default_factory=list)
     visible_cards: list[Card] = field(default_factory=list)
     opponent_events: list[OpponentEvent] = field(default_factory=list)
+    opportunity_click: Point | None = None
     deck_click: Point | None = None
     swap_button: Point | None = None
     discard_button: Point | None = None
@@ -92,6 +93,9 @@ class GameSnapshot:
             self.gold_ranks,
             tuple((c.rank, c.suit, c.wild, c.selected) for c in self.hand),
             tuple((c.rank, c.suit, c.wild) for c in self.visible_cards),
+            None
+            if self.opportunity_click is None
+            else (self.opportunity_click.x, self.opportunity_click.y),
             self.deck_count,
         )
 

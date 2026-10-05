@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass
 
 from game_baque.models import Card, GameDecision
@@ -74,6 +75,7 @@ class ExpectedValueEngine:
         samples: int,
         top_patterns: int,
         top_cards: int,
+        deadline: float | None = None,
     ):
         key = (
             "infer",
@@ -92,8 +94,10 @@ class ExpectedValueEngine:
             samples=samples,
             top_patterns=top_patterns,
             top_cards=top_cards,
+            deadline=deadline,
         )
-        self._bounded_put(self._inference_cache, key, value)
+        if not self._expired(deadline):
+            self._bounded_put(self._inference_cache, key, value)
         return value
 
     def _cached_release_risk(
@@ -103,6 +107,7 @@ class ExpectedValueEngine:
         gold_ranks: tuple[str, ...] | list[str],
         *,
         samples: int,
+        deadline: float | None = None,
     ):
         key = (
             "release",
@@ -119,9 +124,23 @@ class ExpectedValueEngine:
             tracker,
             gold_ranks,
             samples=samples,
+            deadline=deadline,
         )
-        self._bounded_put(self._release_cache, key, value)
+        if not self._expired(deadline):
+            self._bounded_put(self._release_cache, key, value)
         return value
+
+    @staticmethod
+    def _expired(deadline: float | None) -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    @staticmethod
+    def _slice_deadline(end: float | None, parts_left: int, share: float = 1.0) -> float | None:
+        """把剩余预算平均分给剩下的候选，保证每个候选都能拿到相近的样本量。"""
+        if end is None:
+            return None
+        now = time.monotonic()
+        return now + max(0.0, end - now) / max(1, parts_left) * share
 
 
     def infer_opponents(
@@ -192,6 +211,7 @@ class ExpectedValueEngine:
         gold_ranks: tuple[str, ...] | list[str],
         *,
         samples: int | None = None,
+        deadline: float | None = None,
     ) -> float:
         """估计把某张牌暴露给对手后，直接帮助三家成牌的期望损失。"""
         risks = self._cached_release_risk(
@@ -199,6 +219,7 @@ class ExpectedValueEngine:
             tracker,
             gold_ranks,
             samples=samples or max(120, self.simulations // 3),
+            deadline=deadline,
         )
         return sum(item.expected_hu_score for item in risks)
 
@@ -208,13 +229,29 @@ class ExpectedValueEngine:
         visible_cards: list[Card],
         gold_ranks: tuple[str, ...] | list[str],
         tracker: TableTracker,
+        *,
+        opportunity_available: bool = False,
+        time_budget_seconds: float | None = None,
     ) -> GameDecision:
         """在摸牌堆和桌面亮牌之间做“自己收益 + 阻断对手”的联合决策。"""
-        if len(hand) != 7:
-            raise ValueError("摸牌决策必须输入 7 张手牌")
+        end = (
+            time.monotonic() + time_budget_seconds
+            if time_budget_seconds is not None
+            else None
+        )
+        expected_hand_size = 6 if opportunity_available else 7
+        if len(hand) != expected_hand_size:
+            raise ValueError(
+                f"摸牌决策必须输入 {expected_hand_size} 张普通手牌"
+                + ("（另有 1 张问号选牌卡）" if opportunity_available else "")
+            )
 
         def self_value(card: Card) -> float:
             hand8 = hand + [card]
+            # 问号卡会被所选目标替换，得到的是 7 张普通手牌；此时尚未进入
+            # 八张牌胡/出牌阶段，只比较换入后的结构潜力。
+            if opportunity_available:
+                return hand_potential(hand8, gold_ranks) * 0.55
             hu = evaluate_hu(hand8, gold_ranks)
             if hu is not None:
                 return float(hu.theoretical_score)
@@ -229,6 +266,8 @@ class ExpectedValueEngine:
                 tracker,
                 gold_ranks,
                 samples=max(100, self.simulations // 4),
+                # 留一份预算给牌堆期望计算。
+                deadline=self._slice_deadline(end, len(visible_cards) - index + 1),
             )
             total = own + 0.35 * deny
             visible_values.append((total, index, own, deny))
@@ -246,19 +285,21 @@ class ExpectedValueEngine:
             if best_total > deck_total:
                 card = visible_cards[best_index]
                 return GameDecision(
-                    "draw_visible",
+                    "draw_opportunity" if opportunity_available else "draw_visible",
                     visible_index=best_index,
                     reason=(
-                        f"取亮牌 {card.label}：自己价值 {own:.1f}，"
+                        ("先选择亮牌 " if opportunity_available else "取亮牌 ")
+                        + f"{card.label}：自己价值 {own:.1f}，"
                         f"同时阻断对手价值 {deny:.1f}；综合 {best_total:.1f} > "
                         f"摸牌堆 {deck_total:.1f}"
                     ),
                 )
 
         return GameDecision(
-            "draw_deck",
+            "draw_opportunity" if opportunity_available else "draw_deck",
             reason=(
-                f"摸牌堆期望 {deck_own:.1f}，扣除亮牌留给对手的风险后 "
+                ("先选择牌堆" if opportunity_available else "摸牌堆")
+                + f"，期望 {deck_own:.1f}，扣除亮牌留给对手的风险后 "
                 f"综合 {deck_total:.1f}，仍优于当前亮牌"
             ),
         )
@@ -268,10 +309,22 @@ class ExpectedValueEngine:
         hand: list[Card],
         gold_ranks: tuple[str, ...] | list[str],
         tracker: TableTracker,
+        *,
+        time_budget_seconds: float | None = None,
     ) -> tuple[GameDecision, list[ActionValue]]:
+        """time_budget_seconds 给出整体时间上限；到点后各采样按已完成样本估计。
+
+        回合倒计时约 20 秒且识别要占去数秒，带癞子的手牌全量采样可能远超
+        倒计时，因此实时对局必须设预算，宁可少采样也要按时出牌。
+        """
         if len(hand) != 8:
             raise ValueError("收益决策必须输入 8 张手牌")
 
+        end = (
+            time.monotonic() + time_budget_seconds
+            if time_budget_seconds is not None
+            else None
+        )
         values: list[ActionValue] = []
         pattern_inference = self._cached_infer_all(
             tracker,
@@ -279,6 +332,8 @@ class ExpectedValueEngine:
             samples=max(120, self.simulations // 3),
             top_patterns=4,
             top_cards=6,
+            # 全桌威胁只是一个整体扣分项，占预算的四分之一即可。
+            deadline=self._slice_deadline(end, 1, share=0.25),
         )
         table_risk = sum(item.expected_hu_score_next_draw for item in pattern_inference)
         immediate = evaluate_hu(hand, gold_ranks)
@@ -297,12 +352,18 @@ class ExpectedValueEngine:
 
         for index, discarded in enumerate(hand):
             kept = [card for i, card in enumerate(hand) if i != index]
-            future = self._rollout_future_hu(kept, gold_ranks, tracker)
+            future = self._rollout_future_hu(
+                kept,
+                gold_ranks,
+                tracker,
+                deadline=self._slice_deadline(end, len(hand) - index, share=0.7),
+            )
             release_risks = self._cached_release_risk(
                 discarded,
                 tracker,
                 gold_ranks,
                 samples=max(120, self.simulations // 3),
+                deadline=self._slice_deadline(end, len(hand) - index),
             )
             danger = sum(item.expected_hu_score for item in release_risks)
             # 小幅加入结构潜力，避免所有有限 horizon 未胡时全部变成 0。
@@ -359,6 +420,8 @@ class ExpectedValueEngine:
         kept: list[Card],
         gold_ranks: tuple[str, ...] | list[str],
         tracker: TableTracker,
+        *,
+        deadline: float | None = None,
     ) -> float:
         cache_key = (
             "rollout",
@@ -379,8 +442,12 @@ class ExpectedValueEngine:
         keys = list(draw_dist)
         weights = [draw_dist[key] for key in keys]
         total = 0.0
+        completed = 0
 
         for _ in range(self.simulations):
+            if completed and self._expired(deadline):
+                break
+            completed += 1
             hand = list(kept)
             best_value = 0.0
             for depth in range(self.horizon_own_draws):
@@ -403,6 +470,7 @@ class ExpectedValueEngine:
                     )
                     hand = [card for j, card in enumerate(hand8) if j != best_discard]
             total += best_value
-        value = total / self.simulations
-        self._bounded_put(self._rollout_cache, cache_key, value)
+        value = total / completed
+        if completed == self.simulations:
+            self._bounded_put(self._rollout_cache, cache_key, value)
         return value

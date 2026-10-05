@@ -327,12 +327,18 @@ class BaquePlugin:
                 self._last_auto_message = "八雀自动游戏已在进入牌局前停止。"
                 return self._last_auto_message
 
-            if observer is not None:
+            if observer is not None and not game.vision.base_url:
                 game.set_external_observer_active(True)
                 if not observer.running:
                     await observer.start()
                     self._auto_started_observer = True
                     LOGGER.info("八雀启动流程：正式牌局已就绪，三家观察器已启动")
+            elif game.vision.base_url:
+                # Ollama 通常串行处理同一模型请求。并行启动对手视觉 worker 会
+                # 让自己的回合识别排队几十秒，最终点击过期画面。本地模式优先
+                # 实时操作，主循环使用单帧识别且暂不调用对手视觉模型。
+                game.set_external_observer_active(True)
+                LOGGER.info("本地视觉模式：暂停并行对手识别，优先保证回合内操作")
 
             message = await game.run_loop(self._auto_stop_event)
             self._last_auto_message = message

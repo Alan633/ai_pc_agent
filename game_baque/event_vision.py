@@ -393,6 +393,7 @@ class OpponentEventVision:
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
             "temperature": 0,
+            "reasoning_effort": "none",
         }
         try:
             response = await self.client.chat.completions.create(

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import logging
+import os
+from ctypes import wintypes
 
 # 必须在任何会间接导入 PyAutoGUI 的模块之前启用 DPI Awareness，
 # 否则高缩放 Windows 上截图像素与点击坐标可能不一致。
@@ -27,9 +30,57 @@ from tools.process import ProcessManager
 from tools.screen import get_screen_size
 
 LOGGER = logging.getLogger(__name__)
+_AGENT_MUTEX: int | None = None
+
+
+def acquire_single_instance() -> None:
+    """阻止同一 Windows 会话重复启动 Telegram polling。"""
+    global _AGENT_MUTEX
+    if os.name != "nt":
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create_mutex.restype = wintypes.HANDLE
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, False, "Local\\AIPCAgentTelegramPolling")
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        kernel32.CloseHandle(handle)
+        raise RuntimeError("AI PC Agent 已在运行，请不要重复启动 start.bat")
+    _AGENT_MUTEX = int(handle)
+
+
+def disable_console_quick_edit() -> None:
+    """防止误点 CMD 进入“选择”模式后暂停整个 Telegram Agent。"""
+    if os.name != "nt":
+        return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        stdin_handle = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint()
+        if stdin_handle in {0, -1} or not kernel32.GetConsoleMode(
+            stdin_handle,
+            ctypes.byref(mode),
+        ):
+            return
+        enable_extended_flags = 0x0080
+        enable_quick_edit_mode = 0x0040
+        new_mode = (mode.value | enable_extended_flags) & ~enable_quick_edit_mode
+        kernel32.SetConsoleMode(stdin_handle, new_mode)
+    except (AttributeError, OSError):
+        # 例如没有附加控制台时无需处理，不能因此阻止 Agent 启动。
+        LOGGER.debug("无法关闭控制台快速编辑模式", exc_info=True)
 
 
 def main() -> None:
+    try:
+        acquire_single_instance()
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        return
+    disable_console_quick_edit()
     settings = load_settings()
     configure_logging(settings.logs_dir, [settings.telegram_bot_token, settings.openai_api_key])
 

@@ -62,11 +62,11 @@ def hand_potential(cards: list[Card], gold_ranks: tuple[str, ...] | list[str]) -
 
 
 def choose_swap_two(cards: list[Card], gold_ranks: tuple[str, ...] | list[str]) -> GameDecision:
-    if len(cards) != 7:
-        raise ValueError(f"换牌阶段应识别到 7 张手牌，实际 {len(cards)} 张")
+    if len(cards) not in {6, 7}:
+        raise ValueError(f"换牌阶段应识别到 6 或 7 张可操作手牌，实际 {len(cards)} 张")
     best_pair: tuple[int, int] | None = None
     best_score = float("-inf")
-    for pair in combinations(range(7), 2):
+    for pair in combinations(range(len(cards)), 2):
         kept = [card for index, card in enumerate(cards) if index not in pair]
         score = hand_potential(kept, gold_ranks)
         swapped = [cards[index] for index in pair]

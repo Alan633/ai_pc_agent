@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 from pathlib import Path
 from time import monotonic
+from unittest.mock import patch
 
 import pytest
 
@@ -83,12 +85,18 @@ def test_confirmation_is_one_time_and_bound_to_user() -> None:
 
 
 class EndlessPlanner:
+    def __init__(self) -> None:
+        self.discarded: list[str | None] = []
+
     async def first(self, user_text: str) -> PlanResponse:
         return PlanResponse("response-0", [ToolCall("call-0", "noop", {})])
 
     async def next(self, previous_response_id: str, call_id: str, result: object) -> PlanResponse:
         index = int(previous_response_id.split("-")[-1]) + 1
         return PlanResponse(f"response-{index}", [ToolCall(f"call-{index}", "noop", {})])
+
+    def discard(self, response_id: str | None) -> None:
+        self.discarded.append(response_id)
 
 
 @pytest.mark.asyncio
@@ -103,13 +111,45 @@ async def test_max_steps_stops_executor(tmp_path: Path) -> None:
             lambda: {},
         )
     )
+    planner = EndlessPlanner()
     executor = AgentExecutor(
-        EndlessPlanner(), registry, SecurityPolicy(settings), AgentSession(), max_steps=3  # type: ignore[arg-type]
+        planner, registry, SecurityPolicy(settings), AgentSession(), max_steps=3  # type: ignore[arg-type]
     )
     outcome = await executor.run("循环", lambda description, reason: asyncio.sleep(0, result=True))
     assert outcome.ok is False
     assert outcome.steps == 3
     assert "最大步骤数" in outcome.message
+    assert planner.discarded == ["response-3"]
+
+
+def test_threadsafe_coroutine_timeout_cancels_future() -> None:
+    session = AgentSession()
+
+    class OpenLoop:
+        @staticmethod
+        def is_closed() -> bool:
+            return False
+
+    class TimedOutFuture:
+        cancelled = False
+
+        @staticmethod
+        def result(timeout: float) -> None:
+            raise concurrent.futures.TimeoutError
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    session.attach_loop(OpenLoop())  # type: ignore[arg-type]
+    future = TimedOutFuture()
+    coroutine = asyncio.sleep(0)
+    try:
+        with patch("agent.session.asyncio.run_coroutine_threadsafe", return_value=future):
+            with pytest.raises(TimeoutError, match="已取消"):
+                session.run_coroutine_threadsafe(coroutine, timeout=1)
+    finally:
+        coroutine.close()
+    assert future.cancelled
 
 
 @pytest.mark.asyncio
