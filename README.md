@@ -24,6 +24,30 @@ scripts\setup_ollama_qwen16k.bat
 
 完成后必须彻底停止并重新启动 `main.py`。如果只修改代码、不创建 16K 模型，4096 context 的视觉请求仍可能失败。
 
+## 八雀混合视觉
+
+AIAGENT 默认启用 `GAME_FAST_VISION=true`，页面识别不再全部依赖 Qwen：
+
+```text
+游戏截图
+  ↓
+OpenCV 快速视觉
+  ├─ 开始游戏按钮/开始页 → 直接得到坐标，不调用 Qwen
+  ├─ swap / draw / discard 回合 → 只把牌面交给 Qwen 快速协议
+  ├─ 牌局进行中但不是自己回合 → 直接 waiting，不调用 Qwen
+  └─ 结算 / 充值 / 陌生弹窗 / 无法判断 → Qwen 兜底
+```
+
+当前 OpenCV 使用 HSV 颜色、轮廓、固定 ROI 与牌堆/按钮特征，不依赖 OCR。三家对手仍先用本地图像差分定位动作，再把裁剪后的 BEFORE/PEAK/AFTER 交给本地视觉模型。
+
+这样做的目标是把 Qwen 从“每次都理解整个页面”降为“只识别牌面和复杂异常”，减少延迟与视觉 token。若实际皮肤/分辨率导致快速识别异常，可临时在 `.env` 设置：
+
+```dotenv
+GAME_FAST_VISION=false
+```
+
+恢复纯 Qwen 页面识别用于排查。
+
 ## AIAGENT 分支定位
 
 该分支把项目从“某个游戏的自动化程序”调整为**通用电脑 AI 助手**：
