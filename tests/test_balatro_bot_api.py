@@ -359,6 +359,11 @@ def test_balatrobot_ensure_server_auto_starts_uvx(
     ]
     assert "--logs-path" in command
     assert "--audio" in command
+    env = captured["kwargs"]["env"]
+    assert "127.0.0.1" in env["NO_PROXY"]
+    assert "localhost" in env["NO_PROXY"]
+    assert "::1" in env["NO_PROXY"]
+    assert "127.0.0.1" in env["no_proxy"]
     assert (tmp_path / "balatrobot_serve.log").exists()
 
 
@@ -542,3 +547,54 @@ def test_preserve_user_settings_patch_can_be_disabled(
     assert client._patch_preserve_user_settings() == "disabled"
     assert settings.read_text(encoding="utf-8") == original
     assert not settings.with_name("settings.lua.aiagent.bak").exists()
+
+
+
+def test_balatrobot_local_rpc_forces_proxy_bypass(
+    monkeypatch,
+) -> None:
+    client = BalatroBotClient(
+        base_url="http://127.0.0.1:12346",
+    )
+    called: dict[str, object] = {}
+
+    class DummyResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def read():
+            return (
+                b'{"jsonrpc":"2.0","result":{"status":"ok"},"id":1}'
+            )
+
+    class DummyOpener:
+        @staticmethod
+        def open(request, timeout):
+            called["url"] = request.full_url
+            called["timeout"] = timeout
+            return DummyResponse()
+
+    def fake_build_opener(handler):
+        called["handler"] = handler
+        return DummyOpener()
+
+    def fail_urlopen(*_args, **_kwargs):
+        raise AssertionError("localhost RPC 不应该走默认 urlopen/系统代理")
+
+    monkeypatch.setattr(
+        "game_balatro.balatrobot.build_opener",
+        fake_build_opener,
+    )
+    monkeypatch.setattr(
+        "game_balatro.balatrobot.urlopen",
+        fail_urlopen,
+    )
+
+    result = client.call("health")
+
+    assert result["status"] == "ok"
+    assert called["url"] == "http://127.0.0.1:12346"
