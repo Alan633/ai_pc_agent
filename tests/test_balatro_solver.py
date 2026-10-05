@@ -106,3 +106,64 @@ def test_weak_hand_uses_discard_when_available() -> None:
         )
         <= 5
     )
+
+
+def test_rank_candidates_keeps_python_baseline_first() -> None:
+    hand = (
+        card("A", "S"),
+        card("A", "H"),
+        card("K", "D"),
+        card("Q", "C"),
+        card("9", "S"),
+        card("7", "H"),
+        card("4", "D"),
+        card("2", "C"),
+    )
+    snapshot = BalatroSnapshot(
+        screen_type=ScreenType.PLAY,
+        target_score=800,
+        current_score=0,
+        hands_left=4,
+        discards_left=3,
+        hand=hand,
+        play_button=Point(800, 650),
+        discard_button=Point(650, 650),
+    )
+    solver = BalatroSolver()
+    baseline = solver.decide(snapshot)
+    candidates = solver.rank_candidates(snapshot, top_n=6)
+
+    assert candidates
+    assert candidates[0] == baseline
+    assert len(candidates) <= 6
+    assert all(
+        decision.action in {"play_hand", "discard"}
+        for decision in candidates
+    )
+
+
+def test_shop_candidates_never_include_unaffordable_item() -> None:
+    from game_balatro.models import ShopItem
+
+    snapshot = BalatroSnapshot(
+        screen_type=ScreenType.SHOP,
+        money=8,
+        jokers=(),
+        shop_items=(
+            ShopItem("便宜Joker", "joker", 3, 300, 400),
+            ShopItem("买不起Joker", "joker", 9, 500, 400),
+        ),
+        next_round_button=Point(900, 700),
+    )
+    candidates = BalatroSolver(reserve_money=5).rank_candidates(
+        snapshot,
+        top_n=6,
+    )
+    targets = {
+        (decision.target.x, decision.target.y)
+        for decision in candidates
+        if decision.target is not None
+    }
+
+    assert (300, 400) in targets
+    assert (500, 400) not in targets
