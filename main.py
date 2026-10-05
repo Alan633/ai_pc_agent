@@ -73,6 +73,27 @@ LOGGER = logging.getLogger(__name__)
 _AGENT_MUTEX: int | None = None
 
 
+def ensure_localhost_proxy_bypass() -> None:
+    """确保本机服务不经过 HTTP(S) 代理。
+
+    Telegram 等外网请求仍按原代理配置访问；这里只把 loopback 地址追加到
+    NO_PROXY/no_proxy，避免 Qwen、BalatroBot 等 localhost 服务被代理劫持。
+    """
+    bypass = ("127.0.0.1", "localhost", "::1")
+    for key in ("NO_PROXY", "no_proxy"):
+        current = [
+            item.strip()
+            for item in os.environ.get(key, "").split(",")
+            if item.strip()
+        ]
+        lowered = {item.lower() for item in current}
+        for item in bypass:
+            if item.lower() not in lowered:
+                current.append(item)
+                lowered.add(item.lower())
+        os.environ[key] = ",".join(current)
+
+
 def acquire_single_instance() -> None:
     """阻止同一 Windows 会话重复启动 Telegram polling。"""
     global _AGENT_MUTEX
@@ -115,6 +136,7 @@ def disable_console_quick_edit() -> None:
 
 
 def main() -> None:
+    ensure_localhost_proxy_bypass()
     try:
         acquire_single_instance()
     except RuntimeError as exc:
