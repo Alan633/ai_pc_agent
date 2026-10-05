@@ -365,7 +365,26 @@ class BalatroSolver:
                     )
             ranked_plays.sort(key=lambda row: row[0], reverse=True)
             if snapshot.play_button is not None:
-                for _key, indices, value in ranked_plays[:4]:
+                # 优先给策略模型不同牌型，而不是四个几乎一样的组合。
+                diverse: list[
+                    tuple[tuple[int, float, tuple[int, ...]], tuple[int, ...], HandValue]
+                ] = []
+                categories: set[str] = set()
+                for row in ranked_plays:
+                    value = row[2]
+                    if value.category in categories:
+                        continue
+                    categories.add(value.category)
+                    diverse.append(row)
+                    if len(diverse) >= 4:
+                        break
+                for row in ranked_plays:
+                    if len(diverse) >= 4:
+                        break
+                    if row not in diverse:
+                        diverse.append(row)
+
+                for _key, indices, value in diverse:
                     add(
                         BalatroDecision(
                             action="play_hand",
@@ -465,23 +484,8 @@ class BalatroSolver:
                 ),
                 reverse=True,
             )
-            for item in affordable:
-                add(
-                    BalatroDecision(
-                        action="click",
-                        reason=(
-                            f"Python候选：购买 {item.name or item.kind} "
-                            f"(${item.price})。"
-                        ),
-                        target=Point(item.x, item.y),
-                        metadata={
-                            "candidate_type": "shop_buy",
-                            "shop_item": item.name,
-                            "kind": item.kind,
-                            "price": item.price,
-                        },
-                    )
-                )
+            # “保留经济”和“重掷”属于长期策略关键选项，必须在商品很多时
+            # 仍进入 Top-N，不能被前面的购买项挤掉。
             if snapshot.next_round_button is not None:
                 add(
                     BalatroDecision(
@@ -503,8 +507,34 @@ class BalatroSolver:
                         metadata={"candidate_type": "shop_reroll"},
                     )
                 )
+            for item in affordable:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason=(
+                            f"Python候选：购买 {item.name or item.kind} "
+                            f"(${item.price})。"
+                        ),
+                        target=Point(item.x, item.y),
+                        metadata={
+                            "candidate_type": "shop_buy",
+                            "shop_item": item.name,
+                            "kind": item.kind,
+                            "price": item.price,
+                        },
+                    )
+                )
 
         elif snapshot.screen_type == ScreenType.PACK:
+            if snapshot.skip_button is not None:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason="Python候选：跳过当前卡包。",
+                        target=snapshot.skip_button,
+                        metadata={"candidate_type": "pack_skip"},
+                    )
+                )
             for item in sorted(
                 snapshot.pack_items,
                 key=lambda value: value.confidence,
@@ -520,15 +550,6 @@ class BalatroSolver:
                             "shop_item": item.name,
                             "kind": item.kind,
                         },
-                    )
-                )
-            if snapshot.skip_button is not None:
-                add(
-                    BalatroDecision(
-                        action="click",
-                        reason="Python候选：跳过当前卡包。",
-                        target=snapshot.skip_button,
-                        metadata={"candidate_type": "pack_skip"},
                     )
                 )
 
