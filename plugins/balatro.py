@@ -72,6 +72,8 @@ class BalatroPlugin:
                     timeout_seconds=settings.balatrobot_timeout_seconds,
                     deck=settings.balatrobot_deck,
                     stake=settings.balatrobot_stake,
+                    game_executable_path=settings.balatrobot_game_path,
+                    lovely_path=settings.balatrobot_lovely_path,
                 )
             strategist: BalatroLocalStrategist | None = None
             if (
