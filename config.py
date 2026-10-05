@@ -31,6 +31,7 @@ class Settings:
     openai_base_url: str = ""
     game_vision_base_url: str = ""
     game_min_event_confidence: float = 0.80
+    game_fast_vision: bool = True
 
     @property
     def logs_dir(self) -> Path:
@@ -120,6 +121,7 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         openai_base_url=openai_base_url,
         game_vision_base_url=game_vision_base_url,
         game_min_event_confidence=event_confidence,
+        game_fast_vision=_env_bool("GAME_FAST_VISION", "true"),
     )
     settings.prepare_directories()
     return settings
