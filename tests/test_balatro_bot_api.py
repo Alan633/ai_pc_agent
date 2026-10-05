@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
+from pathlib import Path
+
 from game_balatro.balatrobot import BalatroBotClient, snapshot_from_gamestate
 from game_balatro.models import BalatroDecision, ScreenType
 from game_balatro.solver import BalatroSolver
@@ -273,3 +277,73 @@ def test_api_shop_booster_baseline_keeps_buy_group_and_index() -> None:
     assert decision.metadata["candidate_type"] == "shop_buy"
     assert decision.metadata["api_group"] == "pack"
     assert decision.metadata["api_index"] == 0
+
+
+
+def test_balatrobot_ensure_server_skips_spawn_when_api_is_ready(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    client = BalatroBotClient()
+    monkeypatch.setattr(
+        client,
+        "health",
+        lambda **_kwargs: True,
+    )
+
+    def fail_popen(*_args, **_kwargs):
+        raise AssertionError("API 已正常时不应该启动 uvx")
+
+    monkeypatch.setattr(subprocess, "Popen", fail_popen)
+
+    assert client.ensure_server(logs_dir=tmp_path) == "already_running"
+
+
+def test_balatrobot_ensure_server_auto_starts_uvx(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    client = BalatroBotClient()
+    checks = iter((False, True))
+    monkeypatch.setattr(
+        client,
+        "health",
+        lambda **_kwargs: next(checks),
+    )
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "C:/Tools/uvx.exe" if name == "uvx" else None,
+    )
+    captured: dict[str, object] = {}
+
+    class DummyProcess:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return DummyProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    assert (
+        client.ensure_server(
+            logs_dir=tmp_path,
+            startup_timeout_seconds=3.0,
+        )
+        == "started"
+    )
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[:3] == [
+        "C:/Tools/uvx.exe",
+        "balatrobot",
+        "serve",
+    ]
+    assert "--logs-path" in command
+    assert (tmp_path / "balatrobot_serve.log").exists()
