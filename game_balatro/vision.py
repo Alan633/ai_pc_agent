@@ -196,7 +196,11 @@ class BalatroVision:
             payload,
             original_size,
         )
-        return self._refine_navigation_buttons(
+        snapshot = self._refine_navigation_buttons(
+            image_path,
+            snapshot,
+        )
+        return self._refine_play_controls(
             image_path,
             snapshot,
         )
@@ -299,6 +303,118 @@ class BalatroVision:
         return replace(
             snapshot,
             primary_button=detected,
+        )
+
+    @staticmethod
+    def _detect_play_controls(
+        image_path: Path,
+    ) -> dict[str, Point]:
+        """用 Balatro 固定按钮颜色精确定位“出牌/弃牌”。
+
+        Qwen 适合识别按钮语义，但像素中心会有几十到上百像素误差；
+        尤其手牌重叠时这种误差会造成邻牌/邻按钮误点。这里仅在牌桌
+        下半区寻找大号蓝/红圆角矩形，避免依赖模型给出的点击坐标。
+        """
+        import cv2
+        import numpy as np
+
+        image = cv2.imread(str(image_path))
+        if image is None:
+            return {}
+        height, width = image.shape[:2]
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+        # Balatro 默认“出牌”为高饱和蓝色，“弃牌”为高饱和红色。
+        blue = cv2.inRange(
+            hsv,
+            np.array([90, 110, 110]),
+            np.array([135, 255, 255]),
+        )
+        red_low = cv2.inRange(
+            hsv,
+            np.array([0, 115, 120]),
+            np.array([12, 255, 255]),
+        )
+        red_high = cv2.inRange(
+            hsv,
+            np.array([168, 115, 120]),
+            np.array([179, 255, 255]),
+        )
+        masks = {
+            "play": blue,
+            "discard": cv2.bitwise_or(red_low, red_high),
+        }
+
+        result: dict[str, Point] = {}
+        kernel = np.ones((7, 13), dtype=np.uint8)
+        for name, mask in masks.items():
+            closed = cv2.morphologyEx(
+                mask,
+                cv2.MORPH_CLOSE,
+                kernel,
+            )
+            count, _, stats, _ = cv2.connectedComponentsWithStats(
+                closed
+            )
+            candidates: list[tuple[float, int, int]] = []
+            for index in range(1, count):
+                x, y, box_width, box_height, area = (
+                    int(value)
+                    for value in stats[index]
+                )
+                center_x = x + box_width // 2
+                center_y = y + box_height // 2
+                if not (
+                    0.055 * width <= box_width <= 0.24 * width
+                    and 0.025 * height <= box_height <= 0.12 * height
+                    and box_width >= 1.45 * box_height
+                    and 0.22 * width <= center_x <= 0.82 * width
+                    and 0.52 * height <= center_y <= 0.82 * height
+                    and area >= 0.38 * box_width * box_height
+                ):
+                    continue
+                # 优先面积大、且靠近典型底部操作区的候选。
+                score = float(area) - abs(
+                    center_y - 0.66 * height
+                ) * 0.2
+                candidates.append(
+                    (score, center_x, center_y)
+                )
+            if candidates:
+                _, center_x, center_y = max(
+                    candidates,
+                    key=lambda item: item[0],
+                )
+                result[name] = Point(center_x, center_y)
+        return result
+
+    @classmethod
+    def _refine_play_controls(
+        cls,
+        image_path: Path,
+        snapshot: BalatroSnapshot,
+    ) -> BalatroSnapshot:
+        if snapshot.screen_type != ScreenType.PLAY:
+            return snapshot
+        detected = cls._detect_play_controls(image_path)
+        play = detected.get("play")
+        discard = detected.get("discard")
+        if play is not None and play != snapshot.play_button:
+            LOGGER.info(
+                "Balatro本地校正出牌按钮 model=%s local=%s",
+                snapshot.play_button,
+                play,
+            )
+        if discard is not None and discard != snapshot.discard_button:
+            LOGGER.info(
+                "Balatro本地校正弃牌按钮 model=%s local=%s",
+                snapshot.discard_button,
+                discard,
+            )
+        return replace(
+            snapshot,
+            play_button=play or snapshot.play_button,
+            discard_button=discard or snapshot.discard_button,
         )
 
     @staticmethod
