@@ -64,15 +64,16 @@ def test_solver_enumerates_best_five_cards() -> None:
 
 
 def test_weak_hand_uses_discard_when_available() -> None:
+    # 刻意避开 A2345 等隐藏顺子，确保这是纯 High Card 弱牌。
     hand = (
         card("A", "S"),
-        card("9", "H"),
-        card("7", "D"),
-        card("5", "C"),
-        card("3", "S"),
-        card("2", "H"),
-        card("8", "D"),
-        card("4", "C"),
+        card("K", "H"),
+        card("9", "D"),
+        card("7", "C"),
+        card("6", "S"),
+        card("4", "H"),
+        card("3", "D"),
+        card("2", "C"),
     )
     snapshot = BalatroSnapshot(
         screen_type=ScreenType.PLAY,
