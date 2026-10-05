@@ -11,6 +11,7 @@ from pathlib import Path
 from threading import Event
 
 from agent.session import AgentSession
+from game_balatro.balatrobot import BalatroBotClient, BalatroBotError
 from game_balatro.capture import (
     CapturedFrame,
     capture_balatro_window,
@@ -54,6 +55,8 @@ class BalatroController:
         window_title_keyword: str = "Balatro",
         action_interval_seconds: float = 1.2,
         auto_next_run: bool = False,
+        balatrobot: BalatroBotClient | None = None,
+        control_mode: str = "mouse",
     ) -> None:
         self.vision = vision
         self.solver = solver
@@ -75,6 +78,15 @@ class BalatroController:
             float(action_interval_seconds),
         )
         self.auto_next_run = bool(auto_next_run)
+        normalized_control = control_mode.strip().lower()
+        if normalized_control not in {"auto", "api", "mouse"}:
+            raise ValueError(
+                "Balatro control_mode 必须是 auto、api 或 mouse"
+            )
+        if normalized_control == "api" and balatrobot is None:
+            raise ValueError("Balatro api 模式必须配置 BalatroBot 客户端")
+        self.control_mode = normalized_control
+        self.balatrobot = balatrobot
 
         self.last_snapshot: BalatroSnapshot | None = None
         self.last_decision: BalatroDecision | None = None
@@ -86,6 +98,14 @@ class BalatroController:
         self.game_over_count = 0
         self.qwen_strategy_count = 0
         self.qwen_fallback_count = 0
+        self.api_state_count = 0
+        self.api_action_count = 0
+        self.api_failure_count = 0
+        self.mouse_action_count = 0
+        self.mouse_fallback_count = 0
+        self.last_state_source = "none"
+        self.last_control_backend = "none"
+        self._api_retry_after = 0.0
         self.last_decision_source = "none"
         self.strategy_memory: deque[str] = deque(maxlen=12)
         self._last_action_fingerprint: (
@@ -104,9 +124,48 @@ class BalatroController:
             self.screenshots_dir,
             self.window_title_keyword,
         )
-        snapshot = await self.vision.parse(
-            frame.path
+
+        snapshot: BalatroSnapshot | None = None
+        api_allowed = (
+            self.balatrobot is not None
+            and self.control_mode != "mouse"
+            and (
+                self.control_mode == "api"
+                or time.monotonic() >= self._api_retry_after
+            )
         )
+        if api_allowed:
+            try:
+                assert self.balatrobot is not None
+                snapshot = await asyncio.to_thread(
+                    self.balatrobot.get_snapshot,
+                    timeout_seconds=min(
+                        1.5,
+                        self.balatrobot.timeout_seconds,
+                    ),
+                )
+                self.api_state_count += 1
+                self.last_state_source = "balatrobot"
+                self._api_retry_after = 0.0
+            except BalatroBotError as exc:
+                self.api_failure_count += 1
+                if self.control_mode == "api":
+                    raise RuntimeError(
+                        f"BalatroBot API 状态读取失败：{exc}"
+                    ) from exc
+                # auto 模式短暂熔断，避免 BalatroBot 未安装时每一帧都等连接超时。
+                self._api_retry_after = time.monotonic() + 15.0
+                LOGGER.warning(
+                    "BalatroBot不可用，15秒内回退视觉识别：%s",
+                    exc,
+                )
+
+        if snapshot is None:
+            snapshot = await self.vision.parse(
+                frame.path
+            )
+            self.last_state_source = "vision"
+
         self.inspect_count += 1
         if (
             snapshot.screen_type
@@ -244,36 +303,18 @@ class BalatroController:
         finally:
             self.session.set_native_call(False)
 
-    async def _execute(
+    async def _execute_mouse(
         self,
         frame: CapturedFrame,
         snapshot: BalatroSnapshot,
         decision: BalatroDecision,
+        fingerprint: tuple[object, ...],
     ) -> bool:
         if decision.action in {
             "wait",
             "stop",
+            "cash_out",
         }:
-            return False
-
-        fingerprint = self._decision_fingerprint(
-            snapshot,
-            decision,
-        )
-        now = time.monotonic()
-        if (
-            fingerprint
-            == self._last_action_fingerprint
-            and now - self._last_action_at
-            < max(
-                2.0,
-                self.action_interval_seconds,
-            )
-        ):
-            LOGGER.warning(
-                "Balatro 拒绝短时间重复执行同一动作：%s",
-                decision.action,
-            )
             return False
 
         if decision.action in {
@@ -350,10 +391,10 @@ class BalatroController:
                     await asyncio.sleep(0.08)
 
         target = decision.target
-        if target is None:
+        if target is None or not target.visible:
             raise RuntimeError(
                 f"Balatro 动作 {decision.action} "
-                "缺少安全点击目标"
+                "缺少可见的安全点击目标"
             )
 
         await self._click(
@@ -362,19 +403,17 @@ class BalatroController:
             target.y,
         )
         self.action_count += 1
-        self._last_action_fingerprint = (
-            fingerprint
-        )
-        self._last_action_at = (
-            time.monotonic()
-        )
+        self.mouse_action_count += 1
+        self.last_control_backend = "mouse"
+        self._last_action_fingerprint = fingerprint
+        self._last_action_at = time.monotonic()
         self._write_decision(
             snapshot,
             decision,
             acted=True,
         )
         LOGGER.info(
-            "Balatro执行 action=%s cards=%s target=%s reason=%s",
+            "Balatro鼠标执行 action=%s cards=%s target=%s reason=%s",
             decision.action,
             decision.card_indices,
             (
@@ -388,6 +427,123 @@ class BalatroController:
             decision.reason,
         )
         return True
+
+    async def _execute(
+        self,
+        frame: CapturedFrame,
+        snapshot: BalatroSnapshot,
+        decision: BalatroDecision,
+    ) -> bool:
+        if decision.action in {
+            "wait",
+            "stop",
+        }:
+            return False
+
+        fingerprint = self._decision_fingerprint(
+            snapshot,
+            decision,
+        )
+        now = time.monotonic()
+        if (
+            fingerprint
+            == self._last_action_fingerprint
+            and now - self._last_action_at
+            < max(
+                2.0,
+                self.action_interval_seconds,
+            )
+        ):
+            LOGGER.warning(
+                "Balatro 拒绝短时间重复执行同一动作：%s",
+                decision.action,
+            )
+            return False
+
+        use_api = (
+            self.balatrobot is not None
+            and self.control_mode != "mouse"
+            and snapshot.metadata.get("source") == "balatrobot"
+        )
+        if use_api:
+            assert self.balatrobot is not None
+            try:
+                command = self.balatrobot.command_for_decision(
+                    snapshot,
+                    decision,
+                )
+                if command is None:
+                    raise BalatroBotError(
+                        "当前候选缺少可验证的 BalatroBot 动作映射"
+                    )
+                method, params = command
+                await asyncio.to_thread(
+                    self.balatrobot.call,
+                    method,
+                    params,
+                )
+                self.action_count += 1
+                self.api_action_count += 1
+                self.last_control_backend = "balatrobot"
+                self._last_action_fingerprint = fingerprint
+                self._last_action_at = time.monotonic()
+                self._write_decision(
+                    snapshot,
+                    decision,
+                    acted=True,
+                )
+                LOGGER.info(
+                    "BalatroBot执行 method=%s params=%s action=%s reason=%s",
+                    method,
+                    params,
+                    decision.action,
+                    decision.reason,
+                )
+                return True
+            except BalatroBotError as exc:
+                self.api_failure_count += 1
+                if self.control_mode == "api":
+                    raise RuntimeError(
+                        f"BalatroBot API 动作失败，严格API模式停止：{exc}"
+                    ) from exc
+
+                LOGGER.warning(
+                    "BalatroBot动作失败，切换视觉+安全鼠标兜底：%s",
+                    exc,
+                )
+                # 不能使用 API Snapshot 的占位坐标去点屏幕。重新解析当前截图，
+                # 并重新求解一次后才允许进入鼠标链路。
+                vision_snapshot = await self.vision.parse(
+                    frame.path
+                )
+                fallback_decision = await self._choose_decision(
+                    vision_snapshot
+                )
+                if fallback_decision.action in {"wait", "stop"}:
+                    return False
+                self.mouse_fallback_count += 1
+                source = self.last_decision_source
+                self.last_decision_source = (
+                    f"{source}_mouse_fallback"
+                )
+                fallback_fingerprint = self._decision_fingerprint(
+                    vision_snapshot,
+                    fallback_decision,
+                )
+                return await self._execute_mouse(
+                    frame,
+                    vision_snapshot,
+                    fallback_decision,
+                    fallback_fingerprint,
+                )
+
+        # API 未启用、处于熔断期，或当前状态来自视觉时沿用原来的安全鼠标链路。
+        return await self._execute_mouse(
+            frame,
+            snapshot,
+            decision,
+            fingerprint,
+        )
 
     def _write_decision(
         self,
@@ -447,6 +603,9 @@ class BalatroController:
                 decision.expected_strength
             ),
             "decision_source": self.last_decision_source,
+            "state_source": self.last_state_source,
+            "control_mode": self.control_mode,
+            "control_backend": self.last_control_backend,
             "strategy_memory": list(self.strategy_memory),
             "metadata": decision.metadata,
         }
@@ -678,7 +837,15 @@ class BalatroController:
             "actions": self.action_count,
             "game_overs": self.game_over_count,
             "decision_mode": self.decision_mode,
+            "control_mode": self.control_mode,
+            "last_state_source": self.last_state_source,
+            "last_control_backend": self.last_control_backend,
             "last_decision_source": self.last_decision_source,
+            "api_state_count": self.api_state_count,
+            "api_action_count": self.api_action_count,
+            "api_failure_count": self.api_failure_count,
+            "mouse_action_count": self.mouse_action_count,
+            "mouse_fallback_count": self.mouse_fallback_count,
             "qwen_strategy_count": self.qwen_strategy_count,
             "qwen_fallback_count": self.qwen_fallback_count,
             "strategy_memory": list(self.strategy_memory),
