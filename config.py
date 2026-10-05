@@ -32,6 +32,13 @@ class Settings:
     game_vision_base_url: str = ""
     game_min_event_confidence: float = 0.80
     game_fast_vision: bool = True
+    game_decision_mode: str = "hybrid"
+    game_decision_model: str = ""
+    game_decision_base_url: str = ""
+    game_decision_timeout_seconds: float = 4.0
+    game_decision_top_n: int = 4
+    game_decision_min_confidence: float = 0.55
+    game_hybrid_max_ev_drop: float = 18.0
 
     @property
     def logs_dir(self) -> Path:
@@ -98,6 +105,11 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
     game_vision_base_url = os.getenv("GAME_VISION_BASE_URL", openai_base_url).strip().rstrip("/")
     game_confidence = min(max(float(os.getenv("GAME_MIN_CARD_CONFIDENCE", "0.72")), 0.0), 1.0)
     event_confidence = min(max(float(os.getenv("GAME_MIN_EVENT_CONFIDENCE", "0.80")), 0.0), 1.0)
+    decision_mode = os.getenv("GAME_DECISION_MODE", "hybrid").strip().lower()
+    if decision_mode not in {"rule", "ev", "hybrid"}:
+        raise ValueError("GAME_DECISION_MODE 必须是 rule、ev 或 hybrid")
+    decision_base_url = os.getenv("GAME_DECISION_BASE_URL", openai_base_url).strip().rstrip("/")
+    decision_model = os.getenv("GAME_DECISION_MODEL", openai_model).strip()
     settings = Settings(
         base_dir=root,
         telegram_bot_token=token,
@@ -122,6 +134,22 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_vision_base_url=game_vision_base_url,
         game_min_event_confidence=event_confidence,
         game_fast_vision=_env_bool("GAME_FAST_VISION", "true"),
+        game_decision_mode=decision_mode,
+        game_decision_model=decision_model,
+        game_decision_base_url=decision_base_url,
+        game_decision_timeout_seconds=max(
+            1.0, min(float(os.getenv("GAME_DECISION_TIMEOUT_SECONDS", "4.0")), 10.0)
+        ),
+        game_decision_top_n=max(
+            2, min(int(os.getenv("GAME_DECISION_TOP_N", "4")), 8)
+        ),
+        game_decision_min_confidence=min(
+            max(float(os.getenv("GAME_DECISION_MIN_CONFIDENCE", "0.55")), 0.0),
+            1.0,
+        ),
+        game_hybrid_max_ev_drop=max(
+            0.0, float(os.getenv("GAME_HYBRID_MAX_EV_DROP", "18.0"))
+        ),
     )
     settings.prepare_directories()
     return settings
