@@ -566,7 +566,14 @@ class TelegramHandlers:
                 f"执行{stats.get('actions', 0)}步，"
                 f"unknown={stats.get('unknown', 0)}，"
                 f"结束局={stats.get('game_overs', 0)}"
+                f"\n决策模式={stats.get('decision_mode', 'python')}，"
+                f"最近来源={stats.get('last_decision_source', 'none')}，"
+                f"Qwen成功={stats.get('qwen_strategy_count', 0)}，"
+                f"Qwen回退={stats.get('qwen_fallback_count', 0)}"
             )
+            memory = stats.get("strategy_memory") or []
+            if memory:
+                text += f"\n当前构筑计划：{memory[-1]}"
             if last:
                 text += (
                     f"\n最近决策={last.get('action')}："
