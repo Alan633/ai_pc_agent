@@ -55,6 +55,12 @@ class Settings:
     balatro_decision_timeout_seconds: float = 6.0
     balatro_decision_top_n: int = 6
     balatro_decision_min_confidence: float = 0.55
+    # Balatro 控制链路：auto=BalatroBot优先/鼠标兜底，api=仅API，mouse=仅视觉鼠标
+    balatro_control_mode: str = "auto"
+    balatrobot_url: str = "http://127.0.0.1:12346"
+    balatrobot_timeout_seconds: float = 20.0
+    balatrobot_deck: str = "RED"
+    balatrobot_stake: str = "WHITE"
 
     @property
     def logs_dir(self) -> Path:
@@ -139,6 +145,25 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
     balatro_decision_model = os.getenv(
         "BALATRO_DECISION_MODEL", balatro_vision_model
     ).strip()
+    balatro_control_mode = os.getenv(
+        "BALATRO_CONTROL_MODE", "auto"
+    ).strip().lower()
+    if balatro_control_mode not in {"auto", "api", "mouse"}:
+        raise ValueError("BALATRO_CONTROL_MODE 必须是 auto、api 或 mouse")
+    balatrobot_deck = os.getenv("BALATROBOT_DECK", "RED").strip().upper()
+    balatrobot_stake = os.getenv("BALATROBOT_STAKE", "WHITE").strip().upper()
+    valid_decks = {
+        "RED", "BLUE", "YELLOW", "GREEN", "BLACK", "MAGIC", "NEBULA",
+        "GHOST", "ABANDONED", "CHECKERED", "ZODIAC", "PAINTED",
+        "ANAGLYPH", "PLASMA", "ERRATIC",
+    }
+    valid_stakes = {
+        "WHITE", "RED", "GREEN", "BLACK", "BLUE", "PURPLE", "ORANGE", "GOLD"
+    }
+    if balatrobot_deck not in valid_decks:
+        raise ValueError(f"BALATROBOT_DECK 非法：{balatrobot_deck}")
+    if balatrobot_stake not in valid_stakes:
+        raise ValueError(f"BALATROBOT_STAKE 非法：{balatrobot_stake}")
     settings = Settings(
         base_dir=root,
         telegram_bot_token=token,
@@ -203,6 +228,15 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
             max(float(os.getenv("BALATRO_DECISION_MIN_CONFIDENCE", "0.55")), 0.0),
             1.0,
         ),
+        balatro_control_mode=balatro_control_mode,
+        balatrobot_url=os.getenv(
+            "BALATROBOT_URL", "http://127.0.0.1:12346"
+        ).strip().rstrip("/"),
+        balatrobot_timeout_seconds=max(
+            1.0, min(float(os.getenv("BALATROBOT_TIMEOUT_SECONDS", "20.0")), 60.0)
+        ),
+        balatrobot_deck=balatrobot_deck,
+        balatrobot_stake=balatrobot_stake,
     )
     settings.prepare_directories()
     return settings
