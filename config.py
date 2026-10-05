@@ -63,6 +63,7 @@ class Settings:
     balatrobot_startup_timeout_seconds: float = 35.0
     balatrobot_game_path: str = ""
     balatrobot_lovely_path: str = ""
+    balatrobot_audio: bool = True
     balatrobot_deck: str = "RED"
     balatrobot_stake: str = "WHITE"
 
@@ -253,6 +254,7 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         balatrobot_lovely_path=os.getenv(
             "BALATROBOT_LOVELY_PATH", ""
         ).strip(),
+        balatrobot_audio=_env_bool("BALATROBOT_AUDIO", "true"),
         balatrobot_deck=balatrobot_deck,
         balatrobot_stake=balatrobot_stake,
     )
