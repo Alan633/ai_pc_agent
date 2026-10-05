@@ -115,6 +115,10 @@ class BalatroPlugin:
                 ),
                 balatrobot=balatrobot,
                 control_mode=settings.balatro_control_mode,
+                balatrobot_auto_start=settings.balatrobot_auto_start,
+                balatrobot_startup_timeout_seconds=(
+                    settings.balatrobot_startup_timeout_seconds
+                ),
             )
         return cls(
             game=game,
@@ -172,8 +176,9 @@ class BalatroPlugin:
         )
         add(
             "balatro_auto_start",
-            "启动 Balatro 连续自动游戏。auto 模式优先使用 BalatroBot "
-            "API 读取状态并执行动作；API 不可用时才回退视觉+安全鼠标。",
+            "启动 Balatro 连续自动游戏。会先检查 BalatroBot API；"
+            "若游戏未启动且 API 不可用，则自动后台运行 uvx balatrobot serve；"
+            "auto 模式失败时才回退视觉+安全鼠标。",
             self.tool_auto_start,
         )
         add(
@@ -277,8 +282,8 @@ class BalatroPlugin:
         return {
             "running": True,
             "message": (
-                "Balatro 自动游戏启动中：Python 枚举合法候选，"
-                "本地Qwen负责长期策略重排；控制层优先BalatroBot API，"
+                "Balatro 自动游戏启动中：先检查/自动启动 BalatroBot，"
+                "再由 Python 枚举合法候选，本地Qwen负责长期策略重排；"
                 "必要时回退视觉+安全鼠标。"
             ),
         }
