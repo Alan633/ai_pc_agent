@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from game_balatro.models import (
 
 LOCAL_VISION_SIZE = (1280, 720)
 LOCAL_COORDINATE_RANGE = 1000
+LOGGER = logging.getLogger(__name__)
 
 VISION_PROMPT = """你只负责读取 Steam 游戏《Balatro / 小丑牌》的当前截图，不负责制定策略。
 只输出一个 JSON 对象，不要 Markdown、不要解释。
@@ -189,9 +192,113 @@ class BalatroVision:
             raise ValueError(
                 "Balatro 视觉结果必须是 JSON 对象"
             )
-        return self._to_snapshot(
+        snapshot = self._to_snapshot(
             payload,
             original_size,
+        )
+        return self._refine_navigation_buttons(
+            image_path,
+            snapshot,
+        )
+
+    @staticmethod
+    def _detect_blind_select_button(
+        image_path: Path,
+    ) -> Point | None:
+        """用 Balatro 固定的橙色按钮样式定位当前盲注的“选择”。
+
+        视觉模型对窄按钮的中心点偶尔会有几十像素纵向误差。这里不识别文字，
+        只在盲注卡片所在的上半区寻找高饱和橙色横向圆角矩形。
+        """
+        import cv2
+        import numpy as np
+
+        image = cv2.imread(str(image_path))
+        if image is None:
+            return None
+        height, width = image.shape[:2]
+        hsv = cv2.cvtColor(
+            image,
+            cv2.COLOR_BGR2HSV,
+        )
+        mask = cv2.inRange(
+            hsv,
+            np.array([5, 140, 130]),
+            np.array([30, 255, 255]),
+        )
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            np.ones((5, 9), dtype=np.uint8),
+        )
+        count, _, stats, _ = cv2.connectedComponentsWithStats(
+            mask
+        )
+        candidates: list[tuple[int, int, int]] = []
+        for index in range(1, count):
+            x, y, box_width, box_height, area = (
+                int(value)
+                for value in stats[index]
+            )
+            center_x = x + box_width // 2
+            center_y = y + box_height // 2
+            if not (
+                0.07 * width
+                <= box_width
+                <= 0.25 * width
+                and 0.015 * height
+                <= box_height
+                <= 0.07 * height
+                and box_width
+                >= 2.5 * box_height
+                and 0.15 * width
+                <= center_x
+                <= 0.85 * width
+                and 0.20 * height
+                <= center_y
+                <= 0.55 * height
+                and area
+                >= 0.45
+                * box_width
+                * box_height
+            ):
+                continue
+            candidates.append(
+                (area, center_x, center_y)
+            )
+        if not candidates:
+            return None
+        _, center_x, center_y = max(
+            candidates,
+            key=lambda item: item[0],
+        )
+        return Point(center_x, center_y)
+
+    @classmethod
+    def _refine_navigation_buttons(
+        cls,
+        image_path: Path,
+        snapshot: BalatroSnapshot,
+    ) -> BalatroSnapshot:
+        if (
+            snapshot.screen_type
+            != ScreenType.BLIND_SELECT
+        ):
+            return snapshot
+        detected = cls._detect_blind_select_button(
+            image_path
+        )
+        if detected is None:
+            return snapshot
+        if detected != snapshot.primary_button:
+            LOGGER.info(
+                "Balatro本地校正盲注选择按钮 model=%s local=%s",
+                snapshot.primary_button,
+                detected,
+            )
+        return replace(
+            snapshot,
+            primary_button=detected,
         )
 
     @staticmethod

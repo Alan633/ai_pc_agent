@@ -73,6 +73,31 @@ _SM_XVIRTUALSCREEN = 76
 _SM_YVIRTUALSCREEN = 77
 _SM_CXVIRTUALSCREEN = 78
 _SM_CYVIRTUALSCREEN = 79
+_DWMWA_EXTENDED_FRAME_BOUNDS = 9
+
+
+def _visible_window_rect(
+    hwnd: int,
+    fallback: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """返回 DWM 实际绘制的窗口边界。
+
+    GetWindowRect 会把 Windows 的不可见缩放边框算进去。窗口贴边或最大化时，
+    这些边框通常会越过显示器约 8~12 像素，不能拿它们判断画面是否越界。
+    """
+    try:
+        rect = wintypes.RECT()
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+            hwnd,
+            _DWMWA_EXTENDED_FRAME_BOUNDS,
+            ctypes.byref(rect),
+            ctypes.sizeof(rect),
+        )
+        if result == 0 and rect.right > rect.left and rect.bottom > rect.top:
+            return rect.left, rect.top, rect.right, rect.bottom
+    except (AttributeError, OSError):
+        pass
+    return fallback
 
 
 def _foreground_window() -> tuple[int, str, tuple[int, int, int, int]]:
@@ -89,7 +114,8 @@ def _foreground_window() -> tuple[int, str, tuple[int, int, int, int]]:
     rect = wintypes.RECT()
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         raise RuntimeError("无法获取前台窗口坐标")
-    return hwnd, title, (rect.left, rect.top, rect.right, rect.bottom)
+    bounds = (rect.left, rect.top, rect.right, rect.bottom)
+    return hwnd, title, _visible_window_rect(hwnd, bounds)
 
 
 def focus_game_window(title_keyword: str) -> str:
@@ -130,9 +156,7 @@ def focus_game_window(title_keyword: str) -> str:
 
 
 def get_game_window(title_keyword: str) -> GameWindow:
-    """返回当前前台游戏窗口的位置，并统一做窗口/主屏范围校验。"""
-    import pyautogui
-
+    """返回当前前台游戏窗口的可见位置，并校验虚拟桌面范围。"""
     _, title, (left, top, right, bottom) = _foreground_window()
     if title_keyword.lower() not in title.lower():
         raise RuntimeError(
@@ -143,16 +167,39 @@ def get_game_window(title_keyword: str) -> GameWindow:
     height = bottom - top
     if width < 800 or height < 500:
         raise RuntimeError(f"游戏窗口尺寸异常：{width}x{height}")
-    if left < 0 or top < 0:
-        raise RuntimeError("第一版暂不支持位于主屏负坐标区域的游戏窗口，请移到主屏")
-
-    screen = pyautogui.size()
-    if right > screen.width or bottom > screen.height:
+    user32 = ctypes.windll.user32
+    virtual_left = int(user32.GetSystemMetrics(_SM_XVIRTUALSCREEN))
+    virtual_top = int(user32.GetSystemMetrics(_SM_YVIRTUALSCREEN))
+    virtual_width = int(user32.GetSystemMetrics(_SM_CXVIRTUALSCREEN))
+    virtual_height = int(user32.GetSystemMetrics(_SM_CYVIRTUALSCREEN))
+    virtual_right = virtual_left + virtual_width
+    virtual_bottom = virtual_top + virtual_height
+    if (
+        left < virtual_left
+        or top < virtual_top
+        or right > virtual_right
+        or bottom > virtual_bottom
+    ):
         raise RuntimeError(
-            f"游戏窗口超出主屏边界：window=({left},{top},{right},{bottom}) "
-            f"screen={screen.width}x{screen.height}"
+            f"游戏窗口超出虚拟桌面边界：window=({left},{top},{right},{bottom}) "
+            f"desktop=({virtual_left},{virtual_top},{virtual_right},{virtual_bottom})"
         )
     return GameWindow(left, top, width, height, title)
+
+
+def grab_window_image(window: GameWindow) -> Any:
+    """按屏幕坐标抓取窗口可见区域，兼容负坐标副屏。"""
+    from PIL import ImageGrab
+
+    return ImageGrab.grab(
+        bbox=(
+            window.origin_x,
+            window.origin_y,
+            window.origin_x + window.width,
+            window.origin_y + window.height,
+        ),
+        all_screens=True,
+    )
 
 
 def grab_game_window(title_keyword: str) -> tuple[GameWindow, Any]:
@@ -160,12 +207,8 @@ def grab_game_window(title_keyword: str) -> tuple[GameWindow, Any]:
 
     该函数不落盘，供高频录像/差分检测使用。
     """
-    import pyautogui
-
     window = get_game_window(title_keyword)
-    image = pyautogui.screenshot(
-        region=(window.origin_x, window.origin_y, window.width, window.height)
-    )
+    image = grab_window_image(window)
     return window, image
 
 

@@ -9,6 +9,7 @@ from game_baque.capture import (
     click_screen_native,
     focus_game_window,
     get_game_window,
+    grab_window_image,
 )
 
 
@@ -30,17 +31,8 @@ def capture_balatro_window(
     output_dir: Path,
     title_keyword: str,
 ) -> CapturedFrame:
-    import pyautogui
-
     window = get_game_window(title_keyword)
-    image: Any = pyautogui.screenshot(
-        region=(
-            window.origin_x,
-            window.origin_y,
-            window.width,
-            window.height,
-        )
-    )
+    image: Any = grab_window_image(window)
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"balatro_{datetime.now():%Y%m%d_%H%M%S_%f}.png"
     image.save(path, "PNG")

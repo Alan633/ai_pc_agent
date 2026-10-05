@@ -288,9 +288,17 @@ class BalatroController:
             acted=True,
         )
         LOGGER.info(
-            "Balatro执行 action=%s cards=%s reason=%s",
+            "Balatro执行 action=%s cards=%s target=%s reason=%s",
             decision.action,
             decision.card_indices,
+            (
+                (
+                    decision.target.x,
+                    decision.target.y,
+                )
+                if decision.target
+                else None
+            ),
             decision.reason,
         )
         return True
@@ -339,6 +347,14 @@ class BalatroController:
             "action": decision.action,
             "card_indices": list(
                 decision.card_indices
+            ),
+            "target": (
+                {
+                    "x": decision.target.x,
+                    "y": decision.target.y,
+                }
+                if decision.target
+                else None
             ),
             "reason": decision.reason,
             "expected_strength": (
@@ -420,6 +436,8 @@ class BalatroController:
     ) -> str:
         self.run_count += 1
         unknown_streak = 0
+        navigation_screen: ScreenType | None = None
+        navigation_streak = 0
         while not stop_signal.is_set():
             try:
                 result = await self.step(
@@ -443,6 +461,34 @@ class BalatroController:
                 unknown_streak += 1
             else:
                 unknown_streak = 0
+
+            if (
+                result.acted
+                and result.snapshot.screen_type
+                in {
+                    ScreenType.START,
+                    ScreenType.BLIND_SELECT,
+                }
+            ):
+                if (
+                    result.snapshot.screen_type
+                    == navigation_screen
+                ):
+                    navigation_streak += 1
+                else:
+                    navigation_screen = (
+                        result.snapshot.screen_type
+                    )
+                    navigation_streak = 1
+            else:
+                navigation_screen = None
+                navigation_streak = 0
+
+            if navigation_streak >= 3:
+                return (
+                    "Balatro 连续 3 次点击同一导航页面仍未推进，"
+                    "为避免重复误点已停止。"
+                )
 
             if result.stop_loop:
                 self.game_over_count += 1
