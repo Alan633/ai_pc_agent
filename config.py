@@ -59,6 +59,8 @@ class Settings:
     balatro_control_mode: str = "auto"
     balatrobot_url: str = "http://127.0.0.1:12346"
     balatrobot_timeout_seconds: float = 20.0
+    balatrobot_auto_start: bool = True
+    balatrobot_startup_timeout_seconds: float = 35.0
     balatrobot_deck: str = "RED"
     balatrobot_stake: str = "WHITE"
 
@@ -234,6 +236,14 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         ).strip().rstrip("/"),
         balatrobot_timeout_seconds=max(
             1.0, min(float(os.getenv("BALATROBOT_TIMEOUT_SECONDS", "20.0")), 60.0)
+        ),
+        balatrobot_auto_start=_env_bool("BALATROBOT_AUTO_START", "true"),
+        balatrobot_startup_timeout_seconds=max(
+            3.0,
+            min(
+                float(os.getenv("BALATROBOT_STARTUP_TIMEOUT_SECONDS", "35.0")),
+                120.0,
+            ),
         ),
         balatrobot_deck=balatrobot_deck,
         balatrobot_stake=balatrobot_stake,
