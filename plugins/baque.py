@@ -18,6 +18,7 @@ from game_baque.local_decision import LocalDecisionReranker
 from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
 from game_baque.vision import BaqueVision
+from game_baque.vision_coordinator import LocalVisionCoordinator
 
 
 LOGGER = logging.getLogger(__name__)
@@ -67,6 +68,9 @@ class BaquePlugin:
         )
 
         game: BaqueGameController | None = None
+        coordinator = (
+            LocalVisionCoordinator() if settings.game_vision_base_url else None
+        )
         if settings.openai_api_key or settings.game_vision_base_url:
             decision_reranker = None
             if (
@@ -87,6 +91,7 @@ class BaquePlugin:
                     settings.openai_api_key,
                     settings.game_vision_model,
                     settings.game_vision_base_url,
+                    coordinator=coordinator,
                 ),
                 screenshots_dir=settings.screenshots_dir,
                 session=session,
@@ -109,6 +114,7 @@ class BaquePlugin:
                     settings.openai_api_key,
                     settings.game_vision_model,
                     base_url=settings.game_vision_base_url,
+                    coordinator=coordinator,
                 ),
                 output_root=settings.game_recordings_dir,
                 on_observation=game.apply_opponent_observation,
@@ -360,11 +366,18 @@ class BaquePlugin:
                     self._auto_started_observer = True
                     LOGGER.info("八雀启动流程：正式牌局已就绪，三家观察器已启动")
             elif game.vision.base_url:
-                # Ollama 通常串行处理同一模型请求。并行启动对手视觉 worker 会
-                # 让自己的回合识别排队几十秒，最终点击过期画面。本地模式优先
-                # 实时操作，主循环使用单帧识别且暂不调用对手视觉模型。
+                # 本地 Ollama 通常串行处理请求。观察器仅在对手回合调用模型；
+                # 轮到自己时控制器会先取消在途对手请求并取得优先权。
                 game.set_external_observer_active(True)
-                LOGGER.info("本地视觉模式：暂停并行对手识别，优先保证回合内操作")
+                if observer is not None:
+                    game.set_opponent_observer_controls(
+                        pause=observer.pause_classification,
+                        resume=observer.resume_classification,
+                    )
+                    if not observer.running:
+                        await observer.start(classification_paused=True)
+                        self._auto_started_observer = True
+                LOGGER.info("本地视觉模式：已启用按回合抢占的三家桌面识别")
 
             message = await game.run_loop(self._auto_stop_event)
             self._last_auto_message = message
@@ -377,6 +390,7 @@ class BaquePlugin:
             self._last_auto_message = f"八雀自动游戏启动失败：{type(exc).__name__}: {exc}"
             return self._last_auto_message
         finally:
+            game.set_opponent_observer_controls(pause=None, resume=None)
             if self._auto_started_observer and observer is not None and observer.running:
                 try:
                     await observer.stop()
@@ -384,6 +398,12 @@ class BaquePlugin:
                     LOGGER.exception("停止八雀自动观察器失败")
             if observer is None or not observer.running:
                 game.set_external_observer_active(False)
+            elif game.vision.base_url:
+                # 自动模式复用了手动观察器时，退出自动控制后恢复纯观察。
+                try:
+                    await observer.resume_classification()
+                except Exception:
+                    LOGGER.exception("恢复八雀手动观察器失败")
             self._auto_started_observer = False
 
     async def auto_stop(self) -> dict[str, Any]:

@@ -128,7 +128,7 @@ baque_acceptance_mark    baque_acceptance_reset
 看看八雀目前准确率够不够无人值守
 ```
 
-应用白名单位于 `config/apps.yaml`。AIAGENT 分支包含 Chrome、Edge、微信、抖音、记事本、资源管理器、CMD、PowerShell、IDEA 和 `a_share_recommend`，并支持“微信/weixin”“抖音/douyin”等别名。`cmd`、`powershell` 仅允许打开空窗口，AI 不能传入命令；`start_process` 的 `program` 也必须是 YAML 中的应用名称，不能传入原始可执行路径。
+应用白名单位于 `config/apps.yaml`。AIAGENT 分支包含 Chrome、Edge、微信、抖音、记事本、资源管理器、CMD、PowerShell、IDEA、Steam 版《小丑牌》（Balatro）和 `a_share_recommend`，并支持“微信/weixin”“抖音/douyin”“小丑牌/Balatro”等别名。`cmd`、`powershell` 仅允许打开空窗口，AI 不能传入命令；`start_process` 的 `program` 也必须是 YAML 中的应用名称，不能传入原始可执行路径。
 
 可直接测试以下消息：
 

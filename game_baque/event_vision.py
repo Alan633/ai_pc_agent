@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from PIL import Image
 
 from game_baque.models import Card, RANKS, SUITS
+from game_baque.vision_coordinator import LocalVisionCoordinator
 
 _CARD_RANKS = [*RANKS, "WILD", "NONE"]
 _CARD_SUITS = [*SUITS, "NONE"]
@@ -260,6 +261,7 @@ class OpponentEventVision:
         model: str,
         *,
         base_url: str = "",
+        coordinator: LocalVisionCoordinator | None = None,
     ) -> None:
         if not api_key and not base_url:
             raise ValueError("对手动作视觉识别需要 OPENAI_API_KEY 或兼容视觉接口")
@@ -274,6 +276,7 @@ class OpponentEventVision:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._prefer_chat_completions = bool(self.base_url)
+        self.coordinator = coordinator
 
     async def classify(
         self,
@@ -283,15 +286,22 @@ class OpponentEventVision:
         *,
         actor_hint: str = "unknown",
         peak_scores: dict[str, float] | None = None,
+        generation: int = 0,
     ) -> TableObservation:
         if self._prefer_chat_completions:
-            raw = await self._classify_chat(
-                before,
-                peak,
-                after,
-                actor_hint=actor_hint,
-                peak_scores=peak_scores or {},
-            )
+            async def request() -> str:
+                return await self._classify_chat(
+                    before,
+                    peak,
+                    after,
+                    actor_hint=actor_hint,
+                    peak_scores=peak_scores or {},
+                )
+
+            if self.coordinator is None:
+                raw = await request()
+            else:
+                raw = await self.coordinator.run_opponent(generation, request)
         else:
             try:
                 raw = await self._classify_responses(
@@ -310,6 +320,16 @@ class OpponentEventVision:
                     peak_scores=peak_scores or {},
                 )
         return self._parse(json.loads(self._clean_json(raw)))
+
+    async def enter_own_phase(self) -> int:
+        if self.coordinator is None:
+            return 0
+        return await self.coordinator.enter_own_phase()
+
+    async def enter_opponent_phase(self) -> int:
+        if self.coordinator is None:
+            return 0
+        return await self.coordinator.enter_opponent_phase()
 
     async def _classify_responses(
         self,

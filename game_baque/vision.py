@@ -5,9 +5,10 @@ import io
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from openai import AsyncOpenAI
 from PIL import Image
@@ -15,6 +16,7 @@ from PIL import Image
 from game_baque.capture import find_action_buttons
 from game_baque.models import Card, GameSnapshot, OpponentEvent, Point, RANKS, ScreenType, SUITS
 from game_baque.rules import evaluate_hu
+from game_baque.vision_coordinator import LocalVisionCoordinator
 
 
 LOCAL_VISION_SIZE = (1280, 720)
@@ -278,8 +280,18 @@ SNAPSHOT_SCHEMA = {
 }
 
 
+T = TypeVar("T")
+
+
 class BaqueVision:
-    def __init__(self, api_key: str, model: str, base_url: str = "") -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str = "",
+        *,
+        coordinator: LocalVisionCoordinator | None = None,
+    ) -> None:
         client_key = api_key or ("local-model" if base_url else "")
         if not client_key:
             raise ValueError("点字成金视觉识别需要 OPENAI_API_KEY 或本地 GAME_VISION_BASE_URL")
@@ -290,6 +302,12 @@ class BaqueVision:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self._prefer_chat_completions = bool(self.base_url)
+        self.coordinator = coordinator
+
+    async def _run_local_request(self, request: Callable[[], Awaitable[T]]) -> T:
+        if self.coordinator is None:
+            return await request()
+        return await self.coordinator.run_own(request)
 
     @staticmethod
     def _data_url(image_path: Path) -> str:
@@ -667,21 +685,24 @@ class BaqueVision:
         )
 
     async def _quick_json(self, prompt: str, image_url: str, label: str) -> dict[str, Any]:
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_url}},
-                    ],
-                }
-            ],
-            temperature=0,
-            reasoning_effort="none",
-            response_format={"type": "json_object"},
-        )
+        async def send() -> Any:
+            return await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ],
+                temperature=0,
+                reasoning_effort="none",
+                response_format={"type": "json_object"},
+            )
+
+        response = await self._run_local_request(send)
         raw = response.choices[0].message.content or ""
         if not raw.strip():
             raise RuntimeError(f"本地视觉模型未返回{label}识别结果")
@@ -877,10 +898,15 @@ class BaqueVision:
             # 关闭思考可显著降低延迟，并避免推理耗尽输出预算后 content 为空。
             "reasoning_effort": "none",
         }
+        async def send(*, structured: bool) -> Any:
+            request_kwargs = dict(kwargs)
+            if structured:
+                request_kwargs["response_format"] = {"type": "json_object"}
+            return await self.client.chat.completions.create(**request_kwargs)
+
         try:
-            response = await self.client.chat.completions.create(
-                **kwargs,
-                response_format={"type": "json_object"},
+            response = await self._run_local_request(
+                lambda: send(structured=True)
             )
         except Exception as exc:
             if self._is_context_length_error(exc):
@@ -892,13 +918,17 @@ class BaqueVision:
                 "本地视觉接口不支持 response_format，已回退到普通 JSON 输出：%s",
                 type(exc).__name__,
             )
-            response = await self.client.chat.completions.create(**kwargs)
+            response = await self._run_local_request(
+                lambda: send(structured=False)
+            )
         raw = response.choices[0].message.content or ""
         if not raw.strip():
             logging.getLogger(__name__).warning(
                 "本地视觉模型返回空 content，取消 response_format 后重试一次"
             )
-            response = await self.client.chat.completions.create(**kwargs)
+            response = await self._run_local_request(
+                lambda: send(structured=False)
+            )
             raw = response.choices[0].message.content or ""
         if not raw.strip():
             raise RuntimeError("本地视觉模型连续两次返回空内容")

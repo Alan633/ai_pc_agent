@@ -6,6 +6,7 @@ import logging
 import math
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from threading import Event
 from dataclasses import dataclass
 from pathlib import Path
@@ -143,6 +144,9 @@ class BaqueGameController:
         self._previous_frame_path: Path | None = None
         self._pair_event_dedupe: dict[tuple[str, str, str], float] = {}
         self.external_observer_active = False
+        self._pause_opponent_observer: Callable[[], Awaitable[None]] | None = None
+        self._resume_opponent_observer: Callable[[], Awaitable[None]] | None = None
+        self._observer_phase = "inactive"
         self.opponent_event_count = 0
         self.inspect_count = 0
         self.unknown_snapshot_count = 0
@@ -284,6 +288,7 @@ class BaqueGameController:
             )
             if probe.action_state is None:
                 if probe.round_in_progress:
+                    await self._set_observer_phase("opponent")
                     if self._turn_counted:
                         self._end_turn()
                     self._turn_started_at = None
@@ -291,10 +296,19 @@ class BaqueGameController:
                     self._swap_phase_active = False
                     if self._round_info_attempts < 2:
                         # 对手回合空闲时读一次底分与对手豆数（约 1 秒），不占自己回合。
-                        await self._read_round_info()
+                        await self._set_observer_phase("own")
+                        try:
+                            await self._read_round_info()
+                        finally:
+                            await self._set_observer_phase("opponent")
                         continue
-            elif self._turn_started_at is None:
-                self._turn_started_at = probed_at
+                else:
+                    await self._set_observer_phase("inactive")
+            else:
+                # 先抢占/取消本地对手识别，再提交自己的牌面请求。
+                await self._set_observer_phase("own")
+                if self._turn_started_at is None:
+                    self._turn_started_at = probed_at
             if probe.action_state == "swap":
                 if not self._swap_phase_active:
                     # 连续自动模式下见到换牌页即新一局开始。
@@ -1666,6 +1680,27 @@ class BaqueGameController:
         self.external_observer_active = bool(active)
         if active:
             self._previous_frame_path = None
+
+    def set_opponent_observer_controls(
+        self,
+        *,
+        pause: Callable[[], Awaitable[None]] | None,
+        resume: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        self._pause_opponent_observer = pause
+        self._resume_opponent_observer = resume
+        self._observer_phase = "inactive"
+
+    async def _set_observer_phase(self, phase: str) -> None:
+        if phase == self._observer_phase:
+            return
+        self._observer_phase = phase
+        if phase == "opponent":
+            callback = self._resume_opponent_observer
+        else:
+            callback = self._pause_opponent_observer
+        if callback is not None:
+            await callback()
 
     def recent_opponent_events_text(self) -> str:
         if not self._observer_recent_events:

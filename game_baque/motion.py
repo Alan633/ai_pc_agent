@@ -156,6 +156,10 @@ class MotionEpisodeDetector:
             return None
         return self._finish()
 
+    def reset(self) -> None:
+        """丢弃跨回合的半截动作，恢复时从最新稳定帧重新开始。"""
+        self._reset()
+
     def _finish(self) -> MotionEpisode:
         assert self._before is not None
         assert self._peak is not None

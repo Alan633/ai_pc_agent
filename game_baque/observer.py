@@ -84,6 +84,10 @@ class OpponentObserver:
         self._worker_task: asyncio.Task[None] | None = None
         self._stop_event: asyncio.Event | None = None
         self._queue: asyncio.Queue[tuple[MotionEpisode, Path, Path, Path]] | None = None
+        self._classification_enabled: asyncio.Event | None = None
+        self._active_classification: asyncio.Task[TableObservation] | None = None
+        self._generation = 0
+        self._detector: MotionEpisodeDetector | None = None
         self._directory: Path | None = None
         self._sampled_frames = 0
         self._episodes_detected = 0
@@ -98,7 +102,7 @@ class OpponentObserver:
     def running(self) -> bool:
         return self._capture_task is not None and not self._capture_task.done()
 
-    async def start(self) -> ObserverStatus:
+    async def start(self, *, classification_paused: bool = False) -> ObserverStatus:
         if self.running:
             return self.status()
 
@@ -125,8 +129,15 @@ class OpponentObserver:
         self._recent.clear()
         self._stop_event = asyncio.Event()
         self._queue = asyncio.Queue(maxsize=self.max_queue)
+        self._classification_enabled = asyncio.Event()
+        if classification_paused:
+            self._generation = await self.vision.enter_own_phase()
+        else:
+            self._classification_enabled.set()
+            self._generation = await self.vision.enter_opponent_phase()
 
         detector = MotionEpisodeDetector(fps=self.fps)
+        self._detector = detector
         self._capture_task = asyncio.create_task(
             self._capture_loop(first, detector),
             name="baque-opponent-capture",
@@ -138,11 +149,52 @@ class OpponentObserver:
         LOGGER.info("对手观察器启动 dir=%s fps=%.1f", directory, self.fps)
         return self.status()
 
+    async def pause_classification(self) -> None:
+        """自己的回合立即让出本地模型，并使所有旧结果失效。"""
+        enabled = self._classification_enabled
+        if enabled is None or not enabled.is_set():
+            return
+        enabled.clear()
+        self._generation = await self.vision.enter_own_phase()
+        if self._detector is not None:
+            self._detector.reset()
+        self._drain_queue()
+        task = self._active_classification
+        if task is not None and not task.done():
+            task.cancel()
+        self._recent.append("自己的回合：已暂停对手识别并清空旧事件")
+
+    async def resume_classification(self) -> None:
+        """进入对手回合后恢复分类；重复通知不会重置动作分段。"""
+        enabled = self._classification_enabled
+        if enabled is None or enabled.is_set():
+            return
+        self._drain_queue()
+        self._generation = await self.vision.enter_opponent_phase()
+        enabled.set()
+        self._recent.append("对手回合：已恢复桌面动作识别")
+
+    def _drain_queue(self) -> None:
+        if self._queue is None:
+            return
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._queue.task_done()
+
     async def stop(self) -> ObserverStatus:
         if self._capture_task is None and self._worker_task is None:
             return self.status()
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._classification_enabled is not None:
+            self._classification_enabled.set()
+        task = self._active_classification
+        if task is not None and not task.done():
+            task.cancel()
 
         # 先让捕获循环结束并 flush 最后一个动作片段，再等待识别队列消费完。
         capture_task = self._capture_task
@@ -175,6 +227,9 @@ class OpponentObserver:
 
         self._capture_task = None
         self._worker_task = None
+        self._active_classification = None
+        self._classification_enabled = None
+        self._detector = None
         self._write_summary()
         LOGGER.info("对手观察器停止")
         return self.status()
@@ -230,6 +285,12 @@ class OpponentObserver:
                     continue
 
                 self._sampled_frames += 1
+                if (
+                    self._classification_enabled is not None
+                    and not self._classification_enabled.is_set()
+                ):
+                    previous = current
+                    continue
                 episode = detector.push(
                     previous,
                     current,
@@ -290,6 +351,15 @@ class OpponentObserver:
             )
             return
 
+        if (
+            self._classification_enabled is not None
+            and not self._classification_enabled.is_set()
+        ):
+            self._recent.append(
+                f"episode {episode.episode_id}: 自己回合，仅保留关键帧"
+            )
+            return
+
         if self._queue.full():
             self._low_confidence += 1
             self._recent.append(
@@ -301,11 +371,13 @@ class OpponentObserver:
     async def _classify_loop(self) -> None:
         assert self._stop_event is not None
         assert self._queue is not None
+        assert self._classification_enabled is not None
 
         while True:
             capture_done = self._capture_task is None or self._capture_task.done()
             if self._stop_event.is_set() and capture_done and self._queue.empty():
                 break
+            await self._classification_enabled.wait()
             try:
                 episode, before, peak, after = await asyncio.wait_for(
                     self._queue.get(),
@@ -315,13 +387,27 @@ class OpponentObserver:
                 continue
 
             try:
-                observation = await self.vision.classify(
-                    before,
-                    peak,
-                    after,
-                    actor_hint=episode.actor_hint,
-                    peak_scores=episode.peak_scores,
+                generation = self._generation
+                self._active_classification = asyncio.create_task(
+                    self.vision.classify(
+                        before,
+                        peak,
+                        after,
+                        actor_hint=episode.actor_hint,
+                        peak_scores=episode.peak_scores,
+                        generation=generation,
+                    ),
+                    name=f"baque-opponent-episode-{episode.episode_id}",
                 )
+                observation = await self._active_classification
+                if (
+                    generation != self._generation
+                    or not self._classification_enabled.is_set()
+                ):
+                    self._recent.append(
+                        f"episode {episode.episode_id}: 跨回合旧结果已丢弃"
+                    )
+                    continue
                 self._classified += 1
                 applied = False
                 error = ""
@@ -344,6 +430,12 @@ class OpponentObserver:
                     applied=applied,
                     error=error,
                 )
+            except asyncio.CancelledError:
+                if asyncio.current_task() is not None and asyncio.current_task().cancelling():
+                    raise
+                self._recent.append(
+                    f"episode {episode.episode_id}: 自己回合抢占，识别已取消"
+                )
             except Exception as exc:
                 self._low_confidence += 1
                 self._recent.append(
@@ -351,6 +443,7 @@ class OpponentObserver:
                 )
                 LOGGER.exception("对手动作视觉识别失败")
             finally:
+                self._active_classification = None
                 self._queue.task_done()
 
     def _write_recognition(

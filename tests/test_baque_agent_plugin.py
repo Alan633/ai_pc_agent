@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from agent.session import AgentSession
 from agent.tool_registry import ToolRegistry
+from config import Settings
 from game_baque.acceptance import BaqueAcceptanceTracker
 from plugins.baque import BaquePlugin
 
@@ -79,6 +80,33 @@ def test_baque_plugin_registers_agent_tools(tmp_path: Path) -> None:
         "baque_acceptance_reset",
         "baque_round_stats",
     }
+
+
+def test_local_game_and_opponent_vision_share_priority_coordinator(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        base_dir=tmp_path,
+        telegram_bot_token="",
+        allowed_telegram_user_id=0,
+        openai_api_key="",
+        openai_model="local",
+        playwright_headless=True,
+        max_steps=5,
+        confirm_timeout_seconds=30,
+        allowed_roots=(tmp_path,),
+        allowed_executables=frozenset(),
+        game_vision_model="local-vision",
+        game_vision_base_url="http://127.0.0.1:11434/v1",
+        game_decision_mode="rule",
+    )
+
+    plugin = BaquePlugin.build(settings, AgentSession())
+
+    assert plugin.game is not None
+    assert plugin.observer is not None
+    assert plugin.game.vision.coordinator is not None
+    assert plugin.game.vision.coordinator is plugin.observer.vision.coordinator
 
 
 def test_acceptance_report_reaches_pass_with_ground_truth(tmp_path: Path) -> None:

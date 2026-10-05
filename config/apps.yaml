@@ -98,6 +98,18 @@ apps:
       - "idea64.exe"
     allow_extra_args: false
 
+  balatro:
+    paths:
+      - "E:/Steam/steamapps/common/Balatro/Balatro.exe"
+      - "C:/Program Files (x86)/Steam/steamapps/common/Balatro/Balatro.exe"
+      - "C:/Program Files/Steam/steamapps/common/Balatro/Balatro.exe"
+    aliases:
+      - "小丑牌"
+      - "balatro.exe"
+    process_names:
+      - "Balatro.exe"
+    allow_extra_args: false
+
   a_share_recommend:
     paths:
       - "F:/AAA/a_share_recommend/.venv/Scripts/python.exe"
