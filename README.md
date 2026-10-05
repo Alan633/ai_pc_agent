@@ -583,3 +583,53 @@ Telegram 固定命令：
 LOGS/balatro/decisions.jsonl
 screenshots/balatro/
 ```
+
+
+### Balatro 本地模型参与决策
+
+默认使用 `BALATRO_DECISION_MODE=hybrid`：
+
+```text
+Balatro截图
+   ↓
+本地Qwen视觉转录
+   ↓
+BalatroSnapshot
+   ↓
+Python Solver 枚举/校验合法候选
+   ↓
+Top-N 候选（A/B/C...）
+   ↓
+本地 Qwen3.5 长期策略重排
+   ↓
+Python 校验 choice_id
+   ↓
+鼠标执行
+```
+
+本地模型现在会真正参与以下决策，而不只是解释：
+
+- 当前手牌是直接出牌还是消耗 Discard 继续找牌；
+- 多个合法牌型之间如何兼顾当前过关与长期 Build；
+- 商店里买 Joker、Voucher、卡包、重掷还是保留利息；
+- 卡包选哪个项目或跳过；
+- Blind 是挑战还是 Skip（仅在画面能可靠识别对应按钮时）。
+
+Qwen 仍然**不能直接返回鼠标坐标，也不能创造一张牌或一个动作**。所有可执行项必须先由 Python 生成；模型只能返回已有候选的 `choice_id`。超时、连接失败、低置信度、非法 `choice_id` 都自动回退 Python 第一候选。
+
+Controller 会保存最近的 Build 计划，例如“对子/两对方向、优先经济 Joker、保留 $5 利息”，后续决策继续带上这段短期记忆，让本地模型能按整局方向而不是每一帧孤立判断。
+
+配置：
+
+```env
+BALATRO_DECISION_MODE=hybrid
+BALATRO_DECISION_MODEL=qwen3.5-9b-16k
+BALATRO_DECISION_BASE_URL=http://127.0.0.1:11434/v1
+BALATRO_DECISION_TIMEOUT_SECONDS=6.0
+BALATRO_DECISION_TOP_N=6
+BALATRO_DECISION_MIN_CONFIDENCE=0.55
+```
+
+如果不单独设置 `BALATRO_DECISION_BASE_URL` / `BALATRO_DECISION_MODEL`，会默认复用 Balatro 视觉模型配置。改成 `BALATRO_DECISION_MODE=python` 可完全关闭 Qwen 策略重排。
+
+`/balatro_stats` 会额外显示 Qwen 成功决策次数、回退次数、最近决策来源和当前 Strategy Memory；`LOGS/balatro/decisions.jsonl` 中也会记录 `decision_source`、Qwen 置信度与 Build Plan。
