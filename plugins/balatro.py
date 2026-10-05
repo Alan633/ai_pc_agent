@@ -74,6 +74,7 @@ class BalatroPlugin:
                     stake=settings.balatrobot_stake,
                     game_executable_path=settings.balatrobot_game_path,
                     lovely_path=settings.balatrobot_lovely_path,
+                    audio=settings.balatrobot_audio,
                 )
             strategist: BalatroLocalStrategist | None = None
             if (
