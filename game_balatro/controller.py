@@ -283,9 +283,8 @@ class BalatroController:
             desired = set(
                 decision.card_indices
             )
-            for index, card in enumerate(
-                snapshot.hand
-            ):
+            for index in range(len(snapshot.hand) - 1, -1, -1):
+                card = snapshot.hand[index]
                 if (
                     card.selected
                     and index not in desired
@@ -312,7 +311,12 @@ class BalatroController:
                     )
                     await asyncio.sleep(0.08)
 
-            for index in decision.card_indices:
+            # 手牌从左到右重叠绘制，先点右侧最上层牌，再向左，
+            # 可以逐步暴露左侧牌，进一步降低命中邻牌的概率。
+            for index in sorted(
+                decision.card_indices,
+                reverse=True,
+            ):
                 if (
                     index < 0
                     or index >= len(snapshot.hand)
