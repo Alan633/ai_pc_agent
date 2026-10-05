@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -299,7 +298,7 @@ def test_balatrobot_ensure_server_skips_spawn_when_api_is_ready(
     assert client.ensure_server(logs_dir=tmp_path) == "already_running"
 
 
-def test_balatrobot_ensure_server_auto_starts_uvx(
+def test_balatrobot_ensure_server_directly_starts_balatro_on_windows(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -311,21 +310,23 @@ def test_balatrobot_ensure_server_auto_starts_uvx(
         lambda **_kwargs: next(checks),
     )
     monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda name: "C:/Tools/uvx.exe" if name == "uvx" else None,
+        client,
+        "_patch_preserve_user_settings",
+        lambda: "patched",
     )
     monkeypatch.setattr(
         client,
-        "_windows_launch_args",
-        lambda: [
-            "--love-path",
-            "C:/Games/Balatro/Balatro.exe",
-            "--lovely-path",
-            "C:/Games/Balatro/winmm.dll",
-            "--platform",
-            "windows",
-        ],
+        "_direct_launch_command",
+        lambda: (
+            ["C:/Games/Balatro/Balatro.exe"],
+            {
+                "BALATROBOT_HOST": "127.0.0.1",
+                "BALATROBOT_PORT": "12346",
+                "BALATROBOT_AUDIO": "1",
+                "NO_PROXY": "127.0.0.1,localhost,::1",
+                "no_proxy": "127.0.0.1,localhost,::1",
+            },
+        ),
     )
     captured: dict[str, object] = {}
 
@@ -350,21 +351,15 @@ def test_balatrobot_ensure_server_auto_starts_uvx(
         )
         == "started"
     )
-    command = captured["command"]
-    assert isinstance(command, list)
-    assert command[:3] == [
-        "C:/Tools/uvx.exe",
-        "balatrobot",
-        "serve",
+    assert captured["command"] == [
+        "C:/Games/Balatro/Balatro.exe"
     ]
-    assert "--logs-path" in command
-    assert "--audio" in command
     env = captured["kwargs"]["env"]
+    assert env["BALATROBOT_HOST"] == "127.0.0.1"
+    assert env["BALATROBOT_PORT"] == "12346"
+    assert env["BALATROBOT_AUDIO"] == "1"
     assert "127.0.0.1" in env["NO_PROXY"]
-    assert "localhost" in env["NO_PROXY"]
-    assert "::1" in env["NO_PROXY"]
-    assert "127.0.0.1" in env["no_proxy"]
-    assert (tmp_path / "balatrobot_serve.log").exists()
+    assert (tmp_path / "balatro_direct.log").exists()
 
 
 
@@ -437,33 +432,53 @@ def test_windows_launch_args_pass_balatro_and_lovely_paths(
     ]
 
 
+def test_direct_launch_passes_balatrobot_environment(
+    tmp_path: Path,
+) -> None:
+    game_dir = tmp_path / "Balatro"
+    game_dir.mkdir()
+    game = game_dir / "Balatro.exe"
+    lovely = game_dir / "winmm.dll"
+    game.write_bytes(b"exe")
+    lovely.write_bytes(b"lovely")
+
+    client = BalatroBotClient(
+        base_url="http://127.0.0.1:23456",
+        game_executable_path=str(game),
+        lovely_path=str(lovely),
+        audio=True,
+    )
+    command, env = client._direct_launch_command()
+
+    assert command == [str(game.resolve())]
+    assert env["BALATROBOT_HOST"] == "127.0.0.1"
+    assert env["BALATROBOT_PORT"] == "23456"
+    assert env["BALATROBOT_AUDIO"] == "1"
+    assert "localhost" in env["NO_PROXY"]
+    assert "::1" in env["no_proxy"]
+
+
 
 def test_balatrobot_audio_can_be_disabled(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    client = BalatroBotClient(audio=False)
-    monkeypatch.setattr(
-        shutil,
-        "which",
-        lambda name: "C:/Tools/uvx.exe" if name == "uvx" else None,
-    )
-    monkeypatch.setattr(
-        client,
-        "_windows_launch_args",
-        lambda: [
-            "--love-path",
-            "C:/Games/Balatro/Balatro.exe",
-            "--lovely-path",
-            "C:/Games/Balatro/winmm.dll",
-            "--platform",
-            "windows",
-        ],
-    )
+    game_dir = tmp_path / "Balatro"
+    game_dir.mkdir()
+    game = game_dir / "Balatro.exe"
+    lovely = game_dir / "winmm.dll"
+    game.write_bytes(b"exe")
+    lovely.write_bytes(b"lovely")
 
-    command = client._serve_command(tmp_path)
+    client = BalatroBotClient(
+        audio=False,
+        game_executable_path=str(game),
+        lovely_path=str(lovely),
+    )
+    command, env = client._direct_launch_command()
 
-    assert "--audio" not in command
+    assert command == [str(game.resolve())]
+    assert env["BALATROBOT_AUDIO"] == "0"
 
 
 
@@ -523,7 +538,7 @@ def test_preserve_user_settings_patch_is_idempotent(
 
     assert client._patch_preserve_user_settings() == "patched"
     patched = settings.read_text(encoding="utf-8")
-    assert "AIAGENT_PRESERVE_USER_SETTINGS_V1" in patched
+    assert "AIAGENT_PRESERVE_USER_SETTINGS_V2" in patched
     assert "G.SETTINGS.GAMESPEED = BB_SETTINGS.gamespeed" not in patched
     assert 'G.SETTINGS.GRAPHICS.shadows = "Off"' not in patched
     assert "G.SETTINGS.WINDOW.vsync = 0" not in patched
