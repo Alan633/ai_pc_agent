@@ -167,3 +167,39 @@ def test_shop_candidates_never_include_unaffordable_item() -> None:
 
     assert (300, 400) in targets
     assert (500, 400) not in targets
+
+
+def test_shop_keep_money_candidate_survives_many_items() -> None:
+    from game_balatro.models import ShopItem
+
+    items = tuple(
+        ShopItem(
+            name=f"Joker{i}",
+            kind="joker",
+            price=3,
+            x=200 + i * 60,
+            y=400,
+        )
+        for i in range(8)
+    )
+    snapshot = BalatroSnapshot(
+        screen_type=ScreenType.SHOP,
+        money=20,
+        shop_items=items,
+        next_round_button=Point(900, 700),
+        reroll_button=Point(800, 700),
+    )
+
+    candidates = BalatroSolver(reserve_money=5).rank_candidates(
+        snapshot,
+        top_n=6,
+    )
+
+    assert any(
+        decision.metadata.get("candidate_type") == "shop_leave"
+        for decision in candidates
+    )
+    assert any(
+        decision.metadata.get("candidate_type") == "shop_reroll"
+        for decision in candidates
+    )
