@@ -75,6 +75,10 @@ class BalatroPlugin:
                     game_executable_path=settings.balatrobot_game_path,
                     lovely_path=settings.balatrobot_lovely_path,
                     audio=settings.balatrobot_audio,
+                    preserve_user_settings=(
+                        settings.balatrobot_preserve_user_settings
+                    ),
+                    mod_path=settings.balatrobot_mod_path,
                 )
             strategist: BalatroLocalStrategist | None = None
             if (
