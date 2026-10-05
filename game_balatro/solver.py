@@ -313,6 +313,247 @@ class BalatroSolver:
             "商店状态缺少下一回合按钮，等待重新识别。",
         )
 
+    @staticmethod
+    def _decision_key(decision: BalatroDecision) -> tuple[object, ...]:
+        return (
+            decision.action,
+            decision.card_indices,
+            (
+                (decision.target.x, decision.target.y)
+                if decision.target is not None
+                else None
+            ),
+        )
+
+    def rank_candidates(
+        self,
+        snapshot: BalatroSnapshot,
+        *,
+        top_n: int = 6,
+    ) -> tuple[BalatroDecision, ...]:
+        """生成给长期策略层使用的合法候选，首项始终是 Python 基线。
+
+        本地模型只能在这里生成的候选中重排，绝不能创造新的牌索引、
+        商店坐标或按钮坐标。这样即使模型判断失误，执行层仍只会触发
+        Python 已验证过的动作。
+        """
+        limit = max(1, min(int(top_n), 10))
+        base = self.decide(snapshot)
+        candidates: list[BalatroDecision] = [base]
+        seen = {self._decision_key(base)}
+
+        def add(decision: BalatroDecision) -> None:
+            key = self._decision_key(decision)
+            if key in seen or len(candidates) >= limit:
+                return
+            seen.add(key)
+            candidates.append(decision)
+
+        if snapshot.screen_type == ScreenType.PLAY and snapshot.hand:
+            ranked_plays: list[
+                tuple[tuple[int, float, tuple[int, ...]], tuple[int, ...], HandValue]
+            ] = []
+            for size in range(1, min(5, len(snapshot.hand)) + 1):
+                for indices in combinations(range(len(snapshot.hand)), size):
+                    value = evaluate_hand(tuple(snapshot.hand[index] for index in indices))
+                    ranked_plays.append(
+                        (
+                            (value.category_rank, value.strength, value.tiebreak),
+                            indices,
+                            value,
+                        )
+                    )
+            ranked_plays.sort(key=lambda row: row[0], reverse=True)
+            if snapshot.play_button is not None:
+                for _key, indices, value in ranked_plays[:4]:
+                    add(
+                        BalatroDecision(
+                            action="play_hand",
+                            reason=(
+                                f"Python候选：{value.category}，"
+                                f"启发式强度={value.strength:.2f}。"
+                            ),
+                            card_indices=indices,
+                            target=snapshot.play_button,
+                            expected_strength=value.strength,
+                            metadata={
+                                "category": value.category,
+                                "candidate_type": "play",
+                            },
+                        )
+                    )
+
+            if snapshot.discards_left > 0 and snapshot.discard_button is not None:
+                best_keep, _best_value = self.best_play(snapshot.hand)
+                discard_variants: list[tuple[int, ...]] = []
+
+                outside = tuple(
+                    index
+                    for index in range(len(snapshot.hand))
+                    if index not in best_keep
+                )
+                if outside:
+                    discard_variants.append(outside[:5])
+
+                rank_counts = Counter(card.rank for card in snapshot.hand)
+                keep_pairs = {
+                    index
+                    for index, card in enumerate(snapshot.hand)
+                    if rank_counts[card.rank] >= 2
+                }
+                pair_discard = tuple(
+                    sorted(
+                        (
+                            index
+                            for index in range(len(snapshot.hand))
+                            if index not in keep_pairs
+                        ),
+                        key=lambda i: _RANK_VALUE.get(snapshot.hand[i].rank, 0),
+                    )[:5]
+                )
+                if pair_discard:
+                    discard_variants.append(pair_discard)
+
+                low_cards = tuple(
+                    sorted(
+                        range(len(snapshot.hand)),
+                        key=lambda i: _RANK_VALUE.get(snapshot.hand[i].rank, 0),
+                    )[: min(5, max(1, len(snapshot.hand) // 2))]
+                )
+                if low_cards:
+                    discard_variants.append(low_cards)
+
+                for indices in discard_variants:
+                    add(
+                        BalatroDecision(
+                            action="discard",
+                            reason=(
+                                "Python候选：保留当前结构，"
+                                f"弃掉 {len(indices)} 张牌寻找后续牌型。"
+                            ),
+                            card_indices=indices,
+                            target=snapshot.discard_button,
+                            expected_strength=0.0,
+                            metadata={
+                                "candidate_type": "discard",
+                            },
+                        )
+                    )
+
+        elif snapshot.screen_type == ScreenType.SHOP:
+            spendable = max(0, snapshot.money - self.reserve_money)
+            priority = {
+                "joker": 6,
+                "voucher": 5,
+                "pack": 4,
+                "planet": 3,
+                "tarot": 2,
+                "spectral": 2,
+                "card": 1,
+                "other": 0,
+            }
+            affordable = [
+                item
+                for item in snapshot.shop_items
+                if 0 <= item.price <= spendable
+            ]
+            affordable.sort(
+                key=lambda item: (
+                    priority.get(item.kind, 0),
+                    item.confidence,
+                    item.price,
+                ),
+                reverse=True,
+            )
+            for item in affordable:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason=(
+                            f"Python候选：购买 {item.name or item.kind} "
+                            f"(${item.price})。"
+                        ),
+                        target=Point(item.x, item.y),
+                        metadata={
+                            "candidate_type": "shop_buy",
+                            "shop_item": item.name,
+                            "kind": item.kind,
+                            "price": item.price,
+                        },
+                    )
+                )
+            if snapshot.next_round_button is not None:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason="Python候选：不购买，保留经济进入下一回合。",
+                        target=snapshot.next_round_button,
+                        metadata={"candidate_type": "shop_leave"},
+                    )
+                )
+            if (
+                snapshot.reroll_button is not None
+                and snapshot.money >= self.reserve_money + 5
+            ):
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason="Python候选：经济允许，重掷商店寻找更强协同。",
+                        target=snapshot.reroll_button,
+                        metadata={"candidate_type": "shop_reroll"},
+                    )
+                )
+
+        elif snapshot.screen_type == ScreenType.PACK:
+            for item in sorted(
+                snapshot.pack_items,
+                key=lambda value: value.confidence,
+                reverse=True,
+            ):
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason=f"Python候选：选择卡包中的 {item.name or item.kind}。",
+                        target=Point(item.x, item.y),
+                        metadata={
+                            "candidate_type": "pack_pick",
+                            "shop_item": item.name,
+                            "kind": item.kind,
+                        },
+                    )
+                )
+            if snapshot.skip_button is not None:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason="Python候选：跳过当前卡包。",
+                        target=snapshot.skip_button,
+                        metadata={"candidate_type": "pack_skip"},
+                    )
+                )
+
+        elif snapshot.screen_type == ScreenType.BLIND_SELECT:
+            if snapshot.primary_button is not None:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason="Python候选：挑战当前 Blind。",
+                        target=snapshot.primary_button,
+                        metadata={"candidate_type": "blind_play"},
+                    )
+                )
+            if snapshot.skip_button is not None:
+                add(
+                    BalatroDecision(
+                        action="click",
+                        reason="Python候选：跳过当前 Blind 获取 Tag。",
+                        target=snapshot.skip_button,
+                        metadata={"candidate_type": "blind_skip"},
+                    )
+                )
+
+        return tuple(candidates[:limit])
+
     def decide(self, snapshot: BalatroSnapshot) -> BalatroDecision:
         if snapshot.screen_type == ScreenType.PLAY:
             if snapshot.hand and snapshot.play_button:
