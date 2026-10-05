@@ -57,6 +57,8 @@ class BalatroController:
         auto_next_run: bool = False,
         balatrobot: BalatroBotClient | None = None,
         control_mode: str = "mouse",
+        balatrobot_auto_start: bool = True,
+        balatrobot_startup_timeout_seconds: float = 35.0,
     ) -> None:
         self.vision = vision
         self.solver = solver
@@ -87,6 +89,11 @@ class BalatroController:
             raise ValueError("Balatro api 模式必须配置 BalatroBot 客户端")
         self.control_mode = normalized_control
         self.balatrobot = balatrobot
+        self.balatrobot_auto_start = bool(balatrobot_auto_start)
+        self.balatrobot_startup_timeout_seconds = max(
+            3.0,
+            min(float(balatrobot_startup_timeout_seconds), 120.0),
+        )
 
         self.last_snapshot: BalatroSnapshot | None = None
         self.last_decision: BalatroDecision | None = None
@@ -743,15 +750,96 @@ class BalatroController:
         )
 
     async def prepare_auto(self) -> None:
-        title = await asyncio.to_thread(
-            focus_balatro_window,
-            self.window_title_keyword,
+        api_required = (
+            self.balatrobot is not None
+            and self.control_mode != "mouse"
         )
-        LOGGER.info(
-            "Balatro自动模式已聚焦窗口：%s",
-            title,
-        )
-        await asyncio.sleep(0.4)
+
+        if api_required:
+            assert self.balatrobot is not None
+            api_ready = await asyncio.to_thread(
+                self.balatrobot.health
+            )
+            if api_ready:
+                LOGGER.info("BalatroBot API 已就绪，无需重复启动。")
+            else:
+                # 如果游戏窗口已经存在但 API 不通，不能再启动第二个 Balatro。
+                # auto 模式直接保留视觉鼠标兜底；api 模式则明确报错。
+                existing_title: str | None = None
+                try:
+                    existing_title = await asyncio.to_thread(
+                        focus_balatro_window,
+                        self.window_title_keyword,
+                    )
+                except Exception:
+                    existing_title = None
+
+                if existing_title:
+                    message = (
+                        "检测到 Balatro 已打开，但 BalatroBot API 未就绪；"
+                        "不会重复启动第二个游戏。"
+                    )
+                    if self.control_mode == "api":
+                        raise RuntimeError(
+                            message
+                            + " 请检查 Lovely/Steamodded/BalatroBot Mod。"
+                        )
+                    LOGGER.warning(
+                        "%s auto模式继续使用视觉+安全鼠标兜底。",
+                        message,
+                    )
+                    self._api_retry_after = time.monotonic() + 15.0
+                elif self.balatrobot_auto_start:
+                    try:
+                        status = await asyncio.to_thread(
+                            self.balatrobot.ensure_server,
+                            logs_dir=self.logs_dir,
+                            startup_timeout_seconds=(
+                                self.balatrobot_startup_timeout_seconds
+                            ),
+                        )
+                        LOGGER.info(
+                            "BalatroBot自动启动完成：%s",
+                            status,
+                        )
+                    except BalatroBotError as exc:
+                        if self.control_mode == "api":
+                            raise RuntimeError(
+                                f"BalatroBot 自动启动失败：{exc}"
+                            ) from exc
+                        LOGGER.warning(
+                            "BalatroBot自动启动失败，auto模式回退视觉鼠标：%s",
+                            exc,
+                        )
+                        self._api_retry_after = time.monotonic() + 15.0
+                elif self.control_mode == "api":
+                    raise RuntimeError(
+                        "BalatroBot API 未启动，且 BALATROBOT_AUTO_START=false。"
+                    )
+
+        # uvx balatrobot serve 可能刚刚拉起游戏，给窗口几秒钟出现。
+        deadline = time.monotonic() + 12.0
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                title = await asyncio.to_thread(
+                    focus_balatro_window,
+                    self.window_title_keyword,
+                )
+                LOGGER.info(
+                    "Balatro自动模式已聚焦窗口：%s",
+                    title,
+                )
+                await asyncio.sleep(0.4)
+                return
+            except Exception as exc:
+                last_error = exc
+                await asyncio.sleep(0.5)
+
+        raise RuntimeError(
+            "未找到 Balatro 游戏窗口；"
+            "BalatroBot 启动日志见 LOGS/balatro/balatrobot_serve.log"
+        ) from last_error
 
     async def run_loop(
         self,
@@ -844,6 +932,7 @@ class BalatroController:
             "game_overs": self.game_over_count,
             "decision_mode": self.decision_mode,
             "control_mode": self.control_mode,
+            "balatrobot_auto_start": self.balatrobot_auto_start,
             "last_state_source": self.last_state_source,
             "last_control_backend": self.last_control_backend,
             "last_decision_source": self.last_decision_source,
