@@ -75,7 +75,7 @@ class BaquePlugin:
             ):
                 decision_reranker = LocalDecisionReranker(
                     base_url=settings.game_decision_base_url,
-                    model=settings.game_decision_model,
+                    model=settings.game_decision_model or settings.openai_model,
                     api_key=settings.openai_api_key,
                     timeout_seconds=settings.game_decision_timeout_seconds,
                     top_n=settings.game_decision_top_n,
