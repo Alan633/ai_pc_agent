@@ -22,6 +22,7 @@ from game_baque.capture import (
 )
 from game_baque.ev import ExpectedValueEngine
 from game_baque.event_vision import TableObservation
+from game_baque.fast_vision import analyze_image_path
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
 from game_baque.strategy import choose_swap_two
 from game_baque.tracker import TableTracker
@@ -86,6 +87,9 @@ class BaqueGameController:
         self.unknown_snapshot_count = 0
         self.step_count = 0
         self.validation_rejection_count = 0
+        self.fast_ui_count = 0
+        self.qwen_vision_count = 0
+        self.fast_ui_fallback_count = 0
 
     async def inspect(
         self,
@@ -106,6 +110,58 @@ class BaqueGameController:
         *,
         include_previous: bool,
     ) -> GameSnapshot:
+        """固定 UI 先走 OpenCV；只有牌面/异常页面才调用 Qwen。"""
+        fast = await asyncio.to_thread(analyze_image_path, frame.path)
+
+        # 开始页完全不需要多模态模型：OpenCV 直接给出按钮中心。
+        if (
+            fast.screen_type == ScreenType.START
+            and fast.start_button is not None
+            and fast.confidence >= 0.72
+        ):
+            self.fast_ui_count += 1
+            snapshot = GameSnapshot(
+                screen_type=ScreenType.START,
+                start_button=fast.start_button,
+                message=f"{fast.message} confidence={fast.confidence:.2f}",
+            )
+            LOGGER.info(
+                "八雀OpenCV命中 start confidence=%.2f x=%s y=%s",
+                fast.confidence,
+                fast.start_button.x,
+                fast.start_button.y,
+            )
+            self._register_snapshot(frame, snapshot)
+            return snapshot
+
+        # 启动流程或外部观察器运行时，不再用整图 Qwen 判断“是不是轮到我”。
+        # OpenCV 只判断阶段；真正牌面仍交给专用快速视觉协议。
+        can_use_fast_turn = not include_previous or self.external_observer_active
+        if fast.action_state is not None and can_use_fast_turn:
+            self.fast_ui_count += 1
+            self.qwen_vision_count += 1
+            LOGGER.info(
+                "八雀OpenCV命中 action=%s，Qwen只识别牌面",
+                fast.action_state,
+            )
+            snapshot = await self.vision.parse_turn(frame.path, fast.action_state)
+            self._register_snapshot(frame, snapshot)
+            return snapshot
+
+        # 牌局进行中但不是自己回合时，自动模式无需浪费数秒让 Qwen重复确认。
+        if fast.round_in_progress and can_use_fast_turn:
+            self.fast_ui_count += 1
+            snapshot = GameSnapshot(
+                screen_type=ScreenType.WAITING,
+                message=fast.message,
+            )
+            self._register_snapshot(frame, snapshot)
+            return snapshot
+
+        # 结算、充值、陌生弹窗，以及需要用两帧补对手事件的手动模式仍交给 Qwen。
+        self.fast_ui_fallback_count += 1
+        self.qwen_vision_count += 1
+        LOGGER.info("八雀OpenCV未覆盖当前页面，回退Qwen视觉识别")
         snapshot = await self.vision.parse(
             frame.path,
             previous_image_path=(
