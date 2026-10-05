@@ -48,3 +48,5 @@ def test_balatro_plugin_builds_local_hybrid_strategist(tmp_path: Path) -> None:
     assert plugin.game is not None
     assert plugin.game.decision_mode == "hybrid"
     assert plugin.game.strategist is not None
+    assert plugin.game.control_mode == "auto"
+    assert plugin.game.balatrobot is not None
