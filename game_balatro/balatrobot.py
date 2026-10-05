@@ -258,11 +258,15 @@ class BalatroBotClient:
         timeout_seconds: float = 20.0,
         deck: str = "RED",
         stake: str = "WHITE",
+        game_executable_path: str = "",
+        lovely_path: str = "",
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = max(1.0, min(float(timeout_seconds), 60.0))
         self.deck = deck.strip().upper() or "RED"
         self.stake = stake.strip().upper() or "WHITE"
+        self.game_executable_path = game_executable_path.strip()
+        self.lovely_path = lovely_path.strip()
         self._request_id = 0
         self._serve_process: subprocess.Popen[bytes] | None = None
 
@@ -334,6 +338,156 @@ class BalatroBotClient:
         status = str(result.get("status") or "").strip().lower()
         return status in {"ok", "healthy", "ready"} or bool(result)
 
+    @staticmethod
+    def _existing_file(value: str | Path | None) -> Path | None:
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        try:
+            path = path.resolve()
+        except OSError:
+            pass
+        return path if path.is_file() else None
+
+    @staticmethod
+    def _steam_library_roots() -> tuple[Path, ...]:
+        """发现 Windows Steam 根目录和额外 Steam Library。"""
+        candidates: list[Path] = []
+
+        for raw in (
+            os.getenv("STEAM_PATH", ""),
+            os.getenv("ProgramFiles(x86)", ""),
+            os.getenv("ProgramFiles", ""),
+        ):
+            if not raw:
+                continue
+            base = Path(raw).expanduser()
+            if base.name.lower() != "steam":
+                base = base / "Steam"
+            candidates.append(base)
+
+        # 最常见的默认路径即使环境变量缺失也保留。
+        candidates.extend(
+            [
+                Path(r"C:\Program Files (x86)\Steam"),
+                Path(r"C:\Program Files\Steam"),
+            ]
+        )
+
+        roots: list[Path] = []
+        seen: set[str] = set()
+
+        def add_root(path: Path) -> None:
+            key = str(path).lower()
+            if key in seen:
+                return
+            seen.add(key)
+            roots.append(path)
+
+        for steam_root in candidates:
+            add_root(steam_root)
+            vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+            if not vdf.is_file():
+                continue
+            try:
+                text = vdf.read_text(
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+            except OSError:
+                continue
+            # VDF 中 path 常见形式："path" "D:\\SteamLibrary"
+            import re
+
+            for match in re.finditer(
+                r'"path"\s*"([^"]+)"',
+                text,
+                flags=re.IGNORECASE,
+            ):
+                raw_path = match.group(1).replace("\\\\", "\\")
+                if raw_path:
+                    add_root(Path(raw_path))
+
+        return tuple(roots)
+
+    def _resolve_windows_launch_paths(self) -> tuple[Path, Path]:
+        """定位 Balatro.exe 和 Lovely DLL；Lovely 0.10+ 优先 winmm.dll。"""
+        explicit_game = (
+            self.game_executable_path
+            or os.getenv("BALATROBOT_GAME_PATH", "").strip()
+            or os.getenv("BALATROBOT_LOVE_PATH", "").strip()
+        )
+        explicit_lovely = (
+            self.lovely_path
+            or os.getenv("BALATROBOT_LOVELY_PATH", "").strip()
+        )
+
+        game: Path | None = None
+        if explicit_game:
+            raw_game = Path(explicit_game).expanduser()
+            if raw_game.is_dir():
+                raw_game = raw_game / "Balatro.exe"
+            game = self._existing_file(raw_game)
+            if game is None:
+                raise BalatroBotError(
+                    f"指定的 Balatro.exe 不存在：{raw_game}"
+                )
+
+        if game is None:
+            for steam_root in self._steam_library_roots():
+                candidate = (
+                    steam_root
+                    / "steamapps"
+                    / "common"
+                    / "Balatro"
+                    / "Balatro.exe"
+                )
+                game = self._existing_file(candidate)
+                if game is not None:
+                    break
+
+        if game is None:
+            raise BalatroBotError(
+                "未自动找到 Balatro.exe。请在 .env 设置 "
+                "BALATROBOT_GAME_PATH=你的Balatro.exe完整路径。"
+            )
+
+        lovely: Path | None = None
+        if explicit_lovely:
+            lovely = self._existing_file(explicit_lovely)
+            if lovely is None:
+                raise BalatroBotError(
+                    f"指定的 Lovely DLL 不存在：{explicit_lovely}"
+                )
+        else:
+            game_dir = game.parent
+            # Lovely 0.10+ Windows 安装方式优先使用 winmm.dll；
+            # 兼容旧版 Lovely 的 version.dll。
+            for name in ("winmm.dll", "version.dll"):
+                lovely = self._existing_file(game_dir / name)
+                if lovely is not None:
+                    break
+
+        if lovely is None:
+            raise BalatroBotError(
+                "已找到 Balatro.exe，但同目录没有 winmm.dll/version.dll。"
+                "请确认 Lovely Injector 已安装，或在 .env 设置 "
+                "BALATROBOT_LOVELY_PATH。"
+            )
+
+        return game, lovely
+
+    def _windows_launch_args(self) -> list[str]:
+        game, lovely = self._resolve_windows_launch_paths()
+        return [
+            "--love-path",
+            str(game),
+            "--lovely-path",
+            str(lovely),
+            "--platform",
+            "windows",
+        ]
+
     def _serve_command(self, logs_dir: Path) -> list[str]:
         """构造后台启动 BalatroBot 的命令，优先 uvx，兼容只有 uv 的环境。"""
         uvx = shutil.which("uvx")
@@ -346,6 +500,9 @@ class BalatroBotClient:
                     "未找到 uvx/uv。请先安装 uv，并重新启动 AIAGENT。"
                 )
             command = [uv, "tool", "run", "balatrobot", "serve"]
+
+        if os.name == "nt":
+            command.extend(self._windows_launch_args())
 
         parsed = urlparse(self.base_url)
         if parsed.hostname and parsed.hostname not in {"127.0.0.1", "localhost"}:
