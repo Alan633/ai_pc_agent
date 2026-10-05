@@ -45,17 +45,37 @@ class ExpectedValueEngine:
         horizon_own_draws: int = 3,
         opponent_risk_weight: float = 0.55,
         discount: float = 0.92,
+        hu_pass_margin: float = 2.0,
         seed: int | None = None,
     ) -> None:
         self.simulations = max(50, int(simulations))
         self.horizon_own_draws = max(1, min(int(horizon_own_draws), 8))
         self.opponent_risk_weight = max(0.0, float(opponent_risk_weight))
         self.discount = min(max(float(discount), 0.1), 1.0)
+        # 能胡时，只有继续做牌的期望至少是“立即胡”的这么多倍才放弃胡牌。
+        # 未来收益的蒙特卡洛假设自己还能摸到后续几张，几乎不计对手先胡
+        # 终局（自己反而要赔分）的风险，天然偏乐观；实测曾为 +13% 放弃
+        # 3840 分的胡，随后对手胡牌。
+        self.hu_pass_margin = max(1.0, float(hu_pass_margin))
+        # 三家各自最多能付的分数（理论分单位）= min(场次每家封顶, 该家欢乐豆) / 底分。
+        # 胡牌时每家支付 min(理论分, 该家上限)；超过上限的牌型分毫无意义，
+        # 追大牌只会徒增被对手先胡的风险。None 表示未知、不封顶。
+        self.score_caps: tuple[float, ...] | None = None
         self.rng = random.Random(seed)
         self.opponent_model = OpponentPatternModel(samples=max(160, self.simulations // 2), seed=seed)
         self._inference_cache: dict[tuple[object, ...], object] = {}
         self._release_cache: dict[tuple[object, ...], object] = {}
         self._rollout_cache: dict[tuple[object, ...], float] = {}
+
+    def capped(self, score: float) -> float:
+        """按三家各自支付上限折算后的胡牌价值。
+
+        取三家实付的平均值，保持与未封顶时同一量纲（不封顶时恰好等于理论分），
+        以便继续和对手风险等其他按理论分计的项比较。
+        """
+        if not self.score_caps:
+            return float(score)
+        return sum(min(float(score), cap) for cap in self.score_caps) / len(self.score_caps)
 
     @staticmethod
     def _gold_key(gold_ranks: tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -233,7 +253,11 @@ class ExpectedValueEngine:
         opportunity_available: bool = False,
         time_budget_seconds: float | None = None,
     ) -> GameDecision:
-        """在摸牌堆和桌面亮牌之间做“自己收益 + 阻断对手”的联合决策。"""
+        """在摸牌堆和桌面亮牌之间做“自己收益 + 阻断对手”的联合决策。
+
+        手里有“?”选牌卡时照常摸牌：选牌卡要到出牌阶段选中并点“出牌”才会
+        弹出四选一，摸牌阶段点它只会把它抬起。
+        """
         end = (
             time.monotonic() + time_budget_seconds
             if time_budget_seconds is not None
@@ -254,7 +278,7 @@ class ExpectedValueEngine:
                 return hand_potential(hand8, gold_ranks) * 0.55
             hu = evaluate_hu(hand8, gold_ranks)
             if hu is not None:
-                return float(hu.theoretical_score)
+                return self.capped(hu.theoretical_score)
             # 非立即胡时使用结构潜力，量纲压到与中低倍成牌收益可比较。
             return hand_potential(hand8, gold_ranks) * 0.55
 
@@ -285,24 +309,48 @@ class ExpectedValueEngine:
             if best_total > deck_total:
                 card = visible_cards[best_index]
                 return GameDecision(
-                    "draw_opportunity" if opportunity_available else "draw_visible",
+                    "draw_visible",
                     visible_index=best_index,
                     reason=(
-                        ("先选择亮牌 " if opportunity_available else "取亮牌 ")
-                        + f"{card.label}：自己价值 {own:.1f}，"
+                        f"取亮牌 {card.label}：自己价值 {own:.1f}，"
                         f"同时阻断对手价值 {deny:.1f}；综合 {best_total:.1f} > "
                         f"摸牌堆 {deck_total:.1f}"
                     ),
                 )
 
         return GameDecision(
-            "draw_opportunity" if opportunity_available else "draw_deck",
+            "draw_deck",
             reason=(
-                ("先选择牌堆" if opportunity_available else "摸牌堆")
-                + f"，期望 {deck_own:.1f}，扣除亮牌留给对手的风险后 "
+                f"摸牌堆，期望 {deck_own:.1f}，扣除亮牌留给对手的风险后 "
                 f"综合 {deck_total:.1f}，仍优于当前亮牌"
             ),
         )
+
+    def choose_option_card(
+        self,
+        hand: list[Card],
+        options: list[Card],
+        gold_ranks: tuple[str, ...] | list[str],
+    ) -> tuple[int, float]:
+        """“请选择想要的牌”弹窗：按与摸牌相同的自身价值口径挑一张。
+
+        补入后满 8 张且能胡时取理论分，否则取结构潜力（与 choose_draw_action
+        的 self_value 一致）。返回（候选下标, 价值）。
+        """
+        if not options:
+            raise ValueError("选牌弹窗没有候选牌")
+
+        def value(card: Card) -> float:
+            cards = hand + [card]
+            if len(cards) == 8:
+                hu = evaluate_hu(cards, gold_ranks)
+                if hu is not None:
+                    return self.capped(hu.theoretical_score)
+            return hand_potential(cards, gold_ranks) * 0.55
+
+        scored = [(value(card), index) for index, card in enumerate(options)]
+        best_value, best_index = max(scored)
+        return best_index, best_value
 
     def choose_8_card_action(
         self,
@@ -338,12 +386,13 @@ class ExpectedValueEngine:
         table_risk = sum(item.expected_hu_score_next_draw for item in pattern_inference)
         immediate = evaluate_hu(hand, gold_ranks)
         if immediate is not None:
+            immediate_value = self.capped(immediate.theoretical_score)
             values.append(
                 ActionValue(
                     action="hu",
                     card_index=None,
-                    expected_value=float(immediate.theoretical_score),
-                    immediate_hu_value=float(immediate.theoretical_score),
+                    expected_value=immediate_value,
+                    immediate_hu_value=immediate_value,
                     future_hu_value=0.0,
                     opponent_risk=0.0,
                     reason=f"现在胡 {immediate.pattern}，理论分值 {immediate.theoretical_score}",
@@ -388,13 +437,18 @@ class ExpectedValueEngine:
             )
 
         best = max(values, key=lambda item: item.expected_value)
+        if immediate is not None and best.action != "hu":
+            hu_value = self.capped(immediate.theoretical_score)
+            if best.expected_value < hu_value * self.hu_pass_margin:
+                best = next(item for item in values if item.action == "hu")
         if best.action == "hu":
             assert immediate is not None
             return (
                 GameDecision(
                     "hu",
                     reason=(
-                        f"即时胡牌EV {best.expected_value:.1f} 高于继续做牌。"
+                        f"立即胡牌 {best.expected_value:.0f} 分（继续做牌期望须达到 "
+                        f"{self.hu_pass_margin:.1f} 倍才放弃）。"
                         f"{immediate.pattern} ×{immediate.pattern_multiplier}，"
                         f"金牌 {immediate.gold_count} 张 ×{immediate.gold_multiplier}"
                     ),
@@ -431,6 +485,7 @@ class ExpectedValueEngine:
             self.simulations,
             self.horizon_own_draws,
             self.discount,
+            self.score_caps,
         )
         cached = self._rollout_cache.get(cache_key)
         if cached is not None:
@@ -457,7 +512,7 @@ class ExpectedValueEngine:
                 if hu is not None:
                     best_value = max(
                         best_value,
-                        hu.theoretical_score * (self.discount ** depth),
+                        self.capped(hu.theoretical_score) * (self.discount ** depth),
                     )
                 # 即使当前能胡，也允许比较“继续做更大牌”的路线。
                 if depth + 1 < self.horizon_own_draws:

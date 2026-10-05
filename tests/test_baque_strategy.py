@@ -41,7 +41,7 @@ def test_draw_takes_visible_winning_card() -> None:
     assert decision.visible_index == 0
 
 
-def test_ev_question_card_selects_target_before_question_confirmation() -> None:
+def test_ev_question_card_in_hand_still_draws_normally() -> None:
     hand = [
         c("A", "H"),
         c("A", "D"),
@@ -61,5 +61,6 @@ def test_ev_question_card_selects_target_before_question_confirmation() -> None:
         opportunity_available=True,
     )
 
-    assert decision.action == "draw_opportunity"
+    # “?”选牌卡在出牌阶段才打出；摸牌阶段照常摸牌堆/取亮牌。
+    assert decision.action == "draw_deck"
     assert decision.visible_index is None

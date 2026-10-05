@@ -98,6 +98,7 @@ class BaquePlugin:
                 fast_vision_enabled=settings.game_fast_vision,
                 decision_mode=settings.game_decision_mode,
                 decision_reranker=decision_reranker,
+                win_cap_beans=settings.game_win_cap_beans,
             )
 
         observer: OpponentObserver | None = None

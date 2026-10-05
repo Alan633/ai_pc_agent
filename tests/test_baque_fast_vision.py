@@ -73,7 +73,8 @@ async def test_controller_start_page_does_not_call_qwen(tmp_path: Path) -> None:
     image_path = tmp_path / "start.png"
     image = _canvas()
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((400, 310, 600, 365), radius=24, fill=(255, 160, 28))
+    # 真开始页按钮位于水平正中、约 0.69 屏高（安全闸只放行这个位置）。
+    draw.rounded_rectangle((400, 387, 600, 442), radius=24, fill=(255, 160, 28))
     image.save(image_path)
 
     class NeverCallVision:

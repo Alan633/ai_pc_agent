@@ -131,6 +131,9 @@ class LocalDecisionReranker:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
+            # Qwen 默认先输出很长的隐藏推理（实测同类出牌问题约 7000 token、
+            # 110+ 秒），必然超时；重排只需要短 JSON。
+            "reasoning_effort": "none",
         }
         try:
             response = self.client.chat.completions.create(

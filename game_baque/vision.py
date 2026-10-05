@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import logging
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,9 @@ from typing import Any
 from openai import AsyncOpenAI
 from PIL import Image
 
+from game_baque.capture import find_action_buttons
 from game_baque.models import Card, GameSnapshot, OpponentEvent, Point, RANKS, ScreenType, SUITS
+from game_baque.rules import evaluate_hu
 
 
 LOCAL_VISION_SIZE = (1280, 720)
@@ -29,7 +32,7 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
 4. 普通牌点数只可能是 6、7、8、9、10、J、Q、K、A；花色 S/H/C/D 分别表示黑桃/红桃/梅花/方片。
 5. 每张手牌的 x/y 要放在“该牌自己可点击的暴露区域”中心，优先取牌面上方的点数/花色附近，避免落在被右侧牌遮住的区域。若手牌明显被抬高/高亮表示已选中，selected=true。
 6. visible_cards 只返回当前提示“请从牌堆或亮牌中选择一张牌”时，桌面上真正正面朝上且可选择的普通亮牌；对手手牌、历史弃牌不要放进去。
-7. opportunity_click 是当前玩家底部手牌区中、正面显示橙色“?”和骰子图案的“选牌”卡中心。它不是癞子、不是普通手牌，也不是中央牌堆旁较小的“?”预览。可见时必须返回；deck_click 是中央蓝色背面牌堆中心。使用选牌卡时必须先选择中央牌堆或亮牌，再点击这张底部“?”卡。
+7. opportunity_click 是当前玩家底部手牌区中、正面显示橙色“?”和骰子图案的“选牌”卡中心。它不是癞子、不是普通手牌，也不是中央牌堆旁较小的“?”预览。可见时必须返回；deck_click 是中央蓝色背面牌堆中心。选牌卡在出牌阶段选中并点击“出牌”后会弹出四选一。
 8. 识别按钮中心：开始游戏、换牌、出牌、胡牌、继续/再来一局。不可见时 visible=false。
 9. 若出现“豆子不足啦”、充值、钻石购买等弹窗，screen_type 必须为 recharge。不要把任何购买按钮当作 start_button 或 continue_button。
 10. screen_type：
@@ -105,6 +108,70 @@ table：中央长框内蓝色牌堆右侧正面朝上的亮牌，x 为其中心�
 deck_count：蓝色牌堆背面上的数字。
 hu_button：画面有“胡”按钮时返回 {"x":0,"y":0}（0-1000 坐标），否则 null。
 普通牌 rank 仅限 6/7/8/9/10/J/Q/K/A，suit 仅限 S/H/C/D；癞子 rank="WILD"、suit="NONE"。"""
+
+
+# 回合内的快速识别只看局部裁剪图，并用“点数+花色字母”的紧凑写法，输出 token
+# 远少于完整 JSON。实测（qwen3.5-9b）：手牌裁剪 0.5~1.2 秒、亮牌裁剪约 0.4 秒，
+# 完整回合提示词 5~6 秒；且手牌裁剪对花色的识别反而更准（10♠/10♣ 不再混淆）。
+# 一副牌每种两张，手里可能同时有两张一模一样的牌（实测 10♦ 两张）。旧写法
+# “每张只写一次”会让模型把重复牌去掉，出牌阶段永远只读到 7 张而卡住；
+# 现用“分别写两次”为主提示，张数不符时再用旧提示重读一次（各约 0.7 秒）。
+HAND_COMPACT_PROMPT = """只识别图中自己的手牌，只输出 JSON，不要解释。
+格式：{"hand":["WILD","AH","10S"]}
+从左到右逐张返回，牌互相遮挡也必须数全，两张一模一样的牌要分别写两次。每张写成 点数+花色字母：点数 6/7/8/9/10/J/Q/K/A，花色 S♠ H♥ C♣ D♦。
+写着“癞子”的牌写 "WILD"；橙色“?”加骰子的选牌卡写 "?"。牌被明显抬高时在后面加 "^"，如 "AH^"。"""
+
+HAND_COMPACT_FALLBACK_PROMPT = """只识别图中自己的手牌，只输出 JSON，不要解释。
+格式：{"hand":["WILD","AH","10S"]}
+从左到右逐张返回，牌互相遮挡也必须数全，每张只写一次。每张写成 点数+花色字母：点数 6/7/8/9/10/J/Q/K/A，花色 S♠ H♥ C♣ D♦。
+写着“癞子”的牌写 "WILD"；橙色“?”加骰子的选牌卡写 "?"。牌被明显抬高时在后面加 "^"，如 "AH^"。"""
+
+# 出牌/摸牌阶段手牌区应有的张数（含“?”选牌卡）。
+TURN_HAND_COUNTS = {"draw": 7, "discard": 8}
+# 牌角“30分/20分/10分”有时被抄进牌面，如 "A30H"、"J20S"。
+_CARD_TOKEN_RE = re.compile(r"^(10|[6-9JQKA])(?:10|20|30)?([SHCD])$")
+
+TABLE_COMPACT_PROMPT = """图中是牌桌中央：最左边是蓝色背面牌堆（上面有数字），右边依次是 4 个亮牌位，最右侧小“?”图标不是牌。只输出 JSON，不要解释。
+格式：{"deck":52,"slots":["","9D","",""]}
+deck：牌堆背面上的数字。slots：牌堆右边 4 个位置从左到右，空位写 ""，有正面牌写 点数+花色字母（点数 6/7/8/9/10/J/Q/K/A，花色 S♠ H♥ C♣ D♦）。牌上的“吃”只是提示。"""
+
+# 裁剪区域（相对窗口宽高）与放大倍数。
+HAND_CROP_BOX = (0.24, 0.74, 0.76, 1.0)
+TABLE_CROP_BOX = (0.355, 0.32, 0.67, 0.45)
+TABLE_CROP_SCALE = 2
+_SUIT_SYMBOLS = {"♠": "S", "♥": "H", "♣": "C", "♦": "D"}
+
+# 各场次胡一把每家输赢封顶（欢乐豆），三家分别计算。
+ROOM_WIN_CAPS: dict[str, float] = {
+    "新手": 20_000.0,
+    "普通": 300_000.0,
+    "高级": 3_000_000.0,
+    "顶级": 8_000_000.0,
+}
+
+# 本局信息：让模型只照抄裁剪出的文字，字段由代码解析。整图让模型直接填
+# 字段时会照抄提示里的示例值（把普通场读成“新手场、底分 10”）；裁剪照抄
+# 实测 10/10 正确（新手/普通/高级场、两种窗口尺寸），约 1.1 秒。
+TITLE_COPY_PROMPT = """照抄图中这一行文字，只输出 JSON：{"text":"..."}"""
+BEANS_COPY_PROMPT = """图中从上到下有三行，每行是一个欢乐豆数量（黄色豆子图标右边的数字，可能带“万”）。从上到下照抄，只输出 JSON：{"beans":["","",""]}"""
+TITLE_CROP_BOX = (0.33, 0.18, 0.67, 0.24)
+# 左、上、右三家欢乐豆所在区域。
+BEAN_CROP_BOXES = (
+    (0.015, 0.40, 0.11, 0.48),
+    (0.49, 0.09, 0.57, 0.145),
+    (0.905, 0.40, 0.995, 0.48),
+)
+
+LOCAL_CHOICE_PROMPT = """只识别腾讯欢乐斗地主“百变八雀”截图中央“请选择想要的牌”弹窗，只输出 JSON，不要解释。
+格式：{"options":[{"rank":"6","suit":"D","x":327}],"hand":[{"rank":"J","suit":"S"}]}
+options：弹窗里可选的牌，从左到右，x 为牌中心横坐标（0-1000）。牌下方的“吃”只是提示，不是牌。
+hand：屏幕底部自己的手牌，从左到右逐张返回。
+普通牌 rank 仅限 6/7/8/9/10/J/Q/K/A，suit 仅限 S/H/C/D；癞子 rank="WILD"、suit="NONE"。"""
+
+
+# “请选择想要的牌”弹窗：4 张候选时的固定牌位（0-1000，按 1936x1088 实图标定）。
+CHOICE_SLOTS: dict[int, tuple[int, ...]] = {4: (327, 441, 556, 671)}
+CHOICE_Y = 416
 
 
 # 回合专用识别的固定布局（0-1000 归一化，按 1936x1088 实图标定）。扇形手牌
@@ -331,22 +398,272 @@ class BaqueVision:
         )
         return self._scale_local_snapshot(snapshot, original_size)
 
-    async def parse_turn(self, image_path: Path, action_state: str) -> GameSnapshot:
+    async def parse_turn(
+        self,
+        image_path: Path,
+        action_state: str,
+        *,
+        gold_ranks: tuple[str, ...] = (),
+    ) -> GameSnapshot:
         """自己回合专用快速识别；阶段由本地像素门给出，模型只读牌面。
 
-        完整提示词需要模型输出全部按钮/坐标，本地 9B 模型单帧约 13 秒，
-        而一个回合倒计时只有约 20 秒。这里只让模型转录牌面，按钮和牌位
-        使用固定布局，显著缩短输出长度。
+        已知本局金牌时走局部裁剪快速路径（摸牌约 1.5 秒、出牌约 1 秒）；
+        否则走整图回合提示词（约 5 秒），顺带读出金牌。
         """
         if action_state == "swap":
             return await self.parse_swap(image_path)
         if not self._prefer_chat_completions:
             return await self.parse(image_path)
+        if len(gold_ranks) == 3:
+            snapshot = await self._parse_turn_crops(image_path, action_state, gold_ranks)
+            if not (
+                snapshot.screen_type == ScreenType.DISCARD
+                and len(snapshot.hand) == 8
+                and evaluate_hu(snapshot.hand, gold_ranks) is not None
+            ):
+                return snapshot
+            # 能胡时按钮布局变为 [出牌][胡]，按颜色形状直接定位，不必整图识别。
+            with Image.open(image_path) as image:
+                buttons = find_action_buttons(image)
+            if "hu" in buttons:
+                return replace(
+                    snapshot,
+                    screen_type=ScreenType.HU,
+                    hu_button=buttons["hu"],
+                    discard_button=buttons.get("discard", snapshot.discard_button),
+                )
+        return await self._parse_turn_full(image_path, action_state)
+
+    async def _parse_turn_crops(
+        self,
+        image_path: Path,
+        action_state: str,
+        gold_ranks: tuple[str, ...],
+    ) -> GameSnapshot:
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            original_size = image.size
+            hand_url = self._crop_data_url(image, HAND_CROP_BOX)
+            table_url = (
+                self._crop_data_url(image, TABLE_CROP_BOX, TABLE_CROP_SCALE)
+                if action_state == "draw"
+                else None
+            )
+        hand_items = self._compact_hand_items(
+            (await self._quick_json(HAND_COMPACT_PROMPT, hand_url, "手牌")).get("hand", [])
+        )
+        expected = TURN_HAND_COUNTS.get(action_state)
+        if expected is not None and len(hand_items) != expected:
+            retry_items = self._compact_hand_items(
+                (await self._quick_json(HAND_COMPACT_FALLBACK_PROMPT, hand_url, "手牌重读")).get("hand", [])
+            )
+            if len(retry_items) == expected:
+                hand_items = retry_items
+        payload: dict[str, Any] = {
+            "gold_ranks": list(gold_ranks),
+            "hand": hand_items,
+            "table": [],
+            "deck_count": -1,
+            "hu_button": None,
+        }
+        if table_url is not None:
+            table_payload = await self._quick_json(TABLE_COMPACT_PROMPT, table_url, "亮牌")
+            payload["deck_count"] = table_payload.get("deck", -1)
+            slots = table_payload.get("slots", [])
+            for slot_x, token in zip(TURN_TABLE_SLOTS, slots if isinstance(slots, list) else []):
+                card = self._parse_card_token(token)
+                if card is not None and card["rank"] != "?":
+                    payload["table"].append({**card, "x": slot_x})
+        return self._scale_local_snapshot(
+            self._turn_snapshot(payload, action_state),
+            original_size,
+        )
+
+    @staticmethod
+    def _crop_data_url(
+        image: Image.Image,
+        box: tuple[float, float, float, float],
+        scale: int = 1,
+    ) -> str:
+        width, height = image.size
+        crop = image.crop(
+            (
+                round(width * box[0]),
+                round(height * box[1]),
+                round(width * box[2]),
+                round(height * box[3]),
+            )
+        )
+        if scale != 1:
+            crop = crop.resize((crop.width * scale, crop.height * scale), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        crop.save(buffer, "JPEG", quality=90)
+        return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    @classmethod
+    def _parse_card_token(cls, token: Any) -> dict[str, Any] | None:
+        """解析 "10S"、"AH^"、"J D"、"WILD"、"?" 这类紧凑牌面写法。"""
+        text = "".join(str(token or "").split()).upper()
+        for symbol, letter in _SUIT_SYMBOLS.items():
+            text = text.replace(symbol, letter)
+        selected = text.endswith("^")
+        text = text.rstrip("^")
+        if not text:
+            return None
+        if text == "?":
+            return {"rank": "?", "suit": "NONE", "up": selected}
+        if cls._normalize_rank(text) == "WILD" or text in {"癞子", "赖子"}:
+            return {"rank": "WILD", "suit": "NONE", "up": selected}
+        match = _CARD_TOKEN_RE.match(text)
+        if match is None:
+            return None
+        return {"rank": match.group(1), "suit": match.group(2), "up": selected}
+
+    @classmethod
+    def _compact_hand_items(cls, tokens: Any) -> list[dict[str, Any]]:
+        items = []
+        for token in tokens if isinstance(tokens, list) else []:
+            card = cls._parse_card_token(token)
+            if card is not None:
+                items.append(card)
+        return items
+
+    async def _parse_turn_full(self, image_path: Path, action_state: str) -> GameSnapshot:
         current_url, original_size = self._local_data_url(image_path)
         payload = await self._quick_json(LOCAL_TURN_PROMPT, current_url, "回合")
         return self._scale_local_snapshot(
             self._turn_snapshot(payload, action_state),
             original_size,
+        )
+
+    async def parse_round_info(
+        self,
+        image_path: Path,
+    ) -> tuple[float | None, list[float], float | None]:
+        """读取本局底分、三家对手欢乐豆与场次封顶，返回（底分, 对手豆数列表, 场次封顶）。
+
+        实测座位偶尔左右/上下对调，但三个数和底分本身都正确；封顶只用合计。
+        """
+        if not self._prefer_chat_completions:
+            raise RuntimeError("本局信息识别仅支持本地视觉模型")
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            title_url = self._crop_data_url(image, TITLE_CROP_BOX)
+            beans_url = self._encode_jpeg(self._stack_crops(image, BEAN_CROP_BOXES))
+        title = str((await self._quick_json(TITLE_COPY_PROMPT, title_url, "场次底分")).get("text", ""))
+        raw_beans = (await self._quick_json(BEANS_COPY_PROMPT, beans_url, "对手欢乐豆")).get("beans", [])
+        balances = [
+            value
+            for value in (self._parse_beans(item) for item in (raw_beans if isinstance(raw_beans, list) else []))
+            if value is not None
+        ]
+        room_match = re.search(r"(新手|普通|高级|顶级)场", title)
+        room_cap = ROOM_WIN_CAPS.get(room_match.group(1)) if room_match else None
+        base_match = re.search(r"底分\D*(\d+)", title)
+        base = float(base_match.group(1)) if base_match else None
+        return (base if base and base > 0 else None), balances, room_cap
+
+    @classmethod
+    def _stack_crops(
+        cls,
+        image: Image.Image,
+        boxes: tuple[tuple[float, float, float, float], ...],
+    ) -> Image.Image:
+        """把多个小区域放大后自上而下拼成一张图，一次请求读完。"""
+        width, height = image.size
+        crops = []
+        for left, top, right, bottom in boxes:
+            crop = image.crop(
+                (round(width * left), round(height * top), round(width * right), round(height * bottom))
+            )
+            crops.append(crop.resize((crop.width * 2, crop.height * 2), Image.Resampling.LANCZOS))
+        gap = 20
+        canvas = Image.new(
+            "RGB",
+            (max(crop.width for crop in crops), sum(crop.height for crop in crops) + gap * (len(crops) - 1)),
+            (255, 255, 255),
+        )
+        y = 0
+        for crop in crops:
+            canvas.paste(crop, (0, y))
+            y += crop.height + gap
+        return canvas
+
+    @staticmethod
+    def _encode_jpeg(image: Image.Image) -> str:
+        buffer = io.BytesIO()
+        image.save(buffer, "JPEG", quality=92)
+        return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    @staticmethod
+    def _parse_beans(value: Any) -> float | None:
+        """解析 "2700"、"1.258万"、"10.04万"、10 这类豆数。"""
+        text = "".join(str(value if value is not None else "").split()).replace(",", "")
+        multiplier = 1.0
+        if text.endswith("万"):
+            multiplier, text = 10000.0, text[:-1]
+        elif text.endswith("亿"):
+            multiplier, text = 100000000.0, text[:-1]
+        try:
+            number = float(text) * multiplier
+        except ValueError:
+            return None
+        return number if number >= 0 else None
+
+    async def parse_choice(self, image_path: Path) -> tuple[list[Card], list[Card]]:
+        """识别“请选择想要的牌”弹窗，返回（候选牌, 手牌），坐标已换算为截图像素。"""
+        if not self._prefer_chat_completions:
+            raise RuntimeError("选牌弹窗快速识别仅支持本地视觉模型")
+        current_url, original_size = self._local_data_url(image_path)
+        payload = await self._quick_json(LOCAL_CHOICE_PROMPT, current_url, "选牌弹窗")
+        options, hand = self._choice_cards(payload)
+        scaled = self._scale_local_snapshot(
+            GameSnapshot(screen_type=ScreenType.DRAW, hand=hand, visible_cards=options),
+            original_size,
+        )
+        return scaled.visible_cards, scaled.hand
+
+    @classmethod
+    def _choice_cards(cls, payload: dict[str, Any]) -> tuple[list[Card], list[Card]]:
+        raw_options = payload.get("options", [])
+        items = (
+            [item for item in raw_options if isinstance(item, dict)]
+            if isinstance(raw_options, list)
+            else []
+        )
+        slots = CHOICE_SLOTS.get(len(items))
+        option_values = []
+        for index, item in enumerate(items):
+            rank = cls._normalize_rank(item.get("rank"))
+            try:
+                model_x = int(item.get("x", 0))
+            except (TypeError, ValueError):
+                model_x = 0
+            option_values.append(
+                {
+                    "rank": rank,
+                    "suit": item.get("suit"),
+                    "wild": rank == "WILD",
+                    "x": slots[index] if slots is not None else model_x,
+                    "y": CHOICE_Y,
+                    "confidence": 0.95,
+                }
+            )
+        raw_hand = payload.get("hand", [])
+        hand_values = []
+        for item in raw_hand if isinstance(raw_hand, list) else []:
+            if not isinstance(item, dict):
+                continue
+            rank = cls._normalize_rank(item.get("rank"))
+            if rank == "?":
+                continue
+            # 弹窗阶段只用手牌估值，不点击手牌，坐标无意义。
+            hand_values.append(
+                {"rank": rank, "suit": item.get("suit"), "wild": rank == "WILD", "confidence": 0.95}
+            )
+        return (
+            cls._to_cards(option_values, field_name="choice_options"),
+            cls._to_cards(hand_values, field_name="choice_hand"),
         )
 
     async def _quick_json(self, prompt: str, image_url: str, label: str) -> dict[str, Any]:

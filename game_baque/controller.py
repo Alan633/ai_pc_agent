@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 import time
 from collections import deque
 from threading import Event
 from dataclasses import dataclass
 from pathlib import Path
+
+from PIL import Image
 
 from agent.session import AgentSession
 from game_baque.capture import (
@@ -16,7 +19,11 @@ from game_baque.capture import (
     capture_game_window,
     capture_game_window_if_swap,
     click_screen_native,
+    capture_game_window,
+    current_action_buttons,
     current_game_action_state,
+    current_start_page_check,
+    is_start_page_button,
     focus_game_window,
     probe_game_turn,
 )
@@ -27,9 +34,18 @@ from game_baque.local_decision import LocalDecisionReranker
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
 from game_baque.strategy import choose_discard, choose_draw, choose_swap_two
 from game_baque.tracker import TableTracker
-from game_baque.vision import BaqueVision
+from game_baque.vision import (
+    TURN_DISCARD_BUTTON,
+    TURN_HAND_SLOTS,
+    TURN_HAND_Y,
+    BaqueVision,
+)
 
 LOGGER = logging.getLogger(__name__)
+
+# 一个回合（摸牌+出牌）共用约 20 秒倒计时；点击与操作前复核约需 2 秒。
+TURN_SECONDS = 20.0
+ACTION_MARGIN_SECONDS = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +59,14 @@ class GameStepResult:
 
 class StaleActionError(RuntimeError):
     """模型返回后画面已换回合，当前动作必须丢弃。"""
+
+
+_FOREGROUND_ERROR_MARKERS = ("前台窗口", "没有可用的前台窗口", "没有找到包含")
+
+
+def _is_foreground_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return any(marker in text for marker in _FOREGROUND_ERROR_MARKERS)
 
 
 class BaqueGameController:
@@ -61,6 +85,7 @@ class BaqueGameController:
         fast_vision_enabled: bool = True,
         decision_mode: str = "ev",
         decision_reranker: LocalDecisionReranker | None = None,
+        win_cap_beans: float = 0.0,
     ) -> None:
         self.vision = vision
         self.screenshots_dir = screenshots_dir
@@ -78,6 +103,18 @@ class BaqueGameController:
         self.decision_reranker = decision_reranker
         # 回合约 20 秒，识别占 4~6 秒；EV 决策必须在预算内给出结果。
         self.decision_budget_seconds = max(0.5, float(decision_budget_seconds))
+        # 单局输赢封顶手动覆盖（豆，0=按场次自动）；配合底分、对手豆数换算胡牌价值上限。
+        self.win_cap_beans = max(0.0, float(win_cap_beans))
+        self._round_info_attempts = 0
+        # 本回合首次探测到操作权的时刻；对手回合时清空。
+        self._turn_started_at: float | None = None
+        # 本回合尝试打出“?”选牌卡的次数，防止点击未生效时反复抬起/放下。
+        self._opportunity_attempts = 0
+        # 开局换牌阶段：选中两张后“换牌”按钮变橙，像素门会读成 discard，且最左侧
+        # 常是“?”选牌卡；此阶段绝不能去“打出选牌卡”。见到对手回合或摸牌后结束。
+        self._swap_phase_active = True
+        # 最近一次可靠读到的三张金牌；回合内快速识别直接复用，不再让模型重读。
+        self._last_gold_ranks: tuple[str, ...] = ()
         self.last_snapshot: GameSnapshot | None = None
         self.last_message = "尚未识别"
         self.action_count = 0
@@ -136,6 +173,7 @@ class BaqueGameController:
             and fast.screen_type == ScreenType.START
             and fast.start_button is not None
             and fast.confidence >= 0.72
+            and await self._start_page_ok(frame, fast.start_button, live=False)
         ):
             self.fast_ui_count += 1
             snapshot = GameSnapshot(
@@ -162,7 +200,11 @@ class BaqueGameController:
                 "八雀OpenCV命中 action=%s，Qwen只识别牌面",
                 fast.action_state,
             )
-            snapshot = await self.vision.parse_turn(frame.path, fast.action_state)
+            snapshot = await self.vision.parse_turn(
+                frame.path,
+                fast.action_state,
+                gold_ranks=self._last_gold_ranks,
+            )
             self._register_snapshot(frame, snapshot)
             return snapshot
 
@@ -220,17 +262,46 @@ class BaqueGameController:
         """
         deadline = time.monotonic() + idle_timeout_seconds
         while not stop_signal.is_set() and time.monotonic() < deadline:
+            probed_at = time.monotonic()
             probe = await asyncio.to_thread(
                 probe_game_turn,
                 self.screenshots_dir,
                 self.window_title_keyword,
             )
+            if probe.action_state is None:
+                if probe.round_in_progress:
+                    self._turn_started_at = None
+                    self._opportunity_attempts = 0
+                    self._swap_phase_active = False
+                    if self._round_info_attempts < 2:
+                        # 对手回合空闲时读一次底分与对手豆数（约 1 秒），不占自己回合。
+                        await self._read_round_info()
+                        continue
+            elif self._turn_started_at is None:
+                self._turn_started_at = probed_at
+            if probe.action_state == "swap":
+                self._swap_phase_active = True
+            elif probe.action_state == "draw":
+                self._swap_phase_active = False
+            if (
+                probe.frame is not None
+                and probe.opportunity_card
+                and not self._swap_phase_active
+                and self._opportunity_attempts < 2
+            ):
+                # 出牌阶段手里有“?”选牌卡：先打出它换取四选一，再正常出牌。
+                await self._play_opportunity_card(probe.frame)
+                continue
+            if probe.frame is not None and probe.action_state == "choose":
+                await self._handle_choice_popup(probe.frame)
+                continue
             if probe.frame is not None and probe.action_state is not None:
                 started_at = time.monotonic()
                 try:
                     snapshot = await self.vision.parse_turn(
                         probe.frame.path,
                         probe.action_state,
+                        gold_ranks=self._last_gold_ranks,
                     )
                 except (RuntimeError, ValueError) as exc:
                     # 单帧 JSON 损坏/空回复不应结束整局，回合内继续重探。
@@ -248,6 +319,176 @@ class BaqueGameController:
                 return None
             await asyncio.sleep(0.25)
         return None
+
+    async def _read_round_info(self) -> None:
+        self._round_info_attempts += 1
+        try:
+            frame = await asyncio.to_thread(
+                capture_game_window,
+                self.screenshots_dir,
+                self.window_title_keyword,
+            )
+            base, balances, room_cap = await self.vision.parse_round_info(frame.path)
+        except (RuntimeError, ValueError, AttributeError) as exc:
+            LOGGER.warning("八雀本局信息识别失败：%s", exc)
+            return
+        self._apply_payout_cap(base, balances, room_cap)
+        self._round_info_attempts = 2
+
+    def _apply_payout_cap(
+        self,
+        base: float | None,
+        balances: list[float],
+        room_cap: float | None = None,
+    ) -> None:
+        """每家最多支付 min(场次每家封顶, 该家欢乐豆)；换算为理论分（÷ 底分）。
+
+        封顶按每一家分别计算：新手场每家最多 2 万，三家合计最多 6 万。
+        """
+        per_seat_cap = self.win_cap_beans if self.win_cap_beans > 0 else room_cap
+        seats: list[float | None] = list(balances[:3]) + [None] * (3 - min(3, len(balances)))
+        seat_caps: list[float] = []
+        for balance in seats:
+            candidates = [value for value in (per_seat_cap, balance) if value is not None]
+            # 某家豆数没读到时，只能按场次封顶估计；两者都未知则该家不封顶。
+            seat_caps.append(min(candidates) if candidates else math.inf)
+        if base is None or all(math.isinf(cap) for cap in seat_caps):
+            self.ev.score_caps = None
+            LOGGER.info("八雀本局封顶未知：底分=%s 对手豆=%s，按不封顶计算", base, balances)
+            return
+        self.ev.score_caps = tuple(max(1.0, cap / base) for cap in seat_caps)
+        finite = [cap for cap in seat_caps if not math.isinf(cap)]
+        LOGGER.info(
+            "八雀本局封顶：底分 %s，每家封顶 %s 豆，对手豆 %s → 三家最多各付 %s 豆，合计最多赢 %s 豆",
+            base,
+            per_seat_cap or "未知",
+            balances,
+            [round(cap) if not math.isinf(cap) else "不限" for cap in seat_caps],
+            round(sum(finite)) if len(finite) == 3 else "不限",
+        )
+
+    def _turn_deadline(self) -> float | None:
+        """本回合最晚应完成决策的时刻（已扣除点击余量）；未知时返回 None。"""
+        if self._turn_started_at is None:
+            return None
+        return self._turn_started_at + TURN_SECONDS - ACTION_MARGIN_SECONDS
+
+    async def _play_opportunity_card(self, frame: CapturedFrame) -> None:
+        """选中最左侧“?”选牌卡并点击“出牌”，随后游戏弹出“请选择想要的牌”。"""
+        self._opportunity_attempts += 1
+
+        def to_frame(point: Point) -> Point:
+            return Point(
+                round(point.x * frame.width / 1000),
+                round(point.y * frame.height / 1000),
+            )
+
+        # 选牌卡总在最左侧；出牌阶段为 8 张布局。
+        card_point = to_frame(Point(TURN_HAND_SLOTS[8][0], TURN_HAND_Y))
+        discard_point = to_frame(TURN_DISCARD_BUTTON)
+        try:
+            await self._require_action_state("discard")
+            await self._click(frame, card_point)
+            await asyncio.sleep(0.30)
+            discard_point = await self._require_discard_button()
+            await self._click(frame, discard_point)
+        except StaleActionError as exc:
+            LOGGER.warning("八雀打出选牌卡已过期：%s", exc)
+            return
+        self.action_count += 1
+        self._last_action_at = time.monotonic()
+        LOGGER.info(
+            "八雀出牌阶段：打出“?”选牌卡 card=(%s,%s) discard=(%s,%s) attempt=%s",
+            card_point.x,
+            card_point.y,
+            discard_point.x,
+            discard_point.y,
+            self._opportunity_attempts,
+        )
+        # 等待“请选择想要的牌”弹窗出现。
+        await asyncio.sleep(0.6)
+
+    async def _handle_choice_popup(self, frame: CapturedFrame) -> None:
+        """使用“?”选牌卡后会弹出“请选择想要的牌”，必须在倒计时内点选一张。"""
+        started_at = time.monotonic()
+        try:
+            options, hand = await self.vision.parse_choice(frame.path)
+        except (RuntimeError, ValueError) as exc:
+            LOGGER.warning("八雀选牌弹窗识别失败，重新探测：%s", exc)
+            return
+        if not options:
+            LOGGER.warning("八雀选牌弹窗未识别到候选牌，重新探测")
+            return
+        # 开局 ?+6 张时记牌器尚未建立，金牌退回用最近一帧识别结果。
+        gold_ranks = self._round_gold_ranks or (
+            self.last_snapshot.gold_ranks if self.last_snapshot is not None else ()
+        )
+        index, value = self.ev.choose_option_card(hand, options, gold_ranks)  # 已按封顶计价
+        card = options[index]
+        if card.x is None or card.y is None or not (
+            0 <= card.x < frame.width and 0 <= card.y < frame.height
+        ):
+            LOGGER.warning("八雀选牌弹窗候选坐标异常：%s (%s,%s)", card.label, card.x, card.y)
+            return
+        await self._click(frame, Point(card.x, card.y))
+        self.action_count += 1
+        self._last_action_at = time.monotonic()
+        if self._tracker_started and len(options) == 4:
+            try:
+                # 未选中的三张按原顺序回到牌堆顶，之后摸牌时可确知。
+                self.tracker.record_opportunity_reveal("self", options, index)
+            except (ValueError, IndexError) as exc:
+                LOGGER.warning("八雀选牌结果写入记牌器失败：%s", exc)
+        LOGGER.info(
+            "八雀选牌弹窗：选择 %s（价值 %.1f）候选=%s 手牌=%s duration=%.2fs",
+            card.label,
+            value,
+            [option.label for option in options],
+            [item.label for item in hand],
+            time.monotonic() - started_at,
+        )
+        # 等弹窗关闭、牌进入手牌后再继续探测出牌阶段。
+        await asyncio.sleep(0.6)
+
+    async def _start_page_ok(
+        self,
+        frame: CapturedFrame,
+        point: Point,
+        *,
+        live: bool = True,
+    ) -> bool:
+        """点击“开始游戏”前的安全闸：识别所用截图与（可选）即时画面都必须像开始页。"""
+        try:
+            with Image.open(frame.path) as image:
+                frame_ok = is_start_page_button(image.convert("RGB"), point)
+        except OSError:
+            frame_ok = False
+        live_ok = True
+        if frame_ok and live:
+            try:
+                live_ok = await asyncio.to_thread(
+                    current_start_page_check,
+                    self.window_title_keyword,
+                    point,
+                )
+            except RuntimeError:
+                live_ok = False
+        if not (frame_ok and live_ok):
+            LOGGER.warning(
+                "拒绝点击疑似“开始游戏”按钮 (%s,%s)：不像开始页（可能是购买/充值弹窗或牌局中的按钮）",
+                point.x,
+                point.y,
+            )
+            return False
+        return True
+
+    async def _refocus_game(self) -> None:
+        """微信消息弹窗等会抢走前台；重新切回游戏，失败只记录不中断。"""
+        try:
+            await asyncio.to_thread(focus_game_window, self.window_title_keyword)
+        except Exception as exc:  # pywinauto 在窗口切换中可能抛出多种异常
+            LOGGER.warning("重新切回游戏窗口失败：%s", exc)
+        await asyncio.sleep(0.30)
 
     async def _wait_for_swap_frame(self, timeout_seconds: float = 25.0) -> CapturedFrame | None:
         deadline = time.monotonic() + max(1.0, timeout_seconds)
@@ -277,6 +518,19 @@ class BaqueGameController:
         self.step_count += 1
         frame, snapshot = prefetched if prefetched is not None else await self.inspect()
 
+        if (
+            snapshot.screen_type == ScreenType.START
+            and self._turn_started_at is not None
+            and time.monotonic() - self._turn_started_at < TURN_SECONDS + 5
+        ):
+            # 回合进行中不可能出现开始页；OpenCV 曾把“出牌”按钮误判为“开始游戏”。
+            return GameStepResult(
+                False,
+                "回合进行中，忽略疑似“开始游戏”按钮（多半是出牌按钮）。",
+                snapshot,
+                frame,
+            )
+
         if snapshot.screen_type == ScreenType.START:
             if snapshot.start_button is None:
                 return GameStepResult(
@@ -286,6 +540,13 @@ class BaqueGameController:
                     frame,
                 )
             if execute:
+                if not await self._start_page_ok(frame, snapshot.start_button):
+                    return GameStepResult(
+                        False,
+                        "疑似“开始游戏”按钮未通过安全校验（可能是购买弹窗），未点击。",
+                        snapshot,
+                        frame,
+                    )
                 await self._click(frame, snapshot.start_button)
                 self.action_count += 1
                 self._last_action_at = time.monotonic()
@@ -369,7 +630,12 @@ class BaqueGameController:
         # 决策使用当前 TableTracker 的深拷贝，避免后台观察器在计算过程中修改同一牌池。
         tracker_snapshot = copy.deepcopy(self.tracker)
         started_at = time.monotonic()
-        decision = await asyncio.to_thread(self._decide, snapshot, tracker_snapshot)
+        decision = await asyncio.to_thread(
+            self._decide,
+            snapshot,
+            tracker_snapshot,
+            self._turn_deadline(),
+        )
         LOGGER.info(
             "八雀决策完成 state=%s action=%s duration=%.2fs",
             snapshot.screen_type.value,
@@ -395,6 +661,7 @@ class BaqueGameController:
         或后续 7/8 张手牌
         和 3 个金牌的正式牌局后才返回，随后插件再启动三家观察器。
         """
+        self._swap_phase_active = True
         await asyncio.to_thread(focus_game_window, self.window_title_keyword)
         # Windows 前台切换存在极短的异步窗口，给系统一点时间完成激活。
         await asyncio.sleep(0.30)
@@ -403,6 +670,7 @@ class BaqueGameController:
         deadline = time.monotonic() + max(5.0, float(timeout_seconds))
         start_click_attempts = 0
         last_start_click_at = 0.0
+        focus_retries = 0
         prefetched: tuple[CapturedFrame, GameSnapshot] | None = None
         while time.monotonic() < deadline:
             # 自动启动只关心当前处于开始、匹配、发牌还是正式牌局；历史帧和
@@ -411,7 +679,20 @@ class BaqueGameController:
                 frame, snapshot = prefetched
                 prefetched = None
             else:
-                frame, snapshot = await self.inspect(include_previous=False)
+                try:
+                    frame, snapshot = await self.inspect(include_previous=False)
+                except RuntimeError as exc:
+                    # 切到游戏后，微信等窗口可能立刻又抢回前台。
+                    if not _is_foreground_error(exc) or focus_retries >= 5:
+                        raise
+                    focus_retries += 1
+                    LOGGER.warning(
+                        "八雀启动流程：游戏窗口不在前台，重新切回 attempt=%s：%s",
+                        focus_retries,
+                        exc,
+                    )
+                    await self._refocus_game()
+                    continue
 
             if snapshot.screen_type == ScreenType.RECHARGE:
                 raise RuntimeError("检测到豆子不足/充值/购买界面，自动游戏不会继续。")
@@ -449,6 +730,9 @@ class BaqueGameController:
                 now = time.monotonic()
                 if start_click_attempts < 3 and now - last_start_click_at >= 3.0:
                     assert start_button is not None
+                    if not await self._start_page_ok(frame, start_button):
+                        await asyncio.sleep(0.8)
+                        continue
                     await self._click(frame, start_button)
                     self.action_count += 1
                     self._last_action_at = now
@@ -585,17 +869,14 @@ class BaqueGameController:
                         break
                     result = await self.step(execute=True, prefetched=prefetched)
                 except RuntimeError as exc:
-                    text = str(exc)
-                    if any(
-                        marker in text
-                        for marker in (
-                            "前台窗口",
-                            "没有可用的前台窗口",
-                            "没有找到包含",
-                        )
-                    ):
-                        LOGGER.warning("游戏窗口暂不可用，本轮等待后重试：%s", exc)
-                        await asyncio.sleep(self.action_interval_seconds)
+                    if _is_foreground_error(exc):
+                        # 回合倒计时很短，被其他窗口抢走前台时立即切回，而不是
+                        # 干等用户手动切换（与操作前复核 _current_action_state 一致）。
+                        LOGGER.warning("游戏窗口不在前台，重新切回后重试：%s", exc)
+                        await self._refocus_game()
+                        if "没有找到包含" in str(exc):
+                            # 游戏窗口根本不存在时不要高频空转。
+                            await asyncio.sleep(self.action_interval_seconds)
                         continue
                     raise
                 self.last_message = result.message
@@ -669,8 +950,14 @@ class BaqueGameController:
         self,
         snapshot: GameSnapshot,
         tracker: TableTracker | None = None,
+        deadline: float | None = None,
     ) -> GameDecision:
+        """deadline 为本回合最晚决策时刻（time.monotonic）；EV 预算与是否调用
+        本地重排模型都以它为上限，保证在倒计时结束前点出动作。"""
         tracker = tracker or self.tracker
+        budget = self.decision_budget_seconds
+        if deadline is not None:
+            budget = min(budget, max(0.5, deadline - time.monotonic()))
 
         if snapshot.screen_type == ScreenType.SWAP:
             self.last_decision_source = "rule"
@@ -697,7 +984,7 @@ class BaqueGameController:
                 snapshot.gold_ranks,
                 tracker,
                 opportunity_available=snapshot.opportunity_click is not None,
-                time_budget_seconds=self.decision_budget_seconds,
+                time_budget_seconds=budget,
             )
 
         if snapshot.screen_type in {ScreenType.DISCARD, ScreenType.HU}:
@@ -705,7 +992,7 @@ class BaqueGameController:
                 snapshot.hand,
                 snapshot.gold_ranks,
                 tracker,
-                time_budget_seconds=self.decision_budget_seconds,
+                time_budget_seconds=budget,
             )
             LOGGER.info(
                 "八雀EV候选 %s",
@@ -727,7 +1014,25 @@ class BaqueGameController:
                 ],
             )
 
-            if self.decision_mode == "hybrid" and self.decision_reranker is not None:
+            time_left = None if deadline is None else deadline - time.monotonic()
+            if decision.action == "hu":
+                # 确定能胡且 EV 选择胡牌时直接胡，不再让本地模型重排。
+                self.last_decision_source = "ev"
+            elif (
+                self.decision_mode == "hybrid"
+                and self.decision_reranker is not None
+                and time_left is not None
+                and time_left < self.decision_reranker.timeout_seconds
+            ):
+                # 本地模型最坏要等满超时；剩余时间不够时直接用 EV，不能拿回合冒险。
+                self.hybrid_fallback_count += 1
+                self.last_decision_source = "hybrid_ev_fallback"
+                LOGGER.info(
+                    "八雀HYBRID跳过本地模型：回合剩余 %.1fs < 模型超时 %.1fs，沿用Python EV",
+                    time_left,
+                    self.decision_reranker.timeout_seconds,
+                )
+            elif self.decision_mode == "hybrid" and self.decision_reranker is not None:
                 hybrid = self.decision_reranker.rerank_8_card_action(
                     hand=snapshot.hand,
                     gold_ranks=snapshot.gold_ranks,
@@ -817,45 +1122,23 @@ class BaqueGameController:
                 raise RuntimeError("draw_visible 缺少 visible_index")
             card = snapshot.visible_cards[decision.visible_index]
             await self._click_card(frame, card)
-            self.tracker.record_own_take_visible(card)
+            self._record(self.tracker.record_own_take_visible, card)
             return decision.reason + "；已取亮牌。"
-
-        if decision.action == "draw_opportunity":
-            await self._require_action_state("draw")
-            if snapshot.opportunity_click is None:
-                raise RuntimeError("决策使用问号选牌，但未识别到手中问号牌坐标")
-            if decision.visible_index is not None:
-                if not 0 <= decision.visible_index < len(snapshot.visible_cards):
-                    raise RuntimeError("问号选牌的亮牌索引超出范围")
-                target = snapshot.visible_cards[decision.visible_index]
-                await self._click_card(frame, target)
-            else:
-                if snapshot.deck_click is None:
-                    raise RuntimeError("问号选牌选择牌堆，但未识别到牌堆坐标")
-                await self._click(frame, snapshot.deck_click)
-            # 问号牌是对中央目标的确认，不是第一步入口。等选中动画结束后
-            # 再确认仍有操作权，避免用旧截图坐标误点下一回合。
-            await asyncio.sleep(0.30)
-            await self._require_action_state("draw")
-            await self._click(frame, snapshot.opportunity_click)
-            if decision.visible_index is not None:
-                self.tracker.record_own_take_visible(
-                    snapshot.visible_cards[decision.visible_index]
-                )
-            else:
-                self.tracker.record_own_draw_deck()
-            return decision.reason + "；已按候选牌→问号牌顺序完成选牌。"
 
         if decision.action == "draw_deck":
             await self._require_action_state("draw")
             if snapshot.deck_click is None:
                 raise RuntimeError("未识别到牌堆点击位置")
             await self._click(frame, snapshot.deck_click)
-            self.tracker.record_own_draw_deck()
+            self._record(self.tracker.record_own_draw_deck)
             return decision.reason + "；已摸牌堆。"
 
         if decision.action == "hu":
             await self._require_action_state("discard")
+            live_hu = (await self._read_action_buttons()).get("hu")
+            if live_hu is not None:
+                await self._click(frame, live_hu)
+                return decision.reason + "；已点击胡牌。"
             if snapshot.hu_button is None:
                 raise RuntimeError(
                     f"规则引擎判断已胡（{decision.hu.pattern if decision.hu else '未知'}），"
@@ -878,10 +1161,11 @@ class BaqueGameController:
                 await self._click_card(frame, desired)
                 await asyncio.sleep(0.30)
             # 选牌后再次读取即时画面。若倒计时已过或轮到对手，绝不能继续
-            # 用旧截图里的“出牌”按钮坐标点击。
-            await self._require_action_state("discard")
-            await self._click(frame, snapshot.discard_button)
-            self.tracker.record_own_discard(desired)
+            # 用旧截图里的“出牌”按钮坐标点击。选牌后蓝色横幅会消失，
+            # 这里只能看“出牌”按钮是否还在。
+            discard_point = await self._require_discard_button()
+            await self._click(frame, discard_point)
+            self._record(self.tracker.record_own_discard, desired)
             return decision.reason + "；已出牌。"
 
         raise RuntimeError(f"未知游戏动作：{decision.action}")
@@ -902,6 +1186,37 @@ class BaqueGameController:
                 await asyncio.to_thread(focus_game_window, self.window_title_keyword)
                 await asyncio.sleep(0.15)
         return None
+
+    async def _read_action_buttons(self) -> dict[str, Point]:
+        for attempt in range(2):
+            try:
+                return await asyncio.to_thread(current_action_buttons, self.window_title_keyword)
+            except RuntimeError as exc:
+                LOGGER.warning(
+                    "读取操作按钮失败，尝试重新聚焦 attempt=%s error=%s",
+                    attempt + 1,
+                    exc,
+                )
+                await asyncio.to_thread(focus_game_window, self.window_title_keyword)
+                await asyncio.sleep(0.15)
+        return {}
+
+    async def _require_discard_button(self) -> Point:
+        """确认“出牌”按钮仍在并返回其即时位置（能胡时它会左移）。"""
+        point = (await self._read_action_buttons()).get("discard")
+        if point is None:
+            # 保存当时画面，便于排查是回合真结束还是出现了新的界面元素。
+            try:
+                frame = await asyncio.to_thread(
+                    capture_game_window,
+                    self.screenshots_dir,
+                    self.window_title_keyword,
+                )
+                LOGGER.warning("八雀出牌按钮复核失败，现场截图：%s", frame.path)
+            except RuntimeError:
+                pass
+            raise StaleActionError("选牌后复核失败：“出牌”按钮已消失，回合已结束，已取消点击。")
+        return point
 
     async def _require_action_state(self, expected: str) -> None:
         actual = await self._current_action_state()
@@ -1030,6 +1345,30 @@ class BaqueGameController:
             )
 
     def _sync_tracker(self, snapshot: GameSnapshot) -> None:
+        if len(snapshot.gold_ranks) == 3:
+            self._last_gold_ranks = tuple(snapshot.gold_ranks)
+        try:
+            self._sync_tracker_unchecked(snapshot)
+        except (RuntimeError, ValueError) as exc:
+            # 视觉偶尔认错花色（如 10♠→10♣）会让记牌计数为负。不能因此终止
+            # 整局自动游戏：以当前手牌重建记牌状态后继续。
+            LOGGER.warning("八雀记牌状态冲突，按当前手牌重建：%s", exc)
+            if len(snapshot.hand) in {7, 8}:
+                try:
+                    self.tracker.reset_round(snapshot.hand, snapshot.deck_count)
+                    self._tracker_started = True
+                except (RuntimeError, ValueError) as reset_exc:
+                    LOGGER.warning("八雀记牌重建失败，暂停记牌：%s", reset_exc)
+                    self._tracker_started = False
+
+    def _record(self, action: object, *args: object) -> None:
+        """自己动作写入记牌器；记牌冲突只记录，不能让已完成的点击变成异常。"""
+        try:
+            action(*args)  # type: ignore[operator]
+        except (RuntimeError, ValueError) as exc:
+            LOGGER.warning("八雀记牌写入失败（动作已执行）：%s", exc)
+
+    def _sync_tracker_unchecked(self, snapshot: GameSnapshot) -> None:
         if len(snapshot.gold_ranks) != 3 or len(snapshot.hand) not in {7, 8}:
             return
         new_gold = tuple(snapshot.gold_ranks)
@@ -1051,6 +1390,7 @@ class BaqueGameController:
             self._observation_dedupe.clear()
             self._observer_recent_events.clear()
             self.opponent_event_count = 0
+            self._round_info_attempts = 0
             LOGGER.info("建立新一局记牌状态 gold=%s deck=%s", new_gold, snapshot.deck_count)
             return
         self.tracker.update_own_hand(snapshot.hand)

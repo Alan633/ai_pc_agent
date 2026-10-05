@@ -4,7 +4,46 @@ import asyncio
 import ctypes
 import logging
 import os
+import subprocess
+import sys
 from ctypes import wintypes
+
+
+def _relaunch_as_admin_if_needed() -> None:
+    """以管理员身份运行本程序。
+
+    游戏若以管理员权限运行，非管理员进程发出的模拟点击会被 Windows（UIPI）
+    拦截。非管理员启动时弹出 UAC，用同一个 Python 以管理员身份重新运行本脚本，
+    当前进程退出。设置环境变量 AGENT_NO_ELEVATE=1 可跳过（例如 PyCharm 调试）；
+    用户取消 UAC 时以普通权限继续运行。
+    """
+    if os.name != "nt" or os.environ.get("AGENT_NO_ELEVATE") == "1":
+        return
+    try:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return
+    except OSError:
+        return
+    script = os.path.abspath(sys.argv[0])
+    # 提权后的新进程不会继承当前进程的环境变量（如 start.bat 设置的
+    # PYTHONUTF8），用 -X utf8 保证中文日志输出正常。
+    params = subprocess.list2cmdline(["-X", "utf8", script, *sys.argv[1:]])
+    result = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        sys.executable,
+        params,
+        os.path.dirname(script),
+        1,
+    )
+    if result > 32:
+        sys.exit(0)
+    print("[WARN] 未获得管理员权限（UAC 已取消），以普通权限继续运行；若游戏以管理员身份运行，模拟点击可能无效。")
+
+
+if __name__ == "__main__":
+    # 必须在启动 Telegram、热键等任何资源之前完成，避免普通权限进程先占用。
+    _relaunch_as_admin_if_needed()
 
 # 必须在任何会间接导入 PyAutoGUI 的模块之前启用 DPI Awareness，
 # 否则高缩放 Windows 上截图像素与点击坐标可能不一致。

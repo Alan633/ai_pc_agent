@@ -39,6 +39,9 @@ class Settings:
     game_decision_top_n: int = 4
     game_decision_min_confidence: float = 0.55
     game_hybrid_max_ev_drop: float = 18.0
+    # 胡一把每家输赢封顶（欢乐豆）手动覆盖；0 表示按识别到的场次自动选择
+    # （每家：新手场 2 万、普通场 30 万、高级场 300 万、顶级场 800 万；三家分别计算）。
+    game_win_cap_beans: float = 0.0
 
     @property
     def logs_dir(self) -> Path:
@@ -134,6 +137,7 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_vision_base_url=game_vision_base_url,
         game_min_event_confidence=event_confidence,
         game_fast_vision=_env_bool("GAME_FAST_VISION", "true"),
+        game_win_cap_beans=max(float(os.getenv("GAME_WIN_CAP_BEANS", "0")), 0.0),
         game_decision_mode=decision_mode,
         game_decision_model=decision_model,
         game_decision_base_url=decision_base_url,

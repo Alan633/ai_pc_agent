@@ -9,6 +9,7 @@ from typing import Any
 
 import psutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import NetworkError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from agent.executor import AgentExecutor
@@ -582,7 +583,11 @@ class TelegramHandlers:
             return
         task = context.application.create_task(self._run_agent(update, text), update=update)
         self.session.begin(task, text[:200])
-        await update.effective_message.reply_text("已收到，开始执行。需要高风险操作时我会再次确认。")
+        try:
+            await update.effective_message.reply_text("已收到，开始执行。需要高风险操作时我会再次确认。")
+        except NetworkError as exc:
+            # 任务已在后台执行；回执只是提示，网络抖动时不应刷出整段异常栈。
+            LOGGER.warning("Telegram 回执发送失败，任务仍在执行：%s", exc)
 
     async def _run_agent(self, update: Update, text: str) -> None:
         user_id = update.effective_user.id
