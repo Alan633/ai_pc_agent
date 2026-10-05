@@ -11,6 +11,7 @@ from agent.session import AgentSession
 from agent.tool_registry import ToolRegistry, ToolSpec
 from config import Settings
 from game_balatro.controller import BalatroController
+from game_balatro.local_strategy import BalatroLocalStrategist
 from game_balatro.solver import BalatroSolver
 from game_balatro.vision import BalatroVision
 
@@ -60,6 +61,19 @@ class BalatroPlugin:
             settings.openai_api_key
             or settings.balatro_vision_base_url
         ):
+            strategist: BalatroLocalStrategist | None = None
+            if (
+                settings.balatro_decision_mode == "hybrid"
+                and settings.balatro_decision_base_url
+            ):
+                strategist = BalatroLocalStrategist(
+                    base_url=settings.balatro_decision_base_url,
+                    model=settings.balatro_decision_model,
+                    api_key=settings.openai_api_key,
+                    timeout_seconds=settings.balatro_decision_timeout_seconds,
+                    top_n=settings.balatro_decision_top_n,
+                    min_confidence=settings.balatro_decision_min_confidence,
+                )
             game = BalatroController(
                 vision=BalatroVision(
                     settings.openai_api_key,
@@ -71,6 +85,8 @@ class BalatroPlugin:
                         settings.balatro_reserve_money
                     )
                 ),
+                strategist=strategist,
+                decision_mode=settings.balatro_decision_mode,
                 screenshots_dir=(
                     settings.screenshots_dir
                 ),
@@ -130,8 +146,8 @@ class BalatroPlugin:
         add(
             "balatro_get_state",
             "读取 Steam《小丑牌/Balatro》当前页面、"
-            "手牌、Joker、Blind、商店和 Python Solver "
-            "决策预览，不点击。",
+            "手牌、Joker、Blind、商店和 Python Solver + 本地 Qwen "
+            "混合决策预览，不点击。",
             self.tool_get_state,
         )
         add(
@@ -248,7 +264,7 @@ class BalatroPlugin:
             "running": True,
             "message": (
                 "Balatro 自动游戏启动中：将先聚焦游戏窗口，"
-                "再进入视觉识别 + Python Solver 闭环。"
+                "再进入视觉识别 + Python候选 + 本地Qwen策略重排闭环。"
             ),
         }
 
