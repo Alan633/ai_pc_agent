@@ -49,6 +49,12 @@ class Settings:
     balatro_action_interval_seconds: float = 1.2
     balatro_auto_next_run: bool = False
     balatro_reserve_money: int = 5
+    balatro_decision_mode: str = "hybrid"
+    balatro_decision_model: str = ""
+    balatro_decision_base_url: str = ""
+    balatro_decision_timeout_seconds: float = 6.0
+    balatro_decision_top_n: int = 6
+    balatro_decision_min_confidence: float = 0.55
 
     @property
     def logs_dir(self) -> Path:
@@ -120,6 +126,15 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         raise ValueError("GAME_DECISION_MODE 必须是 rule、ev 或 hybrid")
     decision_base_url = os.getenv("GAME_DECISION_BASE_URL", openai_base_url).strip().rstrip("/")
     decision_model = os.getenv("GAME_DECISION_MODEL", openai_model).strip()
+    balatro_decision_mode = os.getenv("BALATRO_DECISION_MODE", "hybrid").strip().lower()
+    if balatro_decision_mode not in {"python", "hybrid"}:
+        raise ValueError("BALATRO_DECISION_MODE 必须是 python 或 hybrid")
+    balatro_decision_base_url = os.getenv(
+        "BALATRO_DECISION_BASE_URL", openai_base_url
+    ).strip().rstrip("/")
+    balatro_decision_model = os.getenv(
+        "BALATRO_DECISION_MODEL", openai_model
+    ).strip()
     settings = Settings(
         base_dir=root,
         telegram_bot_token=token,
@@ -172,6 +187,19 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         balatro_auto_next_run=_env_bool("BALATRO_AUTO_NEXT_RUN"),
         balatro_reserve_money=max(
             0, min(int(os.getenv("BALATRO_RESERVE_MONEY", "5")), 100)
+        ),
+        balatro_decision_mode=balatro_decision_mode,
+        balatro_decision_model=balatro_decision_model,
+        balatro_decision_base_url=balatro_decision_base_url,
+        balatro_decision_timeout_seconds=max(
+            1.0, min(float(os.getenv("BALATRO_DECISION_TIMEOUT_SECONDS", "6.0")), 20.0)
+        ),
+        balatro_decision_top_n=max(
+            2, min(int(os.getenv("BALATRO_DECISION_TOP_N", "6")), 10)
+        ),
+        balatro_decision_min_confidence=min(
+            max(float(os.getenv("BALATRO_DECISION_MIN_CONFIDENCE", "0.55")), 0.0),
+            1.0,
         ),
     )
     settings.prepare_directories()
