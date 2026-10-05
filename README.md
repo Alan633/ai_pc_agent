@@ -535,3 +535,51 @@ GAME_HYBRID_MAX_EV_DROP=18.0
 - `observer_summary.json`：整局观察汇总。
 
 `/game_start` 进入连续自动游戏时，也会自动启动同一套对手观察器；建议先用 `/game_watch_start` 完整手动验证一两局再开启自动执行。
+
+
+## Balatro 自动游戏（第一版）
+
+AIAGENT 已加入 Steam《Balatro / 小丑牌》专项插件：
+
+```text
+game_balatro/
+├── capture.py       # 聚焦 Balatro、截图、Win32 SendInput 点击
+├── vision.py        # 本地 Qwen3.5 视觉转录
+├── models.py        # 手牌/Joker/Blind/商店统一状态
+├── solver.py        # Python 扑克牌型枚举和动作选择
+└── controller.py    # 观察 → 决策 → 点击 → 复核
+plugins/balatro.py   # Agent Tool / 自动任务入口
+```
+
+设计和八雀一致：视觉模型只负责读取界面，实际出牌由 Python Solver 枚举当前 1~5 张组合并校验后执行。当前支持 High Card、Pair、Two Pair、Three of a Kind、Straight、Flush、Full House、Four of a Kind、Straight Flush、Five of a Kind、Flush House、Flush Five。
+
+第一版商店策略保持保守和可解释：默认至少保留 $5；Joker 槽未满时优先补可负担 Joker，其次 Voucher，经济余量足够才开包。当前 `strength` 只是动作排序启发式，不冒充游戏最终精确得分；Planet 等级、完整 Joker 触发链、Boss Blind 特殊规则、牌面强化和 Joker 顺序优化会在实机识别稳定后继续进入评分器。
+
+Telegram 固定命令：
+
+```text
+/balatro_state   只识别 + 给 Solver 决策预览，不点击
+/balatro_step    只执行一步
+/balatro_start   连续自动游戏
+/balatro_stop    停止自动游戏
+/balatro_stats   查看识别/动作/最近决策统计
+```
+
+自然语言也可以直接说：
+
+```text
+看看小丑牌现在怎么打
+小丑牌只走一步
+开始自动玩小丑牌
+停止小丑牌自动游戏
+看看小丑牌最近一次决策
+```
+
+自动模式会先主动聚焦标题包含 `Balatro` 的游戏窗口。连续 3 次无法可靠识别页面时自动停止，避免未知 UI 下盲点；Run 结束后默认停止，不自动开启下一局。
+
+日志和截图：
+
+```text
+LOGS/balatro/decisions.jsonl
+screenshots/balatro/
+```
