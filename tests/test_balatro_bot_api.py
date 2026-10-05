@@ -315,6 +315,18 @@ def test_balatrobot_ensure_server_auto_starts_uvx(
         "which",
         lambda name: "C:/Tools/uvx.exe" if name == "uvx" else None,
     )
+    monkeypatch.setattr(
+        client,
+        "_windows_launch_args",
+        lambda: [
+            "--love-path",
+            "C:/Games/Balatro/Balatro.exe",
+            "--lovely-path",
+            "C:/Games/Balatro/winmm.dll",
+            "--platform",
+            "windows",
+        ],
+    )
     captured: dict[str, object] = {}
 
     class DummyProcess:
@@ -347,3 +359,73 @@ def test_balatrobot_ensure_server_auto_starts_uvx(
     ]
     assert "--logs-path" in command
     assert (tmp_path / "balatrobot_serve.log").exists()
+
+
+
+def test_windows_launch_path_prefers_winmm_over_version(
+    tmp_path: Path,
+) -> None:
+    game_dir = tmp_path / "Balatro"
+    game_dir.mkdir()
+    game = game_dir / "Balatro.exe"
+    winmm = game_dir / "winmm.dll"
+    version = game_dir / "version.dll"
+    game.write_bytes(b"exe")
+    winmm.write_bytes(b"lovely-new")
+    version.write_bytes(b"lovely-old")
+
+    client = BalatroBotClient(
+        game_executable_path=str(game),
+    )
+    resolved_game, resolved_lovely = (
+        client._resolve_windows_launch_paths()
+    )
+
+    assert resolved_game == game.resolve()
+    assert resolved_lovely == winmm.resolve()
+
+
+def test_windows_launch_path_falls_back_to_version_dll(
+    tmp_path: Path,
+) -> None:
+    game_dir = tmp_path / "Balatro"
+    game_dir.mkdir()
+    game = game_dir / "Balatro.exe"
+    version = game_dir / "version.dll"
+    game.write_bytes(b"exe")
+    version.write_bytes(b"lovely-old")
+
+    client = BalatroBotClient(
+        game_executable_path=str(game),
+    )
+    resolved_game, resolved_lovely = (
+        client._resolve_windows_launch_paths()
+    )
+
+    assert resolved_game == game.resolve()
+    assert resolved_lovely == version.resolve()
+
+
+def test_windows_launch_args_pass_balatro_and_lovely_paths(
+    tmp_path: Path,
+) -> None:
+    game_dir = tmp_path / "Balatro"
+    game_dir.mkdir()
+    game = game_dir / "Balatro.exe"
+    lovely = game_dir / "winmm.dll"
+    game.write_bytes(b"exe")
+    lovely.write_bytes(b"lovely")
+
+    client = BalatroBotClient(
+        game_executable_path=str(game),
+        lovely_path=str(lovely),
+    )
+
+    assert client._windows_launch_args() == [
+        "--love-path",
+        str(game.resolve()),
+        "--lovely-path",
+        str(lovely.resolve()),
+        "--platform",
+        "windows",
+    ]
