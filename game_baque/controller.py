@@ -637,6 +637,9 @@ class BaqueGameController:
             "opponent_event_count": self.opponent_event_count,
             "tracker_started": self._tracker_started,
             "external_observer_active": self.external_observer_active,
+            "fast_ui_count": self.fast_ui_count,
+            "qwen_vision_count": self.qwen_vision_count,
+            "fast_ui_fallback_count": self.fast_ui_fallback_count,
         }
 
     def _decide(
