@@ -128,6 +128,7 @@ def main() -> None:
                     f"Tools: {len(registry.names())} registered",
                     f"Apps: {', '.join(catalog.canonical_names())}",
                     f"点字成金插件: {'Ready' if baque.game else '需要 OPENAI_API_KEY 或 GAME_VISION_BASE_URL'}",
+                    f"八雀决策: {baque.game.decision_mode.upper() if baque.game else 'Unavailable'}",
                     "牌局采集器: Ready",
                     f"对手观察器: {'Ready' if baque.observer else 'Unavailable'}",
                     "Emergency Stop: Ctrl+Alt+F12",
