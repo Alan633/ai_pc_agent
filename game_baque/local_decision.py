@@ -59,6 +59,8 @@ class LocalDecisionReranker:
             api_key=api_key or "local-model",
             base_url=self.base_url,
             timeout=self.timeout_seconds,
+            # 实时回合里宁可立刻回退 EV，也不要 SDK 自动重试拖过倒计时。
+            max_retries=0,
         )
 
     def rerank_8_card_action(
