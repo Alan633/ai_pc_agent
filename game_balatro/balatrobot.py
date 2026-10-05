@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from game_balatro.models import (
@@ -258,6 +264,7 @@ class BalatroBotClient:
         self.deck = deck.strip().upper() or "RED"
         self.stake = stake.strip().upper() or "WHITE"
         self._request_id = 0
+        self._serve_process: subprocess.Popen[bytes] | None = None
 
     def call(
         self,
@@ -310,6 +317,106 @@ class BalatroBotClient:
         if not isinstance(result, dict):
             raise BalatroBotError("BalatroBot RPC 缺少 result 对象")
         return result
+
+    def health(
+        self,
+        *,
+        timeout_seconds: float = 0.8,
+    ) -> bool:
+        """快速检查 BalatroBot API 是否已经可用。"""
+        try:
+            result = self.call(
+                "health",
+                timeout_seconds=timeout_seconds,
+            )
+        except BalatroBotError:
+            return False
+        status = str(result.get("status") or "").strip().lower()
+        return status in {"ok", "healthy", "ready"} or bool(result)
+
+    def _serve_command(self, logs_dir: Path) -> list[str]:
+        """构造后台启动 BalatroBot 的命令，优先 uvx，兼容只有 uv 的环境。"""
+        uvx = shutil.which("uvx")
+        if uvx:
+            command = [uvx, "balatrobot", "serve"]
+        else:
+            uv = shutil.which("uv")
+            if not uv:
+                raise BalatroBotError(
+                    "未找到 uvx/uv。请先安装 uv，并重新启动 AIAGENT。"
+                )
+            command = [uv, "tool", "run", "balatrobot", "serve"]
+
+        parsed = urlparse(self.base_url)
+        if parsed.hostname and parsed.hostname not in {"127.0.0.1", "localhost"}:
+            command.extend(["--host", parsed.hostname])
+        if parsed.port and parsed.port != 12346:
+            command.extend(["--port", str(parsed.port)])
+
+        runtime_logs = logs_dir / "balatrobot_runtime"
+        runtime_logs.mkdir(parents=True, exist_ok=True)
+        command.extend(["--logs-path", str(runtime_logs)])
+        return command
+
+    def ensure_server(
+        self,
+        *,
+        logs_dir: Path,
+        startup_timeout_seconds: float = 35.0,
+    ) -> str:
+        """确保 BalatroBot 已启动；必要时后台执行 uvx balatrobot serve。"""
+        if self.health():
+            return "already_running"
+
+        if (
+            self._serve_process is None
+            or self._serve_process.poll() is not None
+        ):
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            log_path = logs_dir / "balatrobot_serve.log"
+            command = self._serve_command(logs_dir)
+            creationflags = 0
+            if os.name == "nt":
+                creationflags |= getattr(
+                    subprocess,
+                    "CREATE_NO_WINDOW",
+                    0,
+                )
+                creationflags |= getattr(
+                    subprocess,
+                    "CREATE_NEW_PROCESS_GROUP",
+                    0,
+                )
+
+            with log_path.open("ab") as log_handle:
+                self._serve_process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    creationflags=creationflags,
+                )
+
+        deadline = time.monotonic() + max(
+            3.0,
+            float(startup_timeout_seconds),
+        )
+        while time.monotonic() < deadline:
+            if self.health(timeout_seconds=0.8):
+                return "started"
+            process = self._serve_process
+            if process is not None and process.poll() is not None:
+                raise BalatroBotError(
+                    "uvx balatrobot serve 已退出，"
+                    f"exit={process.returncode}；请查看 "
+                    f"{logs_dir / 'balatrobot_serve.log'}"
+                )
+            time.sleep(0.5)
+
+        raise BalatroBotError(
+            "等待 BalatroBot API 启动超时；请查看 "
+            f"{logs_dir / 'balatrobot_serve.log'}"
+        )
 
     def get_snapshot(
         self,
