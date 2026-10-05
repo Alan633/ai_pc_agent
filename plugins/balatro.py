@@ -10,6 +10,7 @@ from agent.models import ToolResult
 from agent.session import AgentSession
 from agent.tool_registry import ToolRegistry, ToolSpec
 from config import Settings
+from game_balatro.balatrobot import BalatroBotClient
 from game_balatro.controller import BalatroController
 from game_balatro.local_strategy import BalatroLocalStrategist
 from game_balatro.solver import BalatroSolver
@@ -61,6 +62,17 @@ class BalatroPlugin:
             settings.openai_api_key
             or settings.balatro_vision_base_url
         ):
+            balatrobot: BalatroBotClient | None = None
+            if (
+                settings.balatro_control_mode != "mouse"
+                and settings.balatrobot_url
+            ):
+                balatrobot = BalatroBotClient(
+                    base_url=settings.balatrobot_url,
+                    timeout_seconds=settings.balatrobot_timeout_seconds,
+                    deck=settings.balatrobot_deck,
+                    stake=settings.balatrobot_stake,
+                )
             strategist: BalatroLocalStrategist | None = None
             if (
                 settings.balatro_decision_mode == "hybrid"
@@ -101,6 +113,8 @@ class BalatroPlugin:
                 auto_next_run=(
                     settings.balatro_auto_next_run
                 ),
+                balatrobot=balatrobot,
+                control_mode=settings.balatro_control_mode,
             )
         return cls(
             game=game,
@@ -145,9 +159,9 @@ class BalatroPlugin:
 
         add(
             "balatro_get_state",
-            "读取 Steam《小丑牌/Balatro》当前页面、"
+            "读取 Steam《小丑牌/Balatro》当前状态、"
             "手牌、Joker、Blind、商店和 Python Solver + 本地 Qwen "
-            "混合决策预览，不点击。",
+            "混合决策预览。auto 模式优先使用 BalatroBot API，不点击。",
             self.tool_get_state,
         )
         add(
@@ -158,8 +172,8 @@ class BalatroPlugin:
         )
         add(
             "balatro_auto_start",
-            "启动 Balatro 连续自动游戏。会先聚焦 Balatro "
-            "窗口，再循环识别、求解、鼠标点击和复核。",
+            "启动 Balatro 连续自动游戏。auto 模式优先使用 BalatroBot "
+            "API 读取状态并执行动作；API 不可用时才回退视觉+安全鼠标。",
             self.tool_auto_start,
         )
         add(
@@ -263,8 +277,9 @@ class BalatroPlugin:
         return {
             "running": True,
             "message": (
-                "Balatro 自动游戏启动中：将先聚焦游戏窗口，"
-                "再进入视觉识别 + Python候选 + 本地Qwen策略重排闭环。"
+                "Balatro 自动游戏启动中：Python 枚举合法候选，"
+                "本地Qwen负责长期策略重排；控制层优先BalatroBot API，"
+                "必要时回退视觉+安全鼠标。"
             ),
         }
 
