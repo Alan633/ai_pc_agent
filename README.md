@@ -383,6 +383,51 @@ GAME_AUTO_NEXT_ROUND 默认关闭。一局结束后停止；检测到“豆子�
 
 当前已支持通过 Ollama 使用本地 `qwen3.5:9b` 进行视觉识别，不需要远程视觉 API。自动模式包含两条并行链路：主链识别自己的手牌/按钮并计算动作；后台观察器以约 GAME_RECORD_FPS 的频率做本地图像差分，把连续动画合并成 BEFORE/PEAK/AFTER 三关键帧，只在检测到真实动作片段时调用 Qwen3.5。高置信度的 left/top/right 完整回合会原子写入 TableTracker，EV 使用当时牌局状态的独立快照计算，因此不会阻塞后台采样，也不会在计算过程中被新事件改写牌池。
 
+### 本地模型参与出牌决策
+
+默认 `GAME_DECISION_MODE=hybrid`：
+
+```text
+牌面 / TableTracker
+        ↓
+Python EV + Monte Carlo
+        ↓
+生成所有合法动作并排序
+        ↓
+只取 Top-N 合法候选
+        ↓
+本地 Qwen3.5 文本重排
+        ↓
+Python 再次校验 choice_id / 牌索引 / 是否可胡 / EV 跌幅
+        ↓
+鼠标执行
+```
+
+Qwen **不能自己创造一张牌或一个动作**。任何超时、连接失败、低置信度、非法 choice_id，或者模型选择的候选比最高 EV 低得超过安全阈值，都会自动回退 Python EV。
+
+三种模式：
+
+- `GAME_DECISION_MODE=rule`：纯规则启发式。
+- `GAME_DECISION_MODE=ev`：Python EV / Monte Carlo。
+- `GAME_DECISION_MODE=hybrid`：Python EV / Monte Carlo + 本地 Qwen Top-N 重排（默认）。
+
+当前 HYBRID 只重排 8 张牌时的“胡 / 弃牌”决策；摸牌/拿亮牌仍由 Python EV 决定，避免每回合增加一次本地模型延迟。
+
+可调参数：
+
+```env
+GAME_DECISION_MODE=hybrid
+GAME_DECISION_MODEL=qwen3.5-9b-16k
+GAME_DECISION_BASE_URL=http://127.0.0.1:11434/v1
+GAME_DECISION_TIMEOUT_SECONDS=4.0
+GAME_DECISION_TOP_N=4
+GAME_DECISION_MIN_CONFIDENCE=0.55
+GAME_HYBRID_MAX_EV_DROP=18.0
+```
+
+日志会输出 `八雀EV候选`、`八雀HYBRID决策` 或 `八雀HYBRID回退EV`，方便后续直接比较 Qwen 是否真的带来收益。
+
+
 ### 真实牌局验收
 
 仅仅“程序没有报错”不能证明视觉识别正确，因此 AIAGENT 增加了两层验收：
