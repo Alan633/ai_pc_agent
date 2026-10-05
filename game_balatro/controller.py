@@ -511,10 +511,16 @@ class BalatroController:
                     "BalatroBot动作失败，切换视觉+安全鼠标兜底：%s",
                     exc,
                 )
-                # 不能使用 API Snapshot 的占位坐标去点屏幕。重新解析当前截图，
-                # 并重新求解一次后才允许进入鼠标链路。
+                # 不能使用 API Snapshot 的占位坐标，也不能使用 API 调用前的旧截图。
+                # API 可能已经执行成功、只是响应超时；必须重新截取最新画面再求解，
+                # 才能避免同一手牌/按钮被重复点击。
+                fallback_frame = await asyncio.to_thread(
+                    capture_balatro_window,
+                    self.screenshots_dir,
+                    self.window_title_keyword,
+                )
                 vision_snapshot = await self.vision.parse(
-                    frame.path
+                    fallback_frame.path
                 )
                 fallback_decision = await self._choose_decision(
                     vision_snapshot
@@ -531,7 +537,7 @@ class BalatroController:
                     fallback_decision,
                 )
                 return await self._execute_mouse(
-                    frame,
+                    fallback_frame,
                     vision_snapshot,
                     fallback_decision,
                     fallback_fingerprint,
