@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -549,7 +548,7 @@ class BalatroBotClient:
         if path is None:
             return "not_found"
 
-        marker = "-- AIAGENT_PRESERVE_USER_SETTINGS_V1"
+        marker = "-- AIAGENT_PRESERVE_USER_SETTINGS_V2"
         try:
             source = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -578,17 +577,10 @@ class BalatroBotClient:
 
         preserved_settings = f'''{marker}
 local function configure_settings()
-  -- 保留玩家自己的 G.SETTINGS，避免退出游戏时把机器人配置写回存档。
-  -- 仅保留不会覆盖用户偏好的运行时标志。
-  G.FPS_CAP = BB_SETTINGS.fps_cap
-  G.ANIMATION_FPS = BB_SETTINGS.animation_fps
+  -- 完全保留玩家自己的声音、画面、窗口、速度等 G.SETTINGS。
+  -- 这里只保留不会写回用户设置的运行时标志。
   G.F_SKIP_TUTORIAL = true
   G.F_VERBOSE = true
-
-  if not BB_SETTINGS.audio then
-    G.F_SOUND_THREAD = false
-    G.F_MUTE = true
-  end
 end
 
 --- Configures headless mode'''
@@ -637,37 +629,35 @@ end
 
         return "patched"
 
-    def _serve_command(self, logs_dir: Path) -> list[str]:
-        """构造后台启动 BalatroBot 的命令，优先 uvx，兼容只有 uv 的环境。"""
-        self._patch_preserve_user_settings()
+    def _direct_launch_command(self) -> tuple[list[str], dict[str, str]]:
+        """Windows 下直接启动 Balatro.exe，不再经过 uvx balatrobot serve。
 
-        uvx = shutil.which("uvx")
-        if uvx:
-            command = [uvx, "balatrobot", "serve"]
-        else:
-            uv = shutil.which("uv")
-            if not uv:
-                raise BalatroBotError(
-                    "未找到 uvx/uv。请先安装 uv，并重新启动 AIAGENT。"
-                )
-            command = [uv, "tool", "run", "balatrobot", "serve"]
-
-        if os.name == "nt":
-            command.extend(self._windows_launch_args())
-
-        if self.audio:
-            command.append("--audio")
-
+        BalatroBot 的 HTTP Server 实际运行在游戏内 Mod 中；uvx serve 只是一个
+        生命周期管理器。直接启动可以避免 serve 健康检查失败时反向终止游戏。
+        """
+        game, _lovely = self._resolve_windows_launch_paths()
         parsed = urlparse(self.base_url)
-        if parsed.hostname and parsed.hostname not in {"127.0.0.1", "localhost"}:
-            command.extend(["--host", parsed.hostname])
-        if parsed.port and parsed.port != 12346:
-            command.extend(["--port", str(parsed.port)])
 
-        runtime_logs = logs_dir / "balatrobot_runtime"
-        runtime_logs.mkdir(parents=True, exist_ok=True)
-        command.extend(["--logs-path", str(runtime_logs)])
-        return command
+        env = os.environ.copy()
+        env["BALATROBOT_HOST"] = parsed.hostname or "127.0.0.1"
+        env["BALATROBOT_PORT"] = str(parsed.port or 12346)
+        env["BALATROBOT_AUDIO"] = "1" if self.audio else "0"
+
+        bypass = ["127.0.0.1", "localhost", "::1"]
+        for key in ("NO_PROXY", "no_proxy"):
+            current = [
+                item.strip()
+                for item in env.get(key, "").split(",")
+                if item.strip()
+            ]
+            lowered = {item.lower() for item in current}
+            for item in bypass:
+                if item.lower() not in lowered:
+                    current.append(item)
+                    lowered.add(item.lower())
+            env[key] = ",".join(current)
+
+        return [str(game)], env
 
     def ensure_server(
         self,
@@ -675,7 +665,7 @@ end
         logs_dir: Path,
         startup_timeout_seconds: float = 35.0,
     ) -> str:
-        """确保 BalatroBot 已启动；必要时后台执行 uvx balatrobot serve。"""
+        """确保游戏内 BalatroBot API 可用；Windows 下直接启动 Balatro.exe。"""
         if self.health():
             return "already_running"
 
@@ -683,36 +673,23 @@ end
             self._serve_process is None
             or self._serve_process.poll() is not None
         ):
+            self._patch_preserve_user_settings()
             logs_dir.mkdir(parents=True, exist_ok=True)
-            log_path = logs_dir / "balatrobot_serve.log"
-            command = self._serve_command(logs_dir)
-            creationflags = 0
+
             if os.name == "nt":
-                creationflags |= getattr(
-                    subprocess,
-                    "CREATE_NO_WINDOW",
-                    0,
-                )
-                creationflags |= getattr(
+                command, child_env = self._direct_launch_command()
+                log_path = logs_dir / "balatro_direct.log"
+                creationflags = getattr(
                     subprocess,
                     "CREATE_NEW_PROCESS_GROUP",
                     0,
                 )
-
-            child_env = os.environ.copy()
-            bypass = ["127.0.0.1", "localhost", "::1"]
-            for key in ("NO_PROXY", "no_proxy"):
-                current = [
-                    item.strip()
-                    for item in child_env.get(key, "").split(",")
-                    if item.strip()
-                ]
-                lowered = {item.lower() for item in current}
-                for item in bypass:
-                    if item.lower() not in lowered:
-                        current.append(item)
-                        lowered.add(item.lower())
-                child_env[key] = ",".join(current)
+            else:
+                # 非 Windows 暂时保留原有外部启动方式，避免破坏现有平台支持。
+                command = ["uvx", "balatrobot", "serve"]
+                child_env = os.environ.copy()
+                log_path = logs_dir / "balatrobot_serve.log"
+                creationflags = 0
 
             with log_path.open("ab") as log_handle:
                 self._serve_process = subprocess.Popen(
@@ -734,15 +711,17 @@ end
             process = self._serve_process
             if process is not None and process.poll() is not None:
                 raise BalatroBotError(
-                    "uvx balatrobot serve 已退出，"
+                    "Balatro 游戏进程已退出，"
                     f"exit={process.returncode}；请查看 "
-                    f"{logs_dir / 'balatrobot_serve.log'}"
+                    f"{logs_dir / 'balatro_direct.log'}"
                 )
             time.sleep(0.5)
 
+        # 与 uvx serve 不同：API 超时绝不终止 Balatro。游戏继续保留，
+        # auto 模式可安全退回视觉+鼠标。
         raise BalatroBotError(
-            "等待 BalatroBot API 启动超时；请查看 "
-            f"{logs_dir / 'balatrobot_serve.log'}"
+            "Balatro 已启动，但等待 BalatroBot API 超时；"
+            "游戏不会被自动关闭。请检查 Mod 是否已加载。"
         )
 
     def get_snapshot(
