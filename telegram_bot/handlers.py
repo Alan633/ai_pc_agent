@@ -20,6 +20,7 @@ from game_baque.controller import BaqueGameController
 from game_baque.observer import OpponentObserver
 from game_baque.recorder import GameRecorder
 from plugins.baque import BaquePlugin
+from plugins.balatro import BalatroPlugin
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.messages import BUSY, NO_TASK, UNAUTHORIZED, command_usage
 from tools.process import ProcessManager
@@ -40,6 +41,7 @@ class TelegramHandlers:
         game_recorder: GameRecorder | None = None,
         game_observer: OpponentObserver | None = None,
         baque_plugin: BaquePlugin | None = None,
+        balatro_plugin: BalatroPlugin | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
@@ -51,6 +53,7 @@ class TelegramHandlers:
         self.game_recorder = game_recorder
         self.game_observer = game_observer
         self.baque_plugin = baque_plugin
+        self.balatro_plugin = balatro_plugin
 
     def install(self, application: Application) -> None:
         commands = {
@@ -79,6 +82,11 @@ class TelegramHandlers:
             "game_accept": self.game_accept,
             "game_accept_reset": self.game_accept_reset,
             "game_rounds": self.game_rounds,
+            "balatro_state": self.balatro_state,
+            "balatro_step": self.balatro_step,
+            "balatro_start": self.balatro_start,
+            "balatro_stop": self.balatro_stop,
+            "balatro_stats": self.balatro_stats,
             "stop": self.stop,
         }
         # group=-1 先统一记录所有 Telegram 文本输入；后续新增命令无需再单独补日志。
@@ -467,6 +475,109 @@ class TelegramHandlers:
             except RuntimeError:
                 pass
         await update.effective_message.reply_text("\n".join(parts) if parts else "当前没有运行中的八雀任务。")
+
+
+    async def balatro_state(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.balatro_plugin is None:
+            await update.effective_message.reply_text("Balatro 插件未初始化。")
+            return
+        try:
+            result = await self.balatro_plugin.get_state()
+            data = result.data or {}
+            state = str(data.get("state", "未读取到状态"))
+            decision = data.get("decision")
+            if isinstance(decision, dict):
+                state += (
+                    f"\n决策={decision.get('action')}："
+                    f"{decision.get('reason')}"
+                )
+            await update.effective_message.reply_text(state)
+        except Exception as exc:
+            LOGGER.exception("读取Balatro状态失败")
+            await update.effective_message.reply_text(
+                f"读取失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def balatro_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.balatro_plugin is None:
+            await update.effective_message.reply_text("Balatro 插件未初始化。")
+            return
+        try:
+            result = await self.balatro_plugin.step_once()
+            await update.effective_message.reply_text(
+                str(result.get("message", "Balatro 单步完成。"))
+            )
+        except Exception as exc:
+            LOGGER.exception("执行Balatro单步失败")
+            await update.effective_message.reply_text(
+                f"执行失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def balatro_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.balatro_plugin is None:
+            await update.effective_message.reply_text("Balatro 插件未初始化。")
+            return
+        try:
+            result = await self.balatro_plugin.auto_start()
+            await update.effective_message.reply_text(
+                str(result.get("message", "Balatro 自动游戏已启动。"))
+            )
+        except Exception as exc:
+            LOGGER.exception("启动Balatro自动游戏失败")
+            await update.effective_message.reply_text(
+                f"启动失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def balatro_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.balatro_plugin is None:
+            await update.effective_message.reply_text("Balatro 插件未初始化。")
+            return
+        try:
+            result = await self.balatro_plugin.auto_stop()
+            await update.effective_message.reply_text(
+                str(result.get("message", "Balatro 自动游戏已停止。"))
+            )
+        except Exception as exc:
+            LOGGER.exception("停止Balatro自动游戏失败")
+            await update.effective_message.reply_text(
+                f"停止失败：{type(exc).__name__}: {exc}"
+            )
+
+    async def balatro_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._authorized(update):
+            return
+        if self.balatro_plugin is None:
+            await update.effective_message.reply_text("Balatro 插件未初始化。")
+            return
+        try:
+            stats = self.balatro_plugin.tool_stats()
+            last = stats.get("last_decision") or {}
+            text = (
+                f"Balatro统计：启动{stats.get('runs_started', 0)}次，"
+                f"识别{stats.get('inspections', 0)}帧，"
+                f"执行{stats.get('actions', 0)}步，"
+                f"unknown={stats.get('unknown', 0)}，"
+                f"结束局={stats.get('game_overs', 0)}"
+            )
+            if last:
+                text += (
+                    f"\n最近决策={last.get('action')}："
+                    f"{last.get('reason')}"
+                )
+            await update.effective_message.reply_text(text)
+        except Exception as exc:
+            LOGGER.exception("读取Balatro统计失败")
+            await update.effective_message.reply_text(
+                f"读取失败：{type(exc).__name__}: {exc}"
+            )
 
     async def game_acceptance(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):
