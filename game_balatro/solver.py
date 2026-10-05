@@ -261,9 +261,12 @@ class BalatroSolver:
                     f"Joker 槽未满，保留 ${self.reserve_money} 后购买 {item.name or 'Joker'}。",
                     target=Point(item.x, item.y),
                     metadata={
+                        "candidate_type": "shop_buy",
                         "shop_item": item.name,
                         "kind": item.kind,
                         "price": item.price,
+                        "api_group": item.api_group,
+                        "api_index": item.api_index,
                     },
                 )
 
@@ -275,9 +278,12 @@ class BalatroSolver:
                 f"购买可负担 Voucher：{item.name or 'Voucher'}。",
                 target=Point(item.x, item.y),
                 metadata={
+                    "candidate_type": "shop_buy",
                     "shop_item": item.name,
                     "kind": item.kind,
                     "price": item.price,
+                    "api_group": item.api_group,
+                    "api_index": item.api_index,
                 },
             )
 
@@ -307,6 +313,7 @@ class BalatroSolver:
                 "click",
                 "商店没有满足保守预算的购买项，进入下一回合。",
                 target=snapshot.next_round_button,
+                metadata={"candidate_type": "shop_leave"},
             )
         return BalatroDecision(
             "wait",
@@ -521,6 +528,8 @@ class BalatroSolver:
                             "shop_item": item.name,
                             "kind": item.kind,
                             "price": item.price,
+                            "api_group": item.api_group,
+                            "api_index": item.api_index,
                         },
                     )
                 )
@@ -549,6 +558,7 @@ class BalatroSolver:
                             "candidate_type": "pack_pick",
                             "shop_item": item.name,
                             "kind": item.kind,
+                            "api_index": item.api_index,
                         },
                     )
                 )
@@ -595,26 +605,46 @@ class BalatroSolver:
                 )
                 return BalatroDecision(
                     "click",
-                    f"第一版从卡包选择置信度最高的 {item.name or item.kind}。",
+                    f"从卡包选择当前最高优先级的 {item.name or item.kind}。",
                     target=Point(item.x, item.y),
+                    metadata={
+                        "candidate_type": "pack_pick",
+                        "shop_item": item.name,
+                        "kind": item.kind,
+                        "api_index": item.api_index,
+                    },
                 )
             if snapshot.skip_button:
                 return BalatroDecision(
                     "click",
                     "卡包选项未可靠识别，安全跳过。",
                     target=snapshot.skip_button,
+                    metadata={"candidate_type": "pack_skip"},
                 )
             return BalatroDecision("wait", "等待卡包选项出现。")
+
+        if snapshot.screen_type == ScreenType.ROUND_EVAL:
+            return BalatroDecision(
+                "cash_out",
+                "本回合已结算，领取奖励并进入商店。",
+                metadata={"candidate_type": "cash_out"},
+            )
 
         if snapshot.screen_type in {
             ScreenType.START,
             ScreenType.BLIND_SELECT,
         }:
             if snapshot.primary_button:
+                candidate_type = (
+                    "start_run"
+                    if snapshot.screen_type == ScreenType.START
+                    else "blind_play"
+                )
                 return BalatroDecision(
                     "click",
-                    "执行当前页面的主推进按钮。",
+                    "执行当前页面的主推进动作。",
                     target=snapshot.primary_button,
+                    metadata={"candidate_type": candidate_type},
                 )
             return BalatroDecision(
                 "wait",
