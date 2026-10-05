@@ -12,6 +12,7 @@ class ScreenType(str, Enum):
     START = "start"
     BLIND_SELECT = "blind_select"
     PLAY = "play"
+    ROUND_EVAL = "round_eval"
     SHOP = "shop"
     PACK = "pack"
     GAME_OVER = "game_over"
@@ -57,6 +58,8 @@ class ShopItem:
     x: int
     y: int
     confidence: float = 1.0
+    api_group: str = ""
+    api_index: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +84,7 @@ class BalatroSnapshot:
     reroll_button: Point | None = None
     next_round_button: Point | None = None
     message: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
