@@ -302,9 +302,12 @@ class BalatroSolver:
                 f"经济余量充足，开启 {item.name or 'Booster Pack'}。",
                 target=Point(item.x, item.y),
                 metadata={
+                    "candidate_type": "shop_buy",
                     "shop_item": item.name,
                     "kind": item.kind,
                     "price": item.price,
+                    "api_group": item.api_group,
+                    "api_index": item.api_index,
                 },
             )
 
@@ -322,6 +325,8 @@ class BalatroSolver:
 
     @staticmethod
     def _decision_key(decision: BalatroDecision) -> tuple[object, ...]:
+        # API Snapshot 使用不可见占位坐标，不能只按坐标去重，否则
+        # next_round/reroll、select/skip 等语义不同的动作会被错误合并。
         return (
             decision.action,
             decision.card_indices,
@@ -330,6 +335,9 @@ class BalatroSolver:
                 if decision.target is not None
                 else None
             ),
+            decision.metadata.get("candidate_type"),
+            decision.metadata.get("api_group"),
+            decision.metadata.get("api_index"),
         )
 
     def rank_candidates(
