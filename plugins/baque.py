@@ -80,6 +80,7 @@ class BaquePlugin:
                 min_card_confidence=settings.game_min_card_confidence,
                 min_event_confidence=settings.game_min_event_confidence,
                 auto_next_round=settings.game_auto_next_round,
+                fast_vision_enabled=settings.game_fast_vision,
             )
 
         observer: OpponentObserver | None = None
