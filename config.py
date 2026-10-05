@@ -42,6 +42,13 @@ class Settings:
     # 胡一把每家输赢封顶（欢乐豆）手动覆盖；0 表示按识别到的场次自动选择
     # （每家：新手场 2 万、普通场 30 万、高级场 300 万、顶级场 800 万；三家分别计算）。
     game_win_cap_beans: float = 0.0
+    # Steam《Balatro / 小丑牌》自动游戏。与八雀专项配置完全隔离。
+    balatro_vision_model: str = "qwen3.5-9b-16k"
+    balatro_vision_base_url: str = ""
+    balatro_window_title_keyword: str = "Balatro"
+    balatro_action_interval_seconds: float = 1.2
+    balatro_auto_next_run: bool = False
+    balatro_reserve_money: int = 5
 
     @property
     def logs_dir(self) -> Path:
@@ -153,6 +160,18 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         ),
         game_hybrid_max_ev_drop=max(
             0.0, float(os.getenv("GAME_HYBRID_MAX_EV_DROP", "18.0"))
+        ),
+        balatro_vision_model=os.getenv("BALATRO_VISION_MODEL", openai_model).strip(),
+        balatro_vision_base_url=os.getenv(
+            "BALATRO_VISION_BASE_URL", openai_base_url
+        ).strip().rstrip("/"),
+        balatro_window_title_keyword=os.getenv("BALATRO_WINDOW_TITLE", "Balatro").strip(),
+        balatro_action_interval_seconds=max(
+            0.4, float(os.getenv("BALATRO_ACTION_INTERVAL_SECONDS", "1.2"))
+        ),
+        balatro_auto_next_run=_env_bool("BALATRO_AUTO_NEXT_RUN"),
+        balatro_reserve_money=max(
+            0, min(int(os.getenv("BALATRO_RESERVE_MONEY", "5")), 100)
         ),
     )
     settings.prepare_directories()
