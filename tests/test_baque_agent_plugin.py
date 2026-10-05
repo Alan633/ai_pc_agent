@@ -77,6 +77,7 @@ def test_baque_plugin_registers_agent_tools(tmp_path: Path) -> None:
         "baque_acceptance_report",
         "baque_acceptance_mark",
         "baque_acceptance_reset",
+        "baque_round_stats",
     }
 
 

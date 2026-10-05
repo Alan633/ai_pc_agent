@@ -78,6 +78,7 @@ class TelegramHandlers:
             "game_acceptance": self.game_acceptance,
             "game_accept": self.game_accept,
             "game_accept_reset": self.game_accept_reset,
+            "game_rounds": self.game_rounds,
             "stop": self.stop,
         }
         # group=-1 先统一记录所有 Telegram 文本输入；后续新增命令无需再单独补日志。
@@ -475,6 +476,44 @@ class TelegramHandlers:
             return
         report = self.baque_plugin.acceptance_report()
         await update.effective_message.reply_text(self._format_acceptance(report))
+
+    async def game_rounds(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """/game_rounds [最近N局]：八雀自动游戏战绩。"""
+        if not await self._authorized(update):
+            return
+        if self.baque_plugin is None:
+            await update.effective_message.reply_text("八雀插件未初始化。")
+            return
+        last = None
+        if context.args:
+            try:
+                last = max(1, int(context.args[0]))
+            except ValueError:
+                pass
+        stats = self.baque_plugin.round_stats(last)
+        await update.effective_message.reply_text(self._format_round_stats(stats, last))
+
+    @staticmethod
+    def _format_round_stats(stats: dict[str, Any], last: int | None) -> str:
+        if not stats.get("rounds"):
+            return "还没有八雀对局记录。自动游戏每打完一局会自动记录。"
+        scope = f"最近 {last} 局" if last else "全部"
+        lost_rate = stats.get("lost_turn_rate")
+        lines = [
+            f"八雀战绩（{scope}）：{stats['rounds']} 局，胜 {stats['wins']} 局，胜率 {stats['win_rate'] * 100:.1f}%",
+            f"平均每局轮到自己 {stats['avg_turns']} 回合；丢失回合 {stats['lost_turns']} 次"
+            + (f"（{lost_rate * 100:.1f}%）" if lost_rate is not None else ""),
+            f"听过牌的局 {stats['tenpai_rounds']}（{stats['tenpai_rate'] * 100:.1f}%）；"
+            f"出现过可胡的局 {stats['hu_available_rounds']}",
+        ]
+        reasons = stats.get("top_lost_reasons") or []
+        if reasons:
+            lines.append("丢失回合原因：" + "，".join(f"{name}×{count}" for name, count in reasons))
+        recent = stats.get("recent") or []
+        if recent:
+            lines.append("最近几局：")
+            lines.extend(f"- {line}" for line in recent)
+        return "\n".join(lines)
 
     async def game_accept(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._authorized(update):

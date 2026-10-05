@@ -5,7 +5,7 @@ import random
 import time
 from dataclasses import dataclass
 
-from game_baque.models import Card, GameDecision
+from game_baque.models import Card, GameDecision, HuResult
 from game_baque.opponent_model import OpponentPatternModel
 from game_baque.rules import evaluate_hu
 from game_baque.strategy import hand_potential
@@ -61,11 +61,30 @@ class ExpectedValueEngine:
         # 胡牌时每家支付 min(理论分, 该家上限)；超过上限的牌型分毫无意义，
         # 追大牌只会徒增被对手先胡的风险。None 表示未知、不封顶。
         self.score_caps: tuple[float, ...] | None = None
+        # 三家各自的欢乐豆（理论分单位，未知为 inf）：没有癞子胡 2 次时，两次
+        # 支付合计不能超过对方余额。
+        self.seat_balances: tuple[float, ...] | None = None
         self.rng = random.Random(seed)
         self.opponent_model = OpponentPatternModel(samples=max(160, self.simulations // 2), seed=seed)
         self._inference_cache: dict[tuple[object, ...], object] = {}
         self._release_cache: dict[tuple[object, ...], object] = {}
         self._rollout_cache: dict[tuple[object, ...], float] = {}
+
+    def hu_value(self, hu: HuResult) -> float:
+        """一次胡牌实际能赢到的价值（理论分单位，取三家平均）。
+
+        没有癞子“胡 2 次”：每次各付 min(单次理论分, 该家单次上限)，两次合计
+        再受该家余额限制。有癞子只付一次。
+        """
+        payments = hu.hard_multiplier if hu.hard_multiplier > 1 else 1
+        if not self.score_caps:
+            return float(hu.theoretical_score)
+        per_payment = float(hu.theoretical_score) / payments
+        balances = self.seat_balances or tuple(math.inf for _ in self.score_caps)
+        total = 0.0
+        for cap, balance in zip(self.score_caps, balances):
+            total += min(balance, payments * min(per_payment, cap))
+        return total / len(self.score_caps)
 
     def capped(self, score: float) -> float:
         """按三家各自支付上限折算后的胡牌价值。
@@ -270,17 +289,13 @@ class ExpectedValueEngine:
                 + ("（另有 1 张问号选牌卡）" if opportunity_available else "")
             )
 
+        if not opportunity_available:
+            return self._choose_draw_by_rollout(hand, visible_cards, gold_ranks, tracker, end)
+
         def self_value(card: Card) -> float:
-            hand8 = hand + [card]
             # 问号卡会被所选目标替换，得到的是 7 张普通手牌；此时尚未进入
             # 八张牌胡/出牌阶段，只比较换入后的结构潜力。
-            if opportunity_available:
-                return hand_potential(hand8, gold_ranks) * 0.55
-            hu = evaluate_hu(hand8, gold_ranks)
-            if hu is not None:
-                return self.capped(hu.theoretical_score)
-            # 非立即胡时使用结构潜力，量纲压到与中低倍成牌收益可比较。
-            return hand_potential(hand8, gold_ranks) * 0.55
+            return hand_potential(hand + [card], gold_ranks) * 0.55
 
         visible_values: list[tuple[float, int, float, float]] = []
         for index, card in enumerate(visible_cards):
@@ -326,6 +341,129 @@ class ExpectedValueEngine:
             ),
         )
 
+    def _keep_value(
+        self,
+        kept: list[Card],
+        gold_ranks: tuple[str, ...] | list[str],
+        tracker: TableTracker,
+        deadline: float | None,
+    ) -> float:
+        """保留这 7 张继续打的价值：与出牌决策同一口径（未来胡牌 + 结构价值）。"""
+        future = self._rollout_future_hu(kept, gold_ranks, tracker, deadline=deadline)
+        return future + hand_potential(kept, gold_ranks) * 0.08
+
+    def _choose_draw_by_rollout(
+        self,
+        hand: list[Card],
+        visible_cards: list[Card],
+        gold_ranks: tuple[str, ...] | list[str],
+        tracker: TableTracker,
+        end: float | None,
+    ) -> GameDecision:
+        """摸牌堆 vs 取亮牌，与出牌决策使用同一套价值。
+
+        旧做法给亮牌打“8 张结构分”，没考虑拿进来后还要打出一张：实测 27 次
+        取亮牌里有 5 次下一手又把同一张打回，白白浪费一次摸牌。现在：
+        - 摸牌堆：从当前 7 张开始模拟“现在摸一张、继续打”的未来价值；
+        - 取亮牌 V：能直接胡就取；否则在“拿进 V 后打哪张”里取最优保留价值，
+          若最优就是把 V 打回去，则 V 对自己毫无用处、不取。下一次摸牌要等
+          下一轮，因此再乘一次折扣。
+        """
+        # 每张亮牌只细算：结构潜力最好的前 2 种打法 + 打回 V 本身。
+        plans: list[tuple[int, list[int]]] = []
+        for index, card in enumerate(visible_cards):
+            hand8 = hand + [card]
+            order = sorted(
+                range(len(hand)),
+                key=lambda i: hand_potential(
+                    [c for j, c in enumerate(hand8) if j != i], gold_ranks
+                ),
+                reverse=True,
+            )
+            plans.append((index, order[:2] + [len(hand)]))
+        tasks_left = 1 + sum(len(discards) + 1 for _, discards in plans)
+
+        deck_value = self._keep_value(
+            hand,
+            gold_ranks,
+            tracker,
+            self._slice_deadline(end, tasks_left),
+        )
+        tasks_left -= 1
+
+        visible_values: list[tuple[float, int, float, float, Card | None]] = []
+        skipped: list[str] = []
+        for index, discards in plans:
+            card = visible_cards[index]
+            hand8 = hand + [card]
+            deny = self.danger_of_releasing(
+                card,
+                tracker,
+                gold_ranks,
+                samples=max(100, self.simulations // 4),
+                deadline=self._slice_deadline(end, tasks_left),
+            )
+            tasks_left -= 1
+            hu = evaluate_hu(hand8, gold_ranks)
+            if hu is not None:
+                tasks_left -= len(discards)
+                own = self.hu_value(hu)
+                visible_values.append((own + 0.35 * deny, index, own, deny, None))
+                continue
+            best_discard = -1
+            best_keep = float("-inf")
+            for discard_index in discards:
+                kept = [c for j, c in enumerate(hand8) if j != discard_index]
+                value = self._keep_value(
+                    kept,
+                    gold_ranks,
+                    tracker,
+                    self._slice_deadline(end, tasks_left),
+                )
+                tasks_left -= 1
+                if value > best_keep:
+                    best_keep, best_discard = value, discard_index
+            if best_discard == len(hand):
+                # 拿进来之后最该打掉的就是它自己：等于什么都没做，还错过一次摸牌。
+                skipped.append(card.label)
+                continue
+            own = best_keep * self.discount
+            visible_values.append((own + 0.35 * deny, index, own, deny, hand8[best_discard]))
+
+        # 摸暗牌意味着当前亮牌仍可能被对手利用；作为风险扣分。
+        table_exposure = sum(item[3] for item in visible_values)
+        deck_total = deck_value - 0.18 * table_exposure
+        skipped_text = f"；不取 {'、'.join(skipped)}（拿进后最优仍是打回）" if skipped else ""
+
+        if visible_values:
+            best_total, best_index, own, deny, planned_discard = max(
+                visible_values, key=lambda item: item[0]
+            )
+            if best_total > deck_total:
+                card = visible_cards[best_index]
+                plan = (
+                    "可直接胡"
+                    if planned_discard is None
+                    else f"拿进后计划打出 {planned_discard.label}"
+                )
+                return GameDecision(
+                    "draw_visible",
+                    visible_index=best_index,
+                    reason=(
+                        f"取亮牌 {card.label}（{plan}）：自己价值 {own:.1f}，"
+                        f"同时阻断对手价值 {deny:.1f}；综合 {best_total:.1f} > "
+                        f"摸牌堆 {deck_total:.1f}{skipped_text}"
+                    ),
+                )
+
+        return GameDecision(
+            "draw_deck",
+            reason=(
+                f"摸牌堆，期望 {deck_value:.1f}，扣除亮牌留给对手的风险后 "
+                f"综合 {deck_total:.1f}，优于当前亮牌{skipped_text}"
+            ),
+        )
+
     def choose_option_card(
         self,
         hand: list[Card],
@@ -345,7 +483,7 @@ class ExpectedValueEngine:
             if len(cards) == 8:
                 hu = evaluate_hu(cards, gold_ranks)
                 if hu is not None:
-                    return self.capped(hu.theoretical_score)
+                    return self.hu_value(hu)
             return hand_potential(cards, gold_ranks) * 0.55
 
         scored = [(value(card), index) for index, card in enumerate(options)]
@@ -359,8 +497,12 @@ class ExpectedValueEngine:
         tracker: TableTracker,
         *,
         time_budget_seconds: float | None = None,
+        avoid_discard: Card | None = None,
     ) -> tuple[GameDecision, list[ActionValue]]:
         """time_budget_seconds 给出整体时间上限；到点后各采样按已完成样本估计。
+
+        avoid_discard：本回合刚从亮牌拿进的牌。摸牌决策已判定保留它更优，
+        出牌时不再把它（或同点同花的另一张）打回去，否则等于白白放弃一次摸牌。
 
         回合倒计时约 20 秒且识别要占去数秒，带癞子的手牌全量采样可能远超
         倒计时，因此实时对局必须设预算，宁可少采样也要按时出牌。
@@ -386,7 +528,7 @@ class ExpectedValueEngine:
         table_risk = sum(item.expected_hu_score_next_draw for item in pattern_inference)
         immediate = evaluate_hu(hand, gold_ranks)
         if immediate is not None:
-            immediate_value = self.capped(immediate.theoretical_score)
+            immediate_value = self.hu_value(immediate)
             values.append(
                 ActionValue(
                     action="hu",
@@ -399,7 +541,12 @@ class ExpectedValueEngine:
                 )
             )
 
+        avoid_key = card_key(avoid_discard) if avoid_discard is not None else None
+        if avoid_key is not None and all(card_key(card) == avoid_key for card in hand):
+            avoid_key = None
         for index, discarded in enumerate(hand):
+            if avoid_key is not None and card_key(discarded) == avoid_key:
+                continue
             kept = [card for i, card in enumerate(hand) if i != index]
             future = self._rollout_future_hu(
                 kept,
@@ -438,7 +585,7 @@ class ExpectedValueEngine:
 
         best = max(values, key=lambda item: item.expected_value)
         if immediate is not None and best.action != "hu":
-            hu_value = self.capped(immediate.theoretical_score)
+            hu_value = self.hu_value(immediate)
             if best.expected_value < hu_value * self.hu_pass_margin:
                 best = next(item for item in values if item.action == "hu")
         if best.action == "hu":
@@ -464,6 +611,11 @@ class ExpectedValueEngine:
                 card_indexes=(best.card_index,),
                 reason=(
                     f"不立即胡/继续做牌更优；{best.reason}；综合EV {best.expected_value:.1f}"
+                    + (
+                        f"（{avoid_discard.label} 是本回合刚拿的亮牌，不打回）"
+                        if avoid_key is not None and avoid_discard is not None
+                        else ""
+                    )
                 ),
             ),
             sorted(values, key=lambda item: item.expected_value, reverse=True),
@@ -486,6 +638,7 @@ class ExpectedValueEngine:
             self.horizon_own_draws,
             self.discount,
             self.score_caps,
+            self.seat_balances,
         )
         cached = self._rollout_cache.get(cache_key)
         if cached is not None:
@@ -512,7 +665,7 @@ class ExpectedValueEngine:
                 if hu is not None:
                     best_value = max(
                         best_value,
-                        self.capped(hu.theoretical_score) * (self.discount ** depth),
+                        self.hu_value(hu) * (self.discount ** depth),
                     )
                 # 即使当前能胡，也允许比较“继续做更大牌”的路线。
                 if depth + 1 < self.horizon_own_draws:

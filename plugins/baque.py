@@ -99,6 +99,7 @@ class BaquePlugin:
                 decision_mode=settings.game_decision_mode,
                 decision_reranker=decision_reranker,
                 win_cap_beans=settings.game_win_cap_beans,
+                rounds_log_path=settings.logs_dir / "baque" / "rounds.jsonl",
             )
 
         observer: OpponentObserver | None = None
@@ -208,6 +209,12 @@ class BaquePlugin:
             "开始新一轮八雀验收统计；历史标签不会删除，只在日志中写入 reset 分界。",
             _schema(),
             self.tool_acceptance_reset,
+        )
+        add(
+            "baque_round_stats",
+            "查看八雀自动游戏战绩：总局数、胜局、胜率、平均回合数、听牌率、丢失回合原因和最近几局结果。用户问“战绩/胜率/赢了几把”时使用。",
+            _schema(),
+            self.tool_round_stats,
         )
 
     def _require_game(self) -> BaqueGameController:
@@ -400,6 +407,12 @@ class BaquePlugin:
         self._auto_task = None
         self._last_auto_message = message
         return {"stopped": True, "message": message}
+
+    def round_stats(self, last: int | None = None) -> dict[str, Any]:
+        return self._require_game().round_stats(last)
+
+    def tool_round_stats(self) -> dict[str, Any]:
+        return self.round_stats()
 
     def acceptance_report(self) -> dict[str, Any]:
         return self.acceptance.report(self.game, self.observer)

@@ -41,17 +41,12 @@ def card_base_points(card: Card) -> int:
 
 
 def gold_multiplier(gold_count: int) -> int:
-    if gold_count <= 1:
-        return 1
-    if gold_count == 2:
-        return 2
-    if gold_count == 3:
-        return 4
-    if gold_count == 4:
-        return 8
-    if gold_count == 5:
-        return 16
-    return 32
+    """官方说明：“胡牌倍数额外 × 金牌数量”（线性，不是翻倍）；没有金牌不额外加倍。
+
+    结算页实例：被自摸（平胡 ×1）、3 张金牌 → “3倍”。旧实现按 2/4/8/16 翻倍，
+    会把多金牌的牌型价值严重高估。
+    """
+    return max(1, gold_count)
 
 
 def _all_same_color(cards: list[Card]) -> str | None:
@@ -221,6 +216,8 @@ def _evaluate_canonical(
     base_points = sum(card_base_points(card) for card in cards)
     fixed_gold = sum(1 for card in cards if not card.wild and card.rank in gold)
     hard = not any(card.wild for card in cards)
+    # 没有癞子时“能胡 2 次”：结算页出现两行相同的“被自摸(平胡) 230分 3倍”，
+    # 分两次支付。理论分按两次合计（×2）；封顶与对手余额在 EV 层按每次支付计算。
     hard_multiplier = 2 if hard else 1
     wild_flags = tuple(value[0] for value in canonical)
 

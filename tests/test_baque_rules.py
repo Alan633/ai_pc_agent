@@ -11,7 +11,8 @@ def w() -> Card:
 
 
 def test_gold_multiplier_table() -> None:
-    assert [gold_multiplier(i) for i in range(8)] == [1, 1, 2, 4, 8, 16, 32, 32]
+    # 官方：胡牌倍数额外 × 金牌数量；无金牌不额外加倍。
+    assert [gold_multiplier(i) for i in range(8)] == [1, 1, 2, 3, 4, 5, 6, 7]
 
 
 def test_top_meeting_6_plus_2() -> None:

@@ -78,6 +78,9 @@ class TableTracker:
         self.initial = initial_deck_counts()
         self.own_hand: Counter[CardKey] = Counter()
         self.public_discards: Counter[CardKey] = Counter()
+        # 最近一次看到的桌面亮牌（含对手打出的牌）。本地视觉模式没有对手动作
+        # 事件，这是得知对手弃牌的唯一来源；它们不可能再从牌堆摸到。
+        self.table_visible: Counter[CardKey] = Counter()
         self.opponents = {seat: OpponentKnowledge(seat) for seat in SEATS}
         self.consumed_opportunity_cards = 0
         self.known_deck_top: list[CardKey] = []
@@ -88,6 +91,7 @@ class TableTracker:
     def reset_round(self, own_hand: Iterable[Card], deck_count: int | None = 56) -> None:
         self.own_hand = Counter(card_key(card) for card in own_hand)
         self.public_discards.clear()
+        self.table_visible.clear()
         self.opponents = {seat: OpponentKnowledge(seat) for seat in SEATS}
         self.consumed_opportunity_cards = 0
         self.known_deck_top.clear()
@@ -115,8 +119,18 @@ class TableTracker:
         if self.deck_count is not None:
             self.deck_count = max(0, self.deck_count - 1)
 
+    def sync_table(self, cards: Iterable[Card]) -> None:
+        """以摸牌阶段看到的桌面亮牌为准，替换已知桌面牌。"""
+        self.table_visible = Counter(card_key(card) for card in cards)
+
     def record_own_take_visible(self, card: Card) -> None:
-        self._event("own_take_visible", "self", card_key(card))
+        key = card_key(card)
+        # 牌已从桌面进入自己手牌；不扣掉会在下次同步前被重复计数。
+        if self.table_visible[key] > 0:
+            self.table_visible[key] -= 1
+            if self.table_visible[key] <= 0:
+                del self.table_visible[key]
+        self._event("own_take_visible", "self", key)
 
     def record_opponent_draw_deck(self, seat: str) -> None:
         opp = self._opponent(seat)
@@ -245,6 +259,12 @@ class TableTracker:
         for opp in self.opponents.values():
             counts.subtract(opp.known_hand)
         counts["OPPORTUNITY"] -= self.consumed_opportunity_cards
+        for key, seen in self.table_visible.items():
+            # 自己打出的牌已计入 public_discards 且仍躺在桌面，只扣超出部分；
+            # 桌面信息只做“可能更少”的修正，绝不因视觉误差制造计数冲突。
+            extra = seen - self.public_discards[key]
+            if extra > 0 and counts[key] > 0:
+                counts[key] -= min(extra, counts[key])
         for key in list(counts):
             if counts[key] < 0:
                 raise RuntimeError(f"记牌状态冲突：{key} 计数为 {counts[key]}")
@@ -334,6 +354,7 @@ class TableTracker:
         return (
             tuple(sorted(self.own_hand.items())),
             tuple(sorted(self.public_discards.items())),
+            tuple(sorted(self.table_visible.items())),
             opponents,
             self.consumed_opportunity_cards,
             tuple(self.known_deck_top),

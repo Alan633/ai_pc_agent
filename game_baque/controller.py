@@ -32,8 +32,10 @@ from game_baque.event_vision import TableObservation
 from game_baque.fast_vision import analyze_image_path
 from game_baque.local_decision import LocalDecisionReranker
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
+from game_baque.round_report import RoundLog, RoundReport
+from game_baque.rules import evaluate_hu
 from game_baque.strategy import choose_discard, choose_draw, choose_swap_two
-from game_baque.tracker import TableTracker
+from game_baque.tracker import TableTracker, card_from_key
 from game_baque.vision import (
     TURN_DISCARD_BUTTON,
     TURN_HAND_SLOTS,
@@ -86,8 +88,12 @@ class BaqueGameController:
         decision_mode: str = "ev",
         decision_reranker: LocalDecisionReranker | None = None,
         win_cap_beans: float = 0.0,
+        rounds_log_path: Path | None = None,
     ) -> None:
         self.vision = vision
+        # 截图根目录；每局开始后 screenshots_dir 切到 根目录/rounds/<开局时间>/，
+        # 该局所有截图（开始页、换牌、各回合、弹窗、结算）单独存放。
+        self.base_screenshots_dir = screenshots_dir
         self.screenshots_dir = screenshots_dir
         self.session = session
         self.window_title_keyword = window_title_keyword
@@ -106,6 +112,14 @@ class BaqueGameController:
         # 单局输赢封顶手动覆盖（豆，0=按场次自动）；配合底分、对手豆数换算胡牌价值上限。
         self.win_cap_beans = max(0.0, float(win_cap_beans))
         self._round_info_attempts = 0
+        # 每局结果记录：衡量胜率、定位丢失回合的原因。
+        self.round_log = RoundLog(rounds_log_path)
+        self.round_report: RoundReport | None = None
+        self._turn_discarded = False
+        self._turn_problem = ""
+        self._turn_counted = False
+        # 本回合刚从桌面拿进的亮牌：出牌时不再打回。
+        self._taken_visible: Card | None = None
         # 本回合首次探测到操作权的时刻；对手回合时清空。
         self._turn_started_at: float | None = None
         # 本回合尝试打出“?”选牌卡的次数，防止点击未生效时反复抬起/放下。
@@ -270,6 +284,8 @@ class BaqueGameController:
             )
             if probe.action_state is None:
                 if probe.round_in_progress:
+                    if self._turn_counted:
+                        self._end_turn()
                     self._turn_started_at = None
                     self._opportunity_attempts = 0
                     self._swap_phase_active = False
@@ -280,9 +296,18 @@ class BaqueGameController:
             elif self._turn_started_at is None:
                 self._turn_started_at = probed_at
             if probe.action_state == "swap":
+                if not self._swap_phase_active:
+                    # 连续自动模式下见到换牌页即新一局开始。
+                    self._start_round_report("新一局换牌")
                 self._swap_phase_active = True
             elif probe.action_state == "draw":
                 self._swap_phase_active = False
+            if (
+                probe.action_state in {"draw", "discard", "choose"}
+                and not self._swap_phase_active
+                and not self._turn_counted
+            ):
+                self._begin_turn()
             if (
                 probe.frame is not None
                 and probe.opportunity_card
@@ -333,6 +358,12 @@ class BaqueGameController:
             LOGGER.warning("八雀本局信息识别失败：%s", exc)
             return
         self._apply_payout_cap(base, balances, room_cap)
+        if self.round_report is not None:
+            self.round_report.base_score = base
+            self.round_report.opponent_beans = list(balances)
+            self.round_report.room_cap = (
+                self.win_cap_beans if self.win_cap_beans > 0 else room_cap
+            )
         self._round_info_attempts = 2
 
     def _apply_payout_cap(
@@ -354,9 +385,13 @@ class BaqueGameController:
             seat_caps.append(min(candidates) if candidates else math.inf)
         if base is None or all(math.isinf(cap) for cap in seat_caps):
             self.ev.score_caps = None
+            self.ev.seat_balances = None
             LOGGER.info("八雀本局封顶未知：底分=%s 对手豆=%s，按不封顶计算", base, balances)
             return
         self.ev.score_caps = tuple(max(1.0, cap / base) for cap in seat_caps)
+        self.ev.seat_balances = tuple(
+            balance / base if balance is not None else math.inf for balance in seats
+        )
         finite = [cap for cap in seat_caps if not math.isinf(cap)]
         LOGGER.info(
             "八雀本局封顶：底分 %s，每家封顶 %s 豆，对手豆 %s → 三家最多各付 %s 豆，合计最多赢 %s 豆",
@@ -366,6 +401,129 @@ class BaqueGameController:
             [round(cap) if not math.isinf(cap) else "不限" for cap in seat_caps],
             round(sum(finite)) if len(finite) == 3 else "不限",
         )
+
+    # ---- 每局结果记录 ----
+
+    def _start_round_report(self, reason: str) -> None:
+        if self.round_report is not None and self.round_report.turns > 0:
+            self._finish_round_report(f"下一局开始（{reason}）")
+        if self.round_report is None:
+            self._new_round_report()
+        self._turn_discarded = False
+        self._turn_problem = ""
+
+    def _new_round_report(self) -> RoundReport:
+        """新建本局记录，并把截图目录切到本局专属文件夹。"""
+        from datetime import datetime
+
+        rounds_dir = self.base_screenshots_dir / "rounds"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        round_dir = rounds_dir / stamp
+        suffix = 2
+        while round_dir.exists():
+            round_dir = rounds_dir / f"{stamp}-{suffix}"
+            suffix += 1
+        try:
+            round_dir.mkdir(parents=True, exist_ok=False)
+            self.screenshots_dir = round_dir
+        except OSError as exc:
+            LOGGER.warning("创建本局截图目录失败，继续使用 %s：%s", self.screenshots_dir, exc)
+        self.round_report = RoundReport(screenshots_dir=str(self.screenshots_dir))
+        LOGGER.info("八雀本局截图目录：%s", self.screenshots_dir)
+        return self.round_report
+
+    def _finish_round_report(self, reason: str) -> None:
+        report = self.round_report
+        if report is None:
+            return
+        if self._turn_counted:
+            self._end_turn()
+            self._turn_started_at = None
+        if report.turns == 0 and not report.hu_clicked:
+            # 还没轮到自己就结束（如开局前停止），不计入战绩。
+            self.round_report = None
+            return
+        from datetime import datetime
+
+        report.ended_at = datetime.now().isoformat(timespec="seconds")
+        report.end_reason = reason
+        report.gold_ranks = list(self._round_gold_ranks or self._last_gold_ranks)
+        self.round_log.append(report)
+        self.round_report = None
+
+    def _begin_turn(self) -> None:
+        if self.round_report is None:
+            self._new_round_report()
+        self.round_report.turns += 1
+        self._turn_counted = True
+        self._taken_visible = None
+        self._turn_discarded = False
+        self._turn_problem = ""
+
+    def _end_turn(self) -> None:
+        """回合结束：本回合没完成出牌/胡牌即记为丢失回合（多被系统代打）。"""
+        report = self.round_report
+        self._turn_counted = False
+        self._taken_visible = None
+        if report is None or report.turns == 0:
+            return
+        if not self._turn_discarded:
+            report.lost_turns += 1
+            report.add_reason(report.lost_turn_reasons, self._turn_problem or "未知（未完成出牌）")
+        self._turn_discarded = False
+        self._turn_problem = ""
+
+    def _note_turn_problem(self, message: str, *, rejection: bool = False) -> None:
+        self._turn_problem = message
+        if rejection and self.round_report is not None:
+            self.round_report.add_reason(self.round_report.rejections, message)
+
+    def _count_action(self, kind: str) -> None:
+        report = self.round_report
+        if kind == "discard" or kind == "hu":
+            self._turn_discarded = True
+        if report is None:
+            return
+        if kind == "draw":
+            report.draws += 1
+        elif kind == "discard":
+            report.discards += 1
+        elif kind == "hu":
+            report.hu_clicked = True
+
+    def _note_eight_card_decision(
+        self,
+        snapshot: GameSnapshot,
+        decision: GameDecision,
+        tracker: TableTracker,
+    ) -> None:
+        """记录能胡/放弃胡牌，以及出牌后是否听牌、听几张。"""
+        report = self.round_report
+        if report is None:
+            return
+        if evaluate_hu(snapshot.hand, snapshot.gold_ranks) is not None:
+            report.hu_available += 1
+            if decision.action != "hu":
+                report.passed_hu += 1
+        if decision.action != "discard" or not decision.card_indexes:
+            return
+        index = decision.card_indexes[0]
+        kept = [card for i, card in enumerate(snapshot.hand) if i != index]
+        try:
+            unseen = tracker.unseen_counts()
+        except RuntimeError:
+            return
+        waits = sum(
+            count
+            for key, count in unseen.items()
+            if evaluate_hu(kept + [card_from_key(key)], snapshot.gold_ranks) is not None
+        )
+        if waits > 0:
+            report.tenpai_turns += 1
+            report.best_waits = max(report.best_waits, waits)
+
+    def round_stats(self, last: int | None = None) -> dict[str, object]:
+        return self.round_log.stats(last)
 
     def _turn_deadline(self) -> float | None:
         """本回合最晚应完成决策的时刻（已扣除点击余量）；未知时返回 None。"""
@@ -397,6 +555,8 @@ class BaqueGameController:
             return
         self.action_count += 1
         self._last_action_at = time.monotonic()
+        if self.round_report is not None:
+            self.round_report.opportunity_cards += 1
         LOGGER.info(
             "八雀出牌阶段：打出“?”选牌卡 card=(%s,%s) discard=(%s,%s) attempt=%s",
             card_point.x,
@@ -439,6 +599,8 @@ class BaqueGameController:
                 self.tracker.record_opportunity_reveal("self", options, index)
             except (ValueError, IndexError) as exc:
                 LOGGER.warning("八雀选牌结果写入记牌器失败：%s", exc)
+        if self.round_report is not None:
+            self.round_report.choice_picks += 1
         LOGGER.info(
             "八雀选牌弹窗：选择 %s（价值 %.1f）候选=%s 手牌=%s duration=%.2fs",
             card.label,
@@ -532,6 +694,8 @@ class BaqueGameController:
             )
 
         if snapshot.screen_type == ScreenType.START:
+            if self.round_report is not None and self.round_report.turns > 0:
+                self._finish_round_report("回到开始页")
             if snapshot.start_button is None:
                 return GameStepResult(
                     False,
@@ -563,6 +727,7 @@ class BaqueGameController:
             )
 
         if snapshot.screen_type == ScreenType.RECHARGE:
+            self._finish_round_report("豆子不足/充值界面")
             return GameStepResult(
                 False,
                 "检测到“豆子不足/充值/购买”界面。自动游戏不会充值或购买，已停止。",
@@ -571,6 +736,7 @@ class BaqueGameController:
                 stop_loop=True,
             )
         if snapshot.screen_type == ScreenType.SETTLEMENT:
+            self._finish_round_report("结算页")
             if not self.auto_next_round:
                 return GameStepResult(
                     False,
@@ -597,6 +763,7 @@ class BaqueGameController:
         validation_error = self._validate_actionable_snapshot(snapshot, frame)
         if validation_error:
             self.validation_rejection_count += 1
+            self._note_turn_problem(validation_error, rejection=True)
             return GameStepResult(False, validation_error, snapshot, frame)
 
         required_action = {
@@ -608,6 +775,7 @@ class BaqueGameController:
         if required_action is not None:
             current_action = await self._current_action_state()
             if current_action != required_action:
+                self._note_turn_problem("画面过期")
                 return GameStepResult(
                     False,
                     (
@@ -648,6 +816,7 @@ class BaqueGameController:
         try:
             message = await self._execute(frame, snapshot, decision)
         except StaleActionError as exc:
+            self._note_turn_problem(str(exc))
             return GameStepResult(False, str(exc), snapshot, frame)
         self.action_count += 1
         self._last_action_fingerprint = fingerprint
@@ -662,6 +831,7 @@ class BaqueGameController:
         和 3 个金牌的正式牌局后才返回，随后插件再启动三家观察器。
         """
         self._swap_phase_active = True
+        self._start_round_report("自动开局")
         await asyncio.to_thread(focus_game_window, self.window_title_keyword)
         # Windows 前台切换存在极短的异步窗口，给系统一点时间完成激活。
         await asyncio.sleep(0.30)
@@ -900,6 +1070,7 @@ class BaqueGameController:
                     if result.acted or not turn_gated
                     else 0.2
                 )
+            self._finish_round_report("停止自动游戏")
             return "已收到停止信号。"
         except asyncio.CancelledError:
             return "自动游戏已停止。"
@@ -993,6 +1164,7 @@ class BaqueGameController:
                 snapshot.gold_ranks,
                 tracker,
                 time_budget_seconds=budget,
+                avoid_discard=self._taken_visible,
             )
             LOGGER.info(
                 "八雀EV候选 %s",
@@ -1063,6 +1235,7 @@ class BaqueGameController:
                     self.last_decision_source = "hybrid_ev_fallback"
                     LOGGER.info("八雀HYBRID未配置本地决策模型，沿用Python EV")
 
+            self._note_eight_card_decision(snapshot, decision, tracker)
             if snapshot.screen_type == ScreenType.HU and decision.action != "hu":
                 LOGGER.info("当前虽可胡，但最终策略选择继续做牌：%s", decision.reason)
             return decision
@@ -1123,6 +1296,8 @@ class BaqueGameController:
             card = snapshot.visible_cards[decision.visible_index]
             await self._click_card(frame, card)
             self._record(self.tracker.record_own_take_visible, card)
+            self._taken_visible = card
+            self._count_action("draw")
             return decision.reason + "；已取亮牌。"
 
         if decision.action == "draw_deck":
@@ -1131,6 +1306,7 @@ class BaqueGameController:
                 raise RuntimeError("未识别到牌堆点击位置")
             await self._click(frame, snapshot.deck_click)
             self._record(self.tracker.record_own_draw_deck)
+            self._count_action("draw")
             return decision.reason + "；已摸牌堆。"
 
         if decision.action == "hu":
@@ -1138,6 +1314,7 @@ class BaqueGameController:
             live_hu = (await self._read_action_buttons()).get("hu")
             if live_hu is not None:
                 await self._click(frame, live_hu)
+                self._count_action("hu")
                 return decision.reason + "；已点击胡牌。"
             if snapshot.hu_button is None:
                 raise RuntimeError(
@@ -1145,6 +1322,7 @@ class BaqueGameController:
                     "但视觉没有可靠识别到胡牌按钮；为避免把胡牌打掉，本轮不操作。"
                 )
             await self._click(frame, snapshot.hu_button)
+            self._count_action("hu")
             return decision.reason + "；已点击胡牌。"
 
         if decision.action == "discard":
@@ -1166,6 +1344,7 @@ class BaqueGameController:
             discard_point = await self._require_discard_button()
             await self._click(frame, discard_point)
             self._record(self.tracker.record_own_discard, desired)
+            self._count_action("discard")
             return decision.reason + "；已出牌。"
 
         raise RuntimeError(f"未知游戏动作：{decision.action}")
@@ -1369,7 +1548,9 @@ class BaqueGameController:
             LOGGER.warning("八雀记牌写入失败（动作已执行）：%s", exc)
 
     def _sync_tracker_unchecked(self, snapshot: GameSnapshot) -> None:
-        if len(snapshot.gold_ranks) != 3 or len(snapshot.hand) not in {7, 8}:
+        # “?”选牌卡占一个手牌位：?+6 张普通牌也是完整的 7 张手牌。
+        hand_slots = len(snapshot.hand) + (1 if snapshot.opportunity_click is not None else 0)
+        if len(snapshot.gold_ranks) != 3 or hand_slots not in {7, 8}:
             return
         new_gold = tuple(snapshot.gold_ranks)
         should_reset = (
@@ -1392,9 +1573,14 @@ class BaqueGameController:
             self.opponent_event_count = 0
             self._round_info_attempts = 0
             LOGGER.info("建立新一局记牌状态 gold=%s deck=%s", new_gold, snapshot.deck_count)
-            return
-        self.tracker.update_own_hand(snapshot.hand)
-        self.tracker.set_deck_count(snapshot.deck_count)
+        else:
+            self.tracker.update_own_hand(snapshot.hand)
+            # 出牌阶段的快速识别不读牌堆数；没读到时保留已知值。
+            if snapshot.deck_count is not None:
+                self.tracker.set_deck_count(snapshot.deck_count)
+        if snapshot.screen_type == ScreenType.DRAW:
+            # 摸牌阶段看得到桌面亮牌（含对手刚打出的牌），这些牌不在牌堆里。
+            self.tracker.sync_table(snapshot.visible_cards)
 
     def apply_opponent_observation(self, observation: TableObservation) -> bool:
         """把高置信度的三家动作写入 TableTracker。
