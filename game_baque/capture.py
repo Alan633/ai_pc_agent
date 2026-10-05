@@ -8,6 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from game_baque.fast_vision import (
+    detect_action_state as cv_detect_action_state,
+    detect_round_in_progress as cv_detect_round_in_progress,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class GameWindow:
@@ -246,8 +251,7 @@ def capture_game_window_if_swap(
     避免把模型时间浪费在不可操作的动画帧上。
     """
     window, image = grab_game_window(title_keyword)
-    _, gray_ratio = _action_button_ratios(image)
-    if gray_ratio < BUTTON_GRAY_RATIO:
+    if cv_detect_action_state(image) != "swap":
         return None
     return _save_frame(output_dir, window, image)
 
@@ -294,37 +298,8 @@ def _action_button_ratios(image: Any) -> tuple[float, float]:
 
 
 def detect_action_state(image: Any) -> str | None:
-    """用固定 UI 色块快速判断当前玩家是否有操作权。"""
-    image = image.convert("RGB")
-    width, height = image.size
-    banner = list(
-        image.crop(
-            (
-                round(width * 0.30),
-                round(height * 0.55),
-                round(width * 0.70),
-                round(height * 0.62),
-            )
-        ).getdata()
-    )
-    if not banner:
-        return None
-
-    blue_ratio = sum(
-        1
-        for red, green, blue in banner
-        if blue > 150 and blue > red * 1.25 and blue > green * 1.05
-    ) / len(banner)
-    if blue_ratio < 0.25:
-        # 没有“请选择……”蓝色横幅时，不是自己的操作回合。
-        return None
-
-    orange_ratio, gray_ratio = _action_button_ratios(image)
-    if orange_ratio >= BUTTON_ORANGE_RATIO:
-        return "discard"
-    if gray_ratio >= BUTTON_GRAY_RATIO:
-        return "swap"
-    return "draw"
+    """OpenCV 快速判断当前玩家是否有操作权。"""
+    return cv_detect_action_state(image)
 
 
 def current_game_action_state(title_keyword: str) -> str | None:
@@ -334,31 +309,8 @@ def current_game_action_state(title_keyword: str) -> str | None:
 
 
 def detect_round_in_progress(image: Any) -> bool:
-    """中央蓝色背面牌堆可见即视为牌局进行中。
-
-    结算页、开始页、豆子弹窗遮罩下牌堆都不可见（实测蓝色占比 0~0.46，
-    牌局中稳定约 0.87），可据此决定是否需要调用视觉模型识别非回合画面。
-    """
-    image = image.convert("RGB")
-    width, height = image.size
-    pixels = list(
-        image.crop(
-            (
-                round(width * 0.368),
-                round(height * 0.34),
-                round(width * 0.40),
-                round(height * 0.43),
-            )
-        ).getdata()
-    )
-    if not pixels:
-        return False
-    blue_ratio = sum(
-        1
-        for red, green, blue in pixels
-        if blue > 170 and blue > red * 1.3 and blue > green * 1.1
-    ) / len(pixels)
-    return blue_ratio >= 0.70
+    """OpenCV 检测中央蓝色牌堆，判断牌局是否进行中。"""
+    return cv_detect_round_in_progress(image)
 
 
 def probe_game_turn(output_dir: Path, title_keyword: str) -> TurnProbe:
