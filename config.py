@@ -119,6 +119,10 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
     openai_base_url = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
     game_vision_base_url = os.getenv("GAME_VISION_BASE_URL", openai_base_url).strip().rstrip("/")
+    balatro_vision_base_url = os.getenv(
+        "BALATRO_VISION_BASE_URL", openai_base_url
+    ).strip().rstrip("/")
+    balatro_vision_model = os.getenv("BALATRO_VISION_MODEL", openai_model).strip()
     game_confidence = min(max(float(os.getenv("GAME_MIN_CARD_CONFIDENCE", "0.72")), 0.0), 1.0)
     event_confidence = min(max(float(os.getenv("GAME_MIN_EVENT_CONFIDENCE", "0.80")), 0.0), 1.0)
     decision_mode = os.getenv("GAME_DECISION_MODE", "hybrid").strip().lower()
@@ -130,10 +134,10 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
     if balatro_decision_mode not in {"python", "hybrid"}:
         raise ValueError("BALATRO_DECISION_MODE 必须是 python 或 hybrid")
     balatro_decision_base_url = os.getenv(
-        "BALATRO_DECISION_BASE_URL", openai_base_url
+        "BALATRO_DECISION_BASE_URL", balatro_vision_base_url
     ).strip().rstrip("/")
     balatro_decision_model = os.getenv(
-        "BALATRO_DECISION_MODEL", openai_model
+        "BALATRO_DECISION_MODEL", balatro_vision_model
     ).strip()
     settings = Settings(
         base_dir=root,
@@ -176,10 +180,8 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_hybrid_max_ev_drop=max(
             0.0, float(os.getenv("GAME_HYBRID_MAX_EV_DROP", "18.0"))
         ),
-        balatro_vision_model=os.getenv("BALATRO_VISION_MODEL", openai_model).strip(),
-        balatro_vision_base_url=os.getenv(
-            "BALATRO_VISION_BASE_URL", openai_base_url
-        ).strip().rstrip("/"),
+        balatro_vision_model=balatro_vision_model,
+        balatro_vision_base_url=balatro_vision_base_url,
         balatro_window_title_keyword=os.getenv("BALATRO_WINDOW_TITLE", "Balatro").strip(),
         balatro_action_interval_seconds=max(
             0.4, float(os.getenv("BALATRO_ACTION_INTERVAL_SECONDS", "1.2"))
