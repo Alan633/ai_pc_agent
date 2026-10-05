@@ -459,3 +459,86 @@ def test_balatrobot_audio_can_be_disabled(
     command = client._serve_command(tmp_path)
 
     assert "--audio" not in command
+
+
+
+def _write_balatrobot_settings_fixture(mod_dir: Path) -> Path:
+    settings = mod_dir / "src" / "lua" / "settings.lua"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(
+        """
+local function configure_settings()
+  G.SETTINGS.SOUND.volume = 0
+  G.SETTINGS.SOUND.music_volume = 0
+  G.SETTINGS.SOUND.game_sounds_volume = 0
+  G.F_SOUND_THREAD = false
+  G.F_MUTE = true
+  G.SETTINGS.GAMESPEED = BB_SETTINGS.gamespeed
+  G.SETTINGS.GRAPHICS.shadows = "Off"
+  G.SETTINGS.GRAPHICS.bloom = 0
+  G.SETTINGS.GRAPHICS.crt = 0
+  G.SETTINGS.reduced_motion = true
+  G.SETTINGS.screenshake = false
+  G.SETTINGS.WINDOW.vsync = 0
+end
+
+--- Configures headless mode
+local function configure_headless()
+end
+
+local function configure_audio()
+  G.SETTINGS.SOUND = G.SETTINGS.SOUND or {}
+  G.SETTINGS.SOUND.volume = 50
+  G.SETTINGS.SOUND.music_volume = 100
+  G.SETTINGS.SOUND.game_sounds_volume = 100
+  G.F_MUTE = false
+  G.F_SOUND_THREAD = true
+end
+
+--- Initializes and applies
+BB_SETTINGS.setup = function()
+end
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    return settings
+
+
+def test_preserve_user_settings_patch_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    mod_dir = tmp_path / "balatrobot"
+    settings = _write_balatrobot_settings_fixture(mod_dir)
+    client = BalatroBotClient(
+        mod_path=str(mod_dir),
+        preserve_user_settings=True,
+        audio=True,
+    )
+
+    assert client._patch_preserve_user_settings() == "patched"
+    patched = settings.read_text(encoding="utf-8")
+    assert "AIAGENT_PRESERVE_USER_SETTINGS_V1" in patched
+    assert "G.SETTINGS.GAMESPEED = BB_SETTINGS.gamespeed" not in patched
+    assert 'G.SETTINGS.GRAPHICS.shadows = "Off"' not in patched
+    assert "G.SETTINGS.WINDOW.vsync = 0" not in patched
+    assert "G.F_SOUND_THREAD = true" in patched
+    assert settings.with_name("settings.lua.aiagent.bak").exists()
+
+    assert client._patch_preserve_user_settings() == "already_patched"
+
+
+def test_preserve_user_settings_patch_can_be_disabled(
+    tmp_path: Path,
+) -> None:
+    mod_dir = tmp_path / "balatrobot"
+    settings = _write_balatrobot_settings_fixture(mod_dir)
+    original = settings.read_text(encoding="utf-8")
+    client = BalatroBotClient(
+        mod_path=str(mod_dir),
+        preserve_user_settings=False,
+    )
+
+    assert client._patch_preserve_user_settings() == "disabled"
+    assert settings.read_text(encoding="utf-8") == original
+    assert not settings.with_name("settings.lua.aiagent.bak").exists()
