@@ -11,3 +11,6 @@ pynput>=1.7.7,<2
 pyperclip>=1.9,<2
 pytest>=8.3,<10
 pytest-asyncio>=0.24,<2
+
+opencv-python-headless>=4.10,<5
+numpy>=1.26,<3
