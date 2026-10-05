@@ -23,8 +23,9 @@ from game_baque.capture import (
 from game_baque.ev import ExpectedValueEngine
 from game_baque.event_vision import TableObservation
 from game_baque.fast_vision import analyze_image_path
+from game_baque.local_decision import LocalDecisionReranker
 from game_baque.models import Card, GameDecision, GameSnapshot, Point, ScreenType
-from game_baque.strategy import choose_swap_two
+from game_baque.strategy import choose_discard, choose_draw, choose_swap_two
 from game_baque.tracker import TableTracker
 from game_baque.vision import BaqueVision
 
@@ -58,6 +59,8 @@ class BaqueGameController:
         auto_next_round: bool = False,
         decision_budget_seconds: float = 4.0,
         fast_vision_enabled: bool = True,
+        decision_mode: str = "ev",
+        decision_reranker: LocalDecisionReranker | None = None,
     ) -> None:
         self.vision = vision
         self.screenshots_dir = screenshots_dir
@@ -68,6 +71,11 @@ class BaqueGameController:
         self.min_event_confidence = min(max(float(min_event_confidence), 0.0), 1.0)
         self.auto_next_round = bool(auto_next_round)
         self.fast_vision_enabled = bool(fast_vision_enabled)
+        normalized_mode = decision_mode.strip().lower()
+        if normalized_mode not in {"rule", "ev", "hybrid"}:
+            raise ValueError("decision_mode 必须是 rule、ev 或 hybrid")
+        self.decision_mode = normalized_mode
+        self.decision_reranker = decision_reranker
         # 回合约 20 秒，识别占 4~6 秒；EV 决策必须在预算内给出结果。
         self.decision_budget_seconds = max(0.5, float(decision_budget_seconds))
         self.last_snapshot: GameSnapshot | None = None
@@ -92,6 +100,9 @@ class BaqueGameController:
         self.fast_ui_count = 0
         self.qwen_vision_count = 0
         self.fast_ui_fallback_count = 0
+        self.hybrid_decision_count = 0
+        self.hybrid_fallback_count = 0
+        self.last_decision_source = "none"
 
     async def inspect(
         self,
@@ -648,6 +659,10 @@ class BaqueGameController:
             "qwen_vision_count": self.qwen_vision_count,
             "fast_ui_fallback_count": self.fast_ui_fallback_count,
             "fast_vision_enabled": self.fast_vision_enabled,
+            "decision_mode": self.decision_mode,
+            "hybrid_decision_count": self.hybrid_decision_count,
+            "hybrid_fallback_count": self.hybrid_fallback_count,
+            "last_decision_source": self.last_decision_source,
         }
 
     def _decide(
@@ -656,9 +671,26 @@ class BaqueGameController:
         tracker: TableTracker | None = None,
     ) -> GameDecision:
         tracker = tracker or self.tracker
+
         if snapshot.screen_type == ScreenType.SWAP:
+            self.last_decision_source = "rule"
             return choose_swap_two(snapshot.hand, snapshot.gold_ranks)
+
+        if self.decision_mode == "rule":
+            self.last_decision_source = "rule"
+            if snapshot.screen_type == ScreenType.DRAW:
+                return choose_draw(
+                    snapshot.hand,
+                    snapshot.visible_cards,
+                    snapshot.gold_ranks,
+                )
+            if snapshot.screen_type in {ScreenType.DISCARD, ScreenType.HU}:
+                return choose_discard(snapshot.hand, snapshot.gold_ranks)
+            raise RuntimeError(f"当前状态不可决策：{snapshot.screen_type.value}")
+
         if snapshot.screen_type == ScreenType.DRAW:
+            # 摸牌阶段候选空间较小，继续由 Python EV 决定，避免多一次模型延迟。
+            self.last_decision_source = "ev"
             return self.ev.choose_draw_action(
                 snapshot.hand,
                 snapshot.visible_cards,
@@ -667,6 +699,7 @@ class BaqueGameController:
                 opportunity_available=snapshot.opportunity_click is not None,
                 time_budget_seconds=self.decision_budget_seconds,
             )
+
         if snapshot.screen_type in {ScreenType.DISCARD, ScreenType.HU}:
             decision, values = self.ev.choose_8_card_action(
                 snapshot.hand,
@@ -680,6 +713,12 @@ class BaqueGameController:
                     {
                         "action": item.action,
                         "card_index": item.card_index,
+                        "card": (
+                            snapshot.hand[item.card_index].label
+                            if item.card_index is not None
+                            and 0 <= item.card_index < len(snapshot.hand)
+                            else None
+                        ),
                         "ev": round(item.expected_value, 2),
                         "future": round(item.future_hu_value, 2),
                         "risk": round(item.opponent_risk, 2),
@@ -687,9 +726,42 @@ class BaqueGameController:
                     for item in values[:5]
                 ],
             )
+
+            if self.decision_mode == "hybrid" and self.decision_reranker is not None:
+                hybrid = self.decision_reranker.rerank_8_card_action(
+                    hand=snapshot.hand,
+                    gold_ranks=snapshot.gold_ranks,
+                    tracker=tracker,
+                    ev_decision=decision,
+                    values=values,
+                )
+                if hybrid.used_model:
+                    self.hybrid_decision_count += 1
+                    self.last_decision_source = "hybrid_qwen"
+                    LOGGER.info(
+                        "八雀HYBRID决策 choice=%s confidence=%.2f action=%s indexes=%s reason=%s",
+                        hybrid.choice_id,
+                        hybrid.confidence,
+                        hybrid.decision.action,
+                        hybrid.decision.card_indexes,
+                        hybrid.reason,
+                    )
+                    decision = hybrid.decision
+                else:
+                    self.hybrid_fallback_count += 1
+                    self.last_decision_source = "hybrid_ev_fallback"
+                    LOGGER.info("八雀HYBRID回退EV：%s", hybrid.reason)
+            else:
+                self.last_decision_source = "ev"
+                if self.decision_mode == "hybrid":
+                    self.hybrid_fallback_count += 1
+                    self.last_decision_source = "hybrid_ev_fallback"
+                    LOGGER.info("八雀HYBRID未配置本地决策模型，沿用Python EV")
+
             if snapshot.screen_type == ScreenType.HU and decision.action != "hu":
-                LOGGER.info("当前虽可胡，但EV模型选择继续做牌：%s", decision.reason)
+                LOGGER.info("当前虽可胡，但最终策略选择继续做牌：%s", decision.reason)
             return decision
+
         raise RuntimeError(f"当前状态不可决策：{snapshot.screen_type.value}")
 
     async def _execute(
