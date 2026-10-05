@@ -358,6 +358,7 @@ def test_balatrobot_ensure_server_auto_starts_uvx(
         "serve",
     ]
     assert "--logs-path" in command
+    assert "--audio" in command
     assert (tmp_path / "balatrobot_serve.log").exists()
 
 
@@ -429,3 +430,32 @@ def test_windows_launch_args_pass_balatro_and_lovely_paths(
         "--platform",
         "windows",
     ]
+
+
+
+def test_balatrobot_audio_can_be_disabled(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    client = BalatroBotClient(audio=False)
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "C:/Tools/uvx.exe" if name == "uvx" else None,
+    )
+    monkeypatch.setattr(
+        client,
+        "_windows_launch_args",
+        lambda: [
+            "--love-path",
+            "C:/Games/Balatro/Balatro.exe",
+            "--lovely-path",
+            "C:/Games/Balatro/winmm.dll",
+            "--platform",
+            "windows",
+        ],
+    )
+
+    command = client._serve_command(tmp_path)
+
+    assert "--audio" not in command
