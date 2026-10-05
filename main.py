@@ -174,7 +174,7 @@ def main() -> None:
                     "牌局采集器: Ready",
                     f"对手观察器: {'Ready' if baque.observer else 'Unavailable'}",
                     f"Balatro插件: {'Ready' if balatro.game else '需要 OPENAI_API_KEY 或 BALATRO_VISION_BASE_URL'}",
-                    "Balatro决策: Python牌型枚举 + 保守商店策略",
+                    f"Balatro决策: {balatro.game.decision_mode.upper() if balatro.game else 'Unavailable'} / Python候选 + 本地Qwen策略",
                     "Emergency Stop: Ctrl+Alt+F12",
                     "Agent: READY",
                     "================================",
