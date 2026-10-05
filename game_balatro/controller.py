@@ -188,6 +188,45 @@ class BalatroController:
             ),
         )
 
+    @staticmethod
+    def _safe_card_click_point(
+        snapshot: BalatroSnapshot,
+        index: int,
+    ) -> tuple[int, int]:
+        """返回重叠手牌的安全点击点。
+
+        Balatro 手牌是从左到右重叠绘制的。直接点击模型给出的几何中心，
+        前面的牌很容易被右侧邻牌覆盖，实际命中邻牌。这里把 X 向每张牌
+        左侧已露出的区域移动约半个牌间距；最后一张同样轻微左移，仍位于
+        自身最上层区域。Y 保持模型识别值，避免选中牌抬升后再引入纵向误差。
+        """
+        if index < 0 or index >= len(snapshot.hand):
+            raise IndexError(index)
+        card = snapshot.hand[index]
+        if len(snapshot.hand) <= 1:
+            return card.x, card.y
+
+        gaps = [
+            snapshot.hand[pos + 1].x - snapshot.hand[pos].x
+            for pos in range(len(snapshot.hand) - 1)
+            if snapshot.hand[pos + 1].x > snapshot.hand[pos].x
+        ]
+        if not gaps:
+            return card.x, card.y
+
+        local_gap: int
+        if index < len(snapshot.hand) - 1:
+            candidate = snapshot.hand[index + 1].x - card.x
+            local_gap = candidate if candidate > 0 else gaps[len(gaps) // 2]
+        else:
+            candidate = card.x - snapshot.hand[index - 1].x
+            local_gap = candidate if candidate > 0 else gaps[len(gaps) // 2]
+
+        shift = max(6, round(local_gap * 0.45))
+        # 不允许因为模型异常间距把点击点推离当前牌太远。
+        shift = min(shift, max(12, round(sum(gaps) / len(gaps) * 0.65)))
+        return max(0, card.x - shift), card.y
+
     async def _click(
         self,
         frame: CapturedFrame,
@@ -251,10 +290,25 @@ class BalatroController:
                     card.selected
                     and index not in desired
                 ):
-                    await self._click(
-                        frame,
+                    safe_x, safe_y = self._safe_card_click_point(
+                        snapshot,
+                        index,
+                    )
+                    LOGGER.info(
+                        "Balatro手牌安全点击 index=%d card=%s%s model=(%d,%d) safe=(%d,%d) selected=%s",
+                        index,
+                        card.rank,
+                        card.suit,
                         card.x,
                         card.y,
+                        safe_x,
+                        safe_y,
+                        card.selected,
+                    )
+                    await self._click(
+                        frame,
+                        safe_x,
+                        safe_y,
                     )
                     await asyncio.sleep(0.08)
 
@@ -269,10 +323,25 @@ class BalatroController:
                     )
                 card = snapshot.hand[index]
                 if not card.selected:
-                    await self._click(
-                        frame,
+                    safe_x, safe_y = self._safe_card_click_point(
+                        snapshot,
+                        index,
+                    )
+                    LOGGER.info(
+                        "Balatro手牌安全点击 index=%d card=%s%s model=(%d,%d) safe=(%d,%d) selected=%s",
+                        index,
+                        card.rank,
+                        card.suit,
                         card.x,
                         card.y,
+                        safe_x,
+                        safe_y,
+                        card.selected,
+                    )
+                    await self._click(
+                        frame,
+                        safe_x,
+                        safe_y,
                     )
                     await asyncio.sleep(0.08)
 
