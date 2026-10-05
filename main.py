@@ -61,6 +61,7 @@ from config import load_settings
 from emergency import EmergencyHotkey
 from logging_setup import configure_logging
 from plugins.baque import BaquePlugin
+from plugins.balatro import BalatroPlugin
 from telegram_bot.callbacks import ConfirmationStore
 from telegram_bot.handlers import TelegramHandlers
 from tools.apps import AppCatalog
@@ -132,8 +133,10 @@ def main() -> None:
     # 专项能力全部走插件层。必须在 Planner 读取 schemas() 前注册，
     # 这样本地 Qwen 才能直接调用“观察八雀/自动玩/验收报告”等能力。
     baque = BaquePlugin.build(settings, session)
+    balatro = BalatroPlugin.build(settings, session)
     registry = build_registry(settings, security, processes, session)
     baque.register_tools(registry)
+    balatro.register_tools(registry)
 
     planner = OpenAIPlanner(
         settings.openai_api_key,
@@ -170,6 +173,8 @@ def main() -> None:
                     f"八雀决策: {baque.game.decision_mode.upper() if baque.game else 'Unavailable'}",
                     "牌局采集器: Ready",
                     f"对手观察器: {'Ready' if baque.observer else 'Unavailable'}",
+                    f"Balatro插件: {'Ready' if balatro.game else '需要 OPENAI_API_KEY 或 BALATRO_VISION_BASE_URL'}",
+                    "Balatro决策: Python牌型枚举 + 保守商店策略",
                     "Emergency Stop: Ctrl+Alt+F12",
                     "Agent: READY",
                     "================================",
@@ -181,6 +186,7 @@ def main() -> None:
         confirmations.cancel_all()
         session.request_stop()
         await baque.shutdown()
+        await balatro.shutdown()
         emergency.stop()
 
     application = (
@@ -201,6 +207,7 @@ def main() -> None:
         game_recorder=baque.recorder,
         game_observer=baque.observer,
         baque_plugin=baque,
+        balatro_plugin=balatro,
     ).install(application)
     LOGGER.info("启动 Telegram polling")
     application.run_polling(drop_pending_updates=False)
