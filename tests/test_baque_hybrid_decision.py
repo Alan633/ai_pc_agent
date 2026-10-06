@@ -149,3 +149,25 @@ def test_hybrid_prompt_contains_only_legal_candidates(monkeypatch) -> None:
     assert '"choice_id":"A"' in seen[0]
     assert '"choice_id":"B"' in seen[0]
     assert '"choice_id":"C"' not in seen[0]
+
+
+def test_hybrid_skips_model_when_no_candidate_is_within_ev_guard(monkeypatch) -> None:
+    reranker = _reranker(max_ev_drop=4.0)
+
+    def fail_request(_prompt: str) -> str:
+        raise AssertionError("EV 明显领先时不应请求模型")
+
+    monkeypatch.setattr(reranker, "_request", fail_request)
+    ev = GameDecision("discard", card_indexes=(2,), reason="EV最高")
+
+    result = reranker.rerank_8_card_action(
+        hand=_hand(),
+        gold_ranks=("7", "Q", "A"),
+        tracker=TableTracker(),
+        ev_decision=ev,
+        values=_values(),
+    )
+
+    assert result.used_model is False
+    assert result.decision == ev
+    assert "无需模型重排" in result.reason

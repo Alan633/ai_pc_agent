@@ -19,6 +19,20 @@ def test_swap_does_not_throw_away_wildcard_in_normal_hand() -> None:
     assert len(decision.card_indexes) == 2
 
 
+def test_swap_supports_five_real_cards_with_two_question_cards() -> None:
+    cards = [w(), c("9", "S"), c("8", "S"), c("A", "H"), c("7", "C")]
+    decision = choose_swap_two(cards, ("6", "7", "J"))
+    assert 0 not in decision.card_indexes
+    assert len(decision.card_indexes) == 2
+
+
+def test_swap_supports_three_real_cards_with_four_question_cards() -> None:
+    cards = [w(), c("9", "S"), c("8", "S")]
+    decision = choose_swap_two(cards, ("6", "7", "J"))
+    assert 0 not in decision.card_indexes
+    assert set(decision.card_indexes) == {1, 2}
+
+
 def test_discard_detects_immediate_hu() -> None:
     cards = [
         c("K", "S"), c("K", "H"), c("K", "C"), c("K", "D"), c("K", "S"), c("K", "H"),
@@ -64,3 +78,35 @@ def test_ev_question_card_in_hand_still_draws_normally() -> None:
     # “?”选牌卡在出牌阶段才打出；摸牌阶段照常摸牌堆/取亮牌。
     assert decision.action == "draw_deck"
     assert decision.visible_index is None
+
+
+def test_ev_two_question_cards_and_wild_still_draw_normally() -> None:
+    hand = [w(), c("9", "S"), c("8", "S"), c("A", "H"), c("7", "C")]
+    tracker = TableTracker()
+    tracker.reset_round(hand, deck_count=56)
+
+    decision = ExpectedValueEngine(simulations=20, seed=9).choose_draw_action(
+        hand,
+        [],
+        ("6", "7", "J"),
+        tracker,
+        opportunity_count=2,
+    )
+
+    assert decision.action == "draw_deck"
+
+
+def test_ev_four_question_cards_and_wild_still_draw_normally() -> None:
+    hand = [w(), c("9", "S"), c("8", "S")]
+    tracker = TableTracker()
+    tracker.reset_round(hand, deck_count=56)
+
+    decision = ExpectedValueEngine(simulations=20, seed=10).choose_draw_action(
+        hand,
+        [],
+        ("6", "7", "J"),
+        tracker,
+        opportunity_count=4,
+    )
+
+    assert decision.action == "draw_deck"

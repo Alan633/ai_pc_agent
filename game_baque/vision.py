@@ -16,7 +16,10 @@ from PIL import Image
 from game_baque.capture import find_action_buttons
 from game_baque.models import Card, GameSnapshot, OpponentEvent, Point, RANKS, ScreenType, SUITS
 from game_baque.rules import evaluate_hu
+from game_baque.suit_glyph import classify_hand_suits
 from game_baque.vision_coordinator import LocalVisionCoordinator
+
+LOGGER = logging.getLogger(__name__)
 
 
 LOCAL_VISION_SIZE = (1280, 720)
@@ -46,6 +49,7 @@ VISION_PROMPT = """你只负责读取腾讯欢乐斗地主“百变八雀·点�
    - waiting：等待其他玩家或动画；
    - settlement：正常结算/本局结束；
    - recharge：豆子不足、充值、购买弹窗；
+   - lobby：新手场/普通场/高级场/顶级场的场次选择页，表示本次牌局已经终止；
    - unknown：无法可靠判断。
 11. 坐标均使用“这张输入图片自身的像素坐标”，左上角为 (0,0)。
 12. 看不清的牌不要猜。confidence 低于 0.65 时仍可返回，但如无法确定 rank/suit，应将整个 screen_type 设为 unknown，并在 message 中说明。
@@ -65,7 +69,7 @@ LOCAL_VISION_PROMPT = """识别腾讯欢乐斗地主“百变八雀·点字成�
 
 规则：
 - 所有牌和按钮坐标使用 Qwen 视觉的 0-1000 归一化坐标：左上=(0,0)，右下=(1000,1000)。
-- screen_type: start/swap/draw/discard/hu/waiting/settlement/recharge/unknown。
+- screen_type: start/swap/draw/discard/hu/waiting/settlement/recharge/lobby/unknown。
 - start=中央有橙色“开始游戏”；recharge=豆子不足/充值/购买，绝不能误点购买。
 - gold_ranks 必须是三个点数字符串，例如 ["6","8","9"]，绝不能返回对象。
 - 金牌是左上 3 张黄色小牌；自己的手牌在底部，按左到右。
@@ -123,15 +127,24 @@ HAND_COMPACT_PROMPT = """只识别图中自己的手牌，只输出 JSON，不�
 从左到右逐张返回，牌互相遮挡也必须数全，两张一模一样的牌要分别写两次。每张写成 点数+花色字母：点数 6/7/8/9/10/J/Q/K/A，花色 S♠ H♥ C♣ D♦。
 写着“癞子”的牌写 "WILD"；橙色“?”加骰子的选牌卡写 "?"。牌被明显抬高时在后面加 "^"，如 "AH^"。"""
 
+# 重读改用对象格式、花色必填：紧凑写法偶尔整手牌都把“20分”抄成点数、丢掉花色
+# （如 "K20"、"1010"），同一提示词重读结果一模一样，曾连续 6 次识别为 0 张而丢掉回合。
 HAND_COMPACT_FALLBACK_PROMPT = """只识别图中自己的手牌，只输出 JSON，不要解释。
-格式：{"hand":["WILD","AH","10S"]}
-从左到右逐张返回，牌互相遮挡也必须数全，每张只写一次。每张写成 点数+花色字母：点数 6/7/8/9/10/J/Q/K/A，花色 S♠ H♥ C♣ D♦。
-写着“癞子”的牌写 "WILD"；橙色“?”加骰子的选牌卡写 "?"。牌被明显抬高时在后面加 "^"，如 "AH^"。"""
+格式：{"hand":[{"rank":"K","suit":"H"},{"rank":"WILD","suit":"NONE"}]}
+从左到右逐张返回，牌互相遮挡也必须数全。rank 只能是 6/7/8/9/10/J/Q/K/A；每张牌左上角大字是点数，点数下方的图案是花色：suit 必填，S=黑桃♠ H=红桃♥ C=梅花♣ D=方块♦。
+牌右上角橙色小字“10分/20分/30分”是分值，不是点数，不要写进 rank。写着“癞子”的牌 rank="WILD"、suit="NONE"；橙色“?”加骰子的选牌卡 rank="?"、suit="NONE"。牌被明显抬高时加 "up":true。"""
 
 # 出牌/摸牌阶段手牌区应有的张数（含“?”选牌卡）。
 TURN_HAND_COUNTS = {"draw": 7, "discard": 8}
 # 牌角“30分/20分/10分”有时被抄进牌面，如 "A30H"、"J20S"。
 _CARD_TOKEN_RE = re.compile(r"^(10|[6-9JQKA])(?:10|20|30)?([SHCD])$")
+_RANK_ONLY_RE = re.compile(r"^(10|[6-9JQKA])(?:10|20|30)?$")
+
+# 亮牌行默认用对象格式、花色必填：紧凑写法常只写点数（"K"、"J"）丢掉花色，
+# 整行被丢弃后对手记牌会把“重新出现”的牌误当成新打出的牌。
+TABLE_OBJECT_PROMPT = """图中是牌桌中央：最左边是蓝色背面牌堆（上面有数字），右边依次是 4 个亮牌位，最右侧小图标不是亮牌。只输出 JSON，不要解释。
+格式：{"deck":52,"slots":[{"rank":"K","suit":"H"},null,{"rank":"9","suit":"D"},null]}
+deck：牌堆背面上的数字。slots：牌堆右边 4 个位置从左到右，空位写 null。rank 只能是 6/7/8/9/10/J/Q/K/A；每张牌左上角大字是点数，点数下方的图案是花色：suit 必填，S=黑桃♠ H=红桃♥ C=梅花♣ D=方块♦。牌上橙色“吃”只是提示，不是牌。"""
 
 TABLE_COMPACT_PROMPT = """图中是牌桌中央：最左边是蓝色背面牌堆（上面有数字），右边依次是 4 个亮牌位，最右侧小“?”图标不是牌。只输出 JSON，不要解释。
 格式：{"deck":52,"slots":["","9D","",""]}
@@ -139,6 +152,7 @@ deck：牌堆背面上的数字。slots：牌堆右边 4 个位置从左到右�
 
 # 裁剪区域（相对窗口宽高）与放大倍数。
 HAND_CROP_BOX = (0.24, 0.74, 0.76, 1.0)
+HAND_CROP_SCALE = 2
 TABLE_CROP_BOX = (0.355, 0.32, 0.67, 0.45)
 TABLE_CROP_SCALE = 2
 _SUIT_SYMBOLS = {"♠": "S", "♥": "H", "♣": "C", "♦": "D"}
@@ -150,6 +164,13 @@ ROOM_WIN_CAPS: dict[str, float] = {
     "高级": 3_000_000.0,
     "顶级": 8_000_000.0,
 }
+# 底分与场次一一对应。标题里的“X场”常被“认输”标签挡住，底分数字更可靠。
+ROOM_BY_BASE_SCORE: dict[float, str] = {
+    10.0: "新手",
+    35.0: "普通",
+    240.0: "高级",
+    800.0: "顶级",
+}
 
 # 本局信息：让模型只照抄裁剪出的文字，字段由代码解析。整图让模型直接填
 # 字段时会照抄提示里的示例值（把普通场读成“新手场、底分 10”）；裁剪照抄
@@ -157,6 +178,9 @@ ROOM_WIN_CAPS: dict[str, float] = {
 TITLE_COPY_PROMPT = """照抄图中这一行文字，只输出 JSON：{"text":"..."}"""
 BEANS_COPY_PROMPT = """图中从上到下有三行，每行是一个欢乐豆数量（黄色豆子图标右边的数字，可能带“万”）。从上到下照抄，只输出 JSON：{"beans":["","",""]}"""
 TITLE_CROP_BOX = (0.33, 0.18, 0.67, 0.24)
+# 左下角自己的欢乐豆。
+OWN_BEANS_CROP_BOX = (0.035, 0.94, 0.11, 0.99)
+OWN_BEANS_COPY_PROMPT = """图中是一个欢乐豆数量（可能带“万”或“亿”）。照抄这个数字，只输出 JSON：{"beans":""}"""
 # 左、上、右三家欢乐豆所在区域。
 BEAN_CROP_BOXES = (
     (0.015, 0.40, 0.11, 0.48),
@@ -239,7 +263,7 @@ SNAPSHOT_SCHEMA = {
     "properties": {
         "screen_type": {
             "type": "string",
-            "enum": ["start", "swap", "draw", "discard", "hu", "waiting", "settlement", "recharge", "unknown"],
+            "enum": ["start", "swap", "draw", "discard", "hu", "waiting", "settlement", "recharge", "lobby", "unknown"],
         },
         "gold_ranks": {
             "type": "array",
@@ -365,15 +389,15 @@ class BaqueVision:
         current_url, original_size = self._local_data_url(image_path)
         payload = await self._quick_json(LOCAL_SWAP_PROMPT, current_url, "换牌")
         hand_values = payload.get("hand", [])
+        opportunity_count = 0
+        opportunity_click: Point | None = None
         if isinstance(hand_values, list):
-            placeholder = next(
-                (
-                    item
-                    for item in hand_values
-                    if isinstance(item, dict) and str(item.get("rank", "")) == "?"
-                ),
-                None,
-            )
+            placeholders = [
+                item
+                for item in hand_values
+                if isinstance(item, dict) and str(item.get("rank", "")) == "?"
+            ]
+            opportunity_count = len(placeholders)
             # 癞子是真实手牌；只按普通点数过滤会把它丢掉，6 张手牌变 5 张，
             # 换牌校验失败并错过倒计时。
             hand_values = [
@@ -387,14 +411,15 @@ class BaqueVision:
             # 使用固定牌位：问号+6张普通牌时普通牌从 350 开始；选牌已经翻成
             # 普通牌、共7张时从 285 开始。牌面仍由模型识别，点击点使用实图
             # 标定后的稳定暴露区域中心。
-            if len(hand_values) == 7 and placeholder is None:
+            if len(hand_values) == 7 and opportunity_count == 0:
                 for index, item in enumerate(hand_values):
                     item["x"] = 285 + index * 58
                     item["y"] = 850
-            elif len(hand_values) == 6:
+            elif len(hand_values) + opportunity_count == 7:
                 for index, item in enumerate(hand_values):
-                    item["x"] = 350 + index * 60
+                    item["x"] = 290 + (opportunity_count + index) * 60
                     item["y"] = 850
+                opportunity_click = Point(290, 850)
             for item in hand_values:
                 # 专用协议刻意省略这些恒定字段以减少输出 token；合法普通牌已
                 # 经过 rank/suit 白名单约束，赋予可执行识别的默认置信度。
@@ -405,6 +430,8 @@ class BaqueVision:
             screen_type=ScreenType.SWAP,
             gold_ranks=self._to_gold_ranks(payload.get("gold_ranks", [])),
             hand=self._to_cards(hand_values, field_name="swap_hand"),
+            opportunity_click=opportunity_click,
+            opportunity_count=opportunity_count,
             swap_button=self._to_point(
                 {
                     **(payload.get("swap_button") or {}),
@@ -450,6 +477,9 @@ class BaqueVision:
                     hu_button=buttons["hu"],
                     discard_button=buttons.get("discard", snapshot.discard_button),
                 )
+            # 牌型满足但游戏没给胡按钮（如“?”选牌补成的 8 张）：照常出牌。
+            # 不再整图重识别，那要多花约 4 秒，曾因此拖到回合超时被系统代打。
+            return snapshot
         return await self._parse_turn_full(image_path, action_state)
 
     async def _parse_turn_crops(
@@ -457,25 +487,41 @@ class BaqueVision:
         image_path: Path,
         action_state: str,
         gold_ranks: tuple[str, ...],
+        *,
+        read_table: bool = True,
     ) -> GameSnapshot:
+        expected = TURN_HAND_COUNTS.get(action_state)
         with Image.open(image_path) as image:
             image = image.convert("RGB")
             original_size = image.size
+            # 首读用原尺寸（快）：花色由像素判定，模型只需读准点数；只给点数
+            # 不给花色（如 "K20"）也能由像素补齐。对不上时才放大 2 倍重读。
             hand_url = self._crop_data_url(image, HAND_CROP_BOX)
+            hand_zoom_url = self._crop_data_url(image, HAND_CROP_BOX, HAND_CROP_SCALE)
             table_url = (
                 self._crop_data_url(image, TABLE_CROP_BOX, TABLE_CROP_SCALE)
-                if action_state == "draw"
+                if action_state == "draw" and read_table
                 else None
             )
+            pixel_suits = classify_hand_suits(image, expected) if expected is not None else []
         hand_items = self._compact_hand_items(
             (await self._quick_json(HAND_COMPACT_PROMPT, hand_url, "手牌")).get("hand", [])
         )
-        expected = TURN_HAND_COUNTS.get(action_state)
-        if expected is not None and len(hand_items) != expected:
-            retry_items = self._compact_hand_items(
-                (await self._quick_json(HAND_COMPACT_FALLBACK_PROMPT, hand_url, "手牌重读")).get("hand", [])
+        hand_items = self._apply_pixel_suits(hand_items, pixel_suits)
+        if expected is not None and (
+            len(hand_items) != expected or self._exceeds_deck(hand_items)
+        ):
+            retry_items = self._apply_pixel_suits(
+                self._compact_hand_items(
+                    (
+                        await self._quick_json(HAND_COMPACT_FALLBACK_PROMPT, hand_zoom_url, "手牌重读")
+                    ).get("hand", [])
+                ),
+                pixel_suits,
             )
-            if len(retry_items) == expected:
+            if len(retry_items) == expected and (
+                len(hand_items) != expected or not self._exceeds_deck(retry_items)
+            ):
                 hand_items = retry_items
         payload: dict[str, Any] = {
             "gold_ranks": list(gold_ranks),
@@ -485,17 +531,116 @@ class BaqueVision:
             "hu_button": None,
         }
         if table_url is not None:
-            table_payload = await self._quick_json(TABLE_COMPACT_PROMPT, table_url, "亮牌")
-            payload["deck_count"] = table_payload.get("deck", -1)
-            slots = table_payload.get("slots", [])
-            for slot_x, token in zip(TURN_TABLE_SLOTS, slots if isinstance(slots, list) else []):
-                card = self._parse_card_token(token)
-                if card is not None and card["rank"] != "?":
-                    payload["table"].append({**card, "x": slot_x})
+            payload["deck_count"], payload["table"] = await self._read_table_url(table_url)
         return self._scale_local_snapshot(
             self._turn_snapshot(payload, action_state),
             original_size,
         )
+
+    @staticmethod
+    def _apply_pixel_suits(
+        items: list[dict[str, Any]], pixel_suits: list[str | None]
+    ) -> list[dict[str, Any]]:
+        """张数与牌位对得上时，用像素判定的花色覆盖模型读数（模型常把同色花色互认）。"""
+        if pixel_suits and len(items) == len(pixel_suits):
+            corrected: list[dict[str, Any]] = []
+            changes: list[str] = []
+            for item, suit in zip(items, pixel_suits):
+                if suit is not None and item["rank"] not in {"?", "WILD"} and item["suit"] != suit:
+                    changes.append(f"{item['rank']}{item['suit'] or '?'}→{item['rank']}{suit}")
+                    item = {**item, "suit": suit}
+                corrected.append(item)
+            if changes:
+                LOGGER.info("八雀花色像素校正：%s", "、".join(changes))
+            items = corrected
+        # 仍然缺花色的牌无法使用：丢掉后张数对不上，会触发放大重读。
+        return [item for item in items if item["rank"] in {"?", "WILD"} or item["suit"] in SUITS]
+
+    @staticmethod
+    def _exceeds_deck(items: list[dict[str, Any]]) -> bool:
+        """手牌里某张牌超过牌池张数（每张 2 张、8 为 3 张、癞子 4 张）必然是误读。"""
+        counts: dict[tuple[str, str], int] = {}
+        for item in items:
+            if item["rank"] == "?":
+                continue
+            key = (item["rank"], item["suit"])
+            counts[key] = counts.get(key, 0) + 1
+        for (rank, _suit), count in counts.items():
+            limit = 4 if rank == "WILD" else 3 if rank == "8" else 2
+            if count > limit:
+                return True
+        return False
+
+    async def _read_table_url(self, table_url: str) -> tuple[int, list[dict[str, Any]]]:
+        """读牌堆数与 4 个亮牌位（0-1000 横坐标）；问号与空位不返回。"""
+        table_payload = await self._quick_json(TABLE_OBJECT_PROMPT, table_url, "亮牌")
+        if not isinstance(table_payload.get("slots"), list):
+            table_payload = await self._quick_json(TABLE_COMPACT_PROMPT, table_url, "亮牌重读")
+        table: list[dict[str, Any]] = []
+        slots = table_payload.get("slots", [])
+        for slot_x, token in zip(TURN_TABLE_SLOTS, slots if isinstance(slots, list) else []):
+            card = self._parse_card_token(token)
+            if card is not None and card["rank"] != "?" and (
+                card["rank"] == "WILD" or card["suit"] in SUITS
+            ):
+                table.append({**card, "x": slot_x})
+        return table_payload.get("deck", -1), table
+
+    def build_turn_snapshot(
+        self,
+        *,
+        hand: list[Card],
+        opportunity_count: int,
+        table: list[Card],
+        deck_count: int | None,
+        gold_ranks: tuple[str, ...],
+        action_state: str,
+        size: tuple[int, int],
+    ) -> GameSnapshot:
+        """不调用模型，用已知手牌（显示顺序）与已读到的亮牌行组装回合快照。
+
+        table 为 parse_table 返回的 0-1000 坐标亮牌；问号选牌卡固定排在最左侧。
+        """
+        hand_items: list[dict[str, Any]] = [{"rank": "?", "suit": "NONE"}] * opportunity_count
+        hand_items += [
+            {"rank": "WILD", "suit": "NONE"} if card.wild else {"rank": card.rank, "suit": card.suit}
+            for card in hand
+        ]
+        table_items = [
+            {"rank": "WILD", "suit": "NONE", "x": card.x}
+            if card.wild
+            else {"rank": card.rank, "suit": card.suit, "x": card.x}
+            for card in table
+        ]
+        payload = {
+            "gold_ranks": list(gold_ranks),
+            "hand": hand_items,
+            "table": table_items,
+            "deck_count": -1 if deck_count is None else deck_count,
+            "hu_button": None,
+        }
+        snapshot = self._turn_snapshot(payload, action_state)
+        snapshot.message = "沿用已知手牌与亮牌行（未调用模型）"
+        return self._scale_local_snapshot(snapshot, size)
+
+    async def parse_hand(self, image_path: Path) -> GameSnapshot:
+        """只读 7 张手牌（对手回合空闲时用，约 0.6~1 秒）；问号计入 opportunity_count。"""
+        if not self._prefer_chat_completions:
+            raise RuntimeError("手牌快速识别仅支持本地视觉模型")
+        return await self._parse_turn_crops(image_path, "draw", (), read_table=False)
+
+    async def parse_table(self, image_path: Path) -> tuple[list[Card], int | None]:
+        """对手回合记牌用：只读亮牌行（从左到右）与牌堆数，约 1 秒。"""
+        if not self._prefer_chat_completions:
+            raise RuntimeError("亮牌行快速识别仅支持本地视觉模型")
+        with Image.open(image_path) as image:
+            table_url = self._crop_data_url(image.convert("RGB"), TABLE_CROP_BOX, TABLE_CROP_SCALE)
+        deck, table = await self._read_table_url(table_url)
+        snapshot = self._turn_snapshot(
+            {"gold_ranks": [], "hand": [], "table": table, "deck_count": deck, "hu_button": None},
+            "draw",
+        )
+        return list(snapshot.visible_cards), snapshot.deck_count
 
     @staticmethod
     def _crop_data_url(
@@ -520,7 +665,12 @@ class BaqueVision:
 
     @classmethod
     def _parse_card_token(cls, token: Any) -> dict[str, Any] | None:
-        """解析 "10S"、"AH^"、"J D"、"WILD"、"?" 这类紧凑牌面写法。"""
+        """解析 "10S"、"AH^"、"J D"、"WILD"、"?" 这类紧凑牌面写法，以及 {"rank","suit"} 对象。"""
+        if isinstance(token, dict):
+            rank = "".join(str(token.get("rank") or "").split()).upper()
+            suit = "".join(str(token.get("suit") or "").split()).upper()
+            up = "^" if token.get("up") is True else ""
+            token = rank + ("" if suit in {"", "NONE"} else suit) + up
         text = "".join(str(token or "").split()).upper()
         for symbol, letter in _SUIT_SYMBOLS.items():
             text = text.replace(symbol, letter)
@@ -533,9 +683,13 @@ class BaqueVision:
         if cls._normalize_rank(text) == "WILD" or text in {"癞子", "赖子"}:
             return {"rank": "WILD", "suit": "NONE", "up": selected}
         match = _CARD_TOKEN_RE.match(text)
-        if match is None:
-            return None
-        return {"rank": match.group(1), "suit": match.group(2), "up": selected}
+        if match is not None:
+            return {"rank": match.group(1), "suit": match.group(2), "up": selected}
+        rank_only = _RANK_ONLY_RE.match(text)
+        if rank_only is not None:
+            # 只读出点数（如 "K20"）：花色留空，手牌由像素判定补齐，补不上的会被丢弃。
+            return {"rank": rank_only.group(1), "suit": "", "up": selected}
+        return None
 
     @classmethod
     def _compact_hand_items(cls, tokens: Any) -> list[dict[str, Any]]:
@@ -575,11 +729,24 @@ class BaqueVision:
             for value in (self._parse_beans(item) for item in (raw_beans if isinstance(raw_beans, list) else []))
             if value is not None
         ]
-        room_match = re.search(r"(新手|普通|高级|顶级)场", title)
-        room_cap = ROOM_WIN_CAPS.get(room_match.group(1)) if room_match else None
         base_match = re.search(r"底分\D*(\d+)", title)
         base = float(base_match.group(1)) if base_match else None
+        room = ROOM_BY_BASE_SCORE.get(base) if base else None
+        if room is None:
+            # 底分没读到或不在已知档位时，才退回标题里的场次文字。
+            room_match = re.search(r"(新手|普通|高级|顶级)场", title)
+            room = room_match.group(1) if room_match else None
+        room_cap = ROOM_WIN_CAPS.get(room) if room else None
         return (base if base and base > 0 else None), balances, room_cap
+
+    async def parse_own_beans(self, image_path: Path) -> float | None:
+        """左下角自己的欢乐豆数（如 “2.5万”），实测约 0.25 秒。"""
+        if not self._prefer_chat_completions:
+            raise RuntimeError("自己豆数识别仅支持本地视觉模型")
+        with Image.open(image_path) as image:
+            url = self._crop_data_url(image.convert("RGB"), OWN_BEANS_CROP_BOX, 3)
+        payload = await self._quick_json(OWN_BEANS_COPY_PROMPT, url, "自己欢乐豆")
+        return self._parse_beans(payload.get("beans"))
 
     @classmethod
     def _stack_crops(
@@ -727,13 +894,15 @@ class BaqueVision:
         )
         slots = TURN_HAND_SLOTS.get(len(items))
         opportunity_click: Point | None = None
+        opportunity_count = 0
         hand_values: list[dict[str, Any]] = []
         for index, item in enumerate(items):
             # 张数不符合任何已知布局时不给坐标，控制器会按张数校验拒绝执行。
             x = slots[index] if slots is not None else 0
             rank = cls._normalize_rank(item.get("rank"))
             if rank == "?":
-                if slots is not None:
+                opportunity_count += 1
+                if slots is not None and opportunity_click is None:
                     opportunity_click = Point(x, TURN_HAND_Y)
                 continue
             hand_values.append(
@@ -801,6 +970,7 @@ class BaqueVision:
             hand=hand,
             visible_cards=visible,
             opportunity_click=opportunity_click,
+            opportunity_count=opportunity_count,
             deck_click=TURN_DECK_POINT if action_state == "draw" else None,
             discard_button=TURN_DISCARD_BUTTON if action_state == "discard" else None,
             hu_button=hu_button,
@@ -838,6 +1008,7 @@ class BaqueVision:
             visible_cards=[card(value) for value in snapshot.visible_cards],
             opponent_events=snapshot.opponent_events,
             opportunity_click=point(snapshot.opportunity_click),
+            opportunity_count=snapshot.opportunity_count,
             deck_click=point(snapshot.deck_click),
             swap_button=point(snapshot.swap_button),
             discard_button=point(snapshot.discard_button),
@@ -1177,6 +1348,7 @@ class BaqueVision:
             visible_cards=visible,
             opponent_events=events,
             opportunity_click=opportunity_click,
+            opportunity_count=1 if opportunity_click is not None else 0,
             deck_click=deck_click,
             swap_button=swap_button,
             discard_button=discard_button,

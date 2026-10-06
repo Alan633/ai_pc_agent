@@ -16,6 +16,7 @@ from game_baque.capture import (
     detect_discard_button,
     detect_opportunity_card,
     detect_round_in_progress,
+    find_opportunity_card,
 )
 from game_baque.controller import BaqueGameController
 from game_baque.ev import ExpectedValueEngine
@@ -274,6 +275,36 @@ async def test_parse_swap_keeps_wild_card(tmp_path: Path) -> None:
     assert [card.wild for card in snapshot.hand] == [True, False, False, False, False, True]
 
 
+@pytest.mark.asyncio
+async def test_parse_swap_supports_two_question_cards_and_one_wild(tmp_path: Path) -> None:
+    image_path = tmp_path / "swap_two_questions.png"
+    Image.new("RGB", (1936, 1088), TABLE_GREEN).save(image_path)
+    vision = BaqueVision("", "local", "http://127.0.0.1:11434/v1")
+
+    async def fake_quick_json(_prompt: str, _url: str, _label: str) -> dict[str, object]:
+        return {
+            "gold_ranks": ["6", "7", "J"],
+            "hand": [
+                {"rank": "?", "suit": "NONE"},
+                {"rank": "?", "suit": "NONE"},
+                {"rank": "WILD", "suit": "NONE"},
+                {"rank": "9", "suit": "S"},
+                {"rank": "8", "suit": "S"},
+                {"rank": "A", "suit": "H"},
+                {"rank": "7", "suit": "C"},
+            ],
+            "swap_button": {"x": 536, "y": 677},
+        }
+
+    vision._quick_json = fake_quick_json  # type: ignore[method-assign]
+    snapshot = await vision.parse_swap(image_path)
+
+    assert len(snapshot.hand) == 5
+    assert snapshot.opportunity_card_count == 2
+    assert snapshot.opportunity_click is not None
+    assert snapshot.hand[0].wild
+
+
 def test_turn_snapshot_keeps_wild_card() -> None:
     payload = {
         "gold_ranks": ["8", "9", "10"],
@@ -284,6 +315,52 @@ def test_turn_snapshot_keeps_wild_card() -> None:
     snapshot = BaqueVision._turn_snapshot(payload, "draw")
 
     assert len(snapshot.hand) == 7
+    assert snapshot.hand[0].wild
+
+
+def test_turn_snapshot_counts_two_question_cards() -> None:
+    payload = {
+        "gold_ranks": ["6", "7", "J"],
+        "hand": [
+            {"rank": "?", "suit": "NONE"},
+            {"rank": "?", "suit": "NONE"},
+            {"rank": "WILD", "suit": "NONE"},
+            {"rank": "9", "suit": "S"},
+            {"rank": "8", "suit": "S"},
+            {"rank": "A", "suit": "H"},
+            {"rank": "7", "suit": "C"},
+        ],
+        "deck_count": 56,
+    }
+
+    snapshot = BaqueVision._turn_snapshot(payload, "draw")
+
+    assert len(snapshot.hand) == 5
+    assert snapshot.opportunity_card_count == 2
+    assert snapshot.opportunity_click == Point(TURN_HAND_SLOTS[7][0], TURN_HAND_Y)
+    assert snapshot.hand[0].wild
+
+
+def test_turn_snapshot_caps_four_left_question_cards() -> None:
+    payload = {
+        "gold_ranks": ["6", "7", "J"],
+        "hand": [
+            {"rank": "?", "suit": "NONE"},
+            {"rank": "?", "suit": "NONE"},
+            {"rank": "?", "suit": "NONE"},
+            {"rank": "?", "suit": "NONE"},
+            {"rank": "WILD", "suit": "NONE"},
+            {"rank": "9", "suit": "S"},
+            {"rank": "8", "suit": "S"},
+        ],
+        "deck_count": 56,
+    }
+
+    snapshot = BaqueVision._turn_snapshot(payload, "draw")
+
+    assert len(snapshot.hand) == 3
+    assert snapshot.opportunity_card_count == 4
+    assert snapshot.opportunity_click == Point(TURN_HAND_SLOTS[7][0], TURN_HAND_Y)
     assert snapshot.hand[0].wild
 
 
@@ -473,6 +550,20 @@ def test_opportunity_card_detector_ignores_wild_and_normal_cards() -> None:
     assert not detect_opportunity_card(wild)
 
 
+def test_opportunity_card_detector_finds_second_slot_after_first_pick() -> None:
+    image = _table_image(deck=True, banner=True)
+    draw = ImageDraw.Draw(image)
+    # 第一张已变成普通牌，剩余问号仍在第二个 8 张手牌位。
+    second_x = round((282 + 53.4) * image.width / 1000)
+    draw.rectangle((second_x - 38, 860, second_x + 38, 1000), fill=(230, 229, 229))
+    draw.rectangle((second_x - 23, 880, second_x + 2, 930), fill=(245, 160, 90))
+
+    point = find_opportunity_card(image)
+
+    assert point is not None
+    assert abs(point.x - second_x) <= 3
+
+
 def _discard_probe(frame: CapturedFrame) -> TurnProbe:
     return TurnProbe("discard", True, frame, opportunity_card=True)
 
@@ -653,7 +744,9 @@ def test_compact_card_tokens_are_parsed() -> None:
     assert parse("Q♣") == {"rank": "Q", "suit": "C", "up": False}
     assert parse("WILD")["rank"] == "WILD"
     assert parse("?")["rank"] == "?"
-    assert parse("J") is None
+    # 只读出点数：花色留空，由像素判定补齐（补不上的在 _apply_pixel_suits 里丢弃）。
+    assert parse("J") == {"rank": "J", "suit": "", "up": False}
+    assert parse("K20") == {"rank": "K", "suit": "", "up": False}
     assert parse("") is None
     # 牌角“30分/20分”被抄进牌面时仍能解析。
     assert parse("A30H") == {"rank": "A", "suit": "H", "up": False}
@@ -708,6 +801,7 @@ def test_sure_hu_is_taken_unless_continuing_is_much_better(future_ratio: float, 
     tracker.reset_round(hand[:7], 50)
     engine = ExpectedValueEngine(simulations=50, seed=3)
     engine._rollout_future_hu = lambda *_args, **_kwargs: hu_value * future_ratio  # type: ignore[method-assign]
+    engine.repeat_hu_value = lambda *_args, **_kwargs: 0.0  # type: ignore[method-assign]  # 只测单次胡的门槛
 
     decision, _values = engine.choose_8_card_action(hand, gold, tracker, time_budget_seconds=1.0)
 
@@ -769,10 +863,11 @@ def test_capped_hu_is_taken_even_when_rollout_promises_more() -> None:
     tracker.reset_round(hand[:7], 50)
     engine = ExpectedValueEngine(simulations=50, seed=3)
     engine.score_caps = (500.0, 500.0, 500.0)
-    # 继续做牌的未来价值同样被封顶，不可能超过“立即胡”的 2 倍。
+    engine.repeat_hu_value = lambda *_args, **_kwargs: 0.0  # type: ignore[method-assign]  # 只测单次封顶
+    # 继续做牌的未来价值同样按每胡一次封顶（无癞子胡最多 2 倍），不可能超过“立即胡”的 2 倍。
     decision, values = engine.choose_8_card_action(hand, gold, tracker, time_budget_seconds=1.0)
     assert decision.action == "hu"
-    assert max(item.future_hu_value for item in values) <= 500.0
+    assert max(item.future_hu_value for item in values) <= 2 * 500.0
 
 
 def test_bean_amounts_are_parsed() -> None:
@@ -808,3 +903,23 @@ def test_large_ting_hint_panel_does_not_hide_the_discard_button() -> None:
     draw.rectangle((208, 232, 1728, 637), fill=(236, 244, 252))
     draw.rounded_rectangle((945, 695, 1130, 780), 38, fill=DISCARD_ORANGE)
     assert "discard" in find_action_buttons(image)
+
+
+def test_hand_fallback_accepts_object_tokens_with_mandatory_suit() -> None:
+    # 紧凑写法偶尔整手丢花色（"K20"），重读改用对象格式。
+    items = BaqueVision._compact_hand_items(
+        [
+            {"rank": "K", "suit": "H"},
+            {"rank": "10", "suit": "D", "up": True},
+            {"rank": "WILD", "suit": "NONE"},
+            {"rank": "?", "suit": "NONE"},
+            "K20",
+        ]
+    )
+    assert [(item["rank"], item["suit"], item["up"]) for item in items] == [
+        ("K", "H", False),
+        ("10", "D", True),
+        ("WILD", "NONE", False),
+        ("?", "NONE", False),
+        ("K", "", False),  # 只有点数：留给像素花色补齐
+    ]

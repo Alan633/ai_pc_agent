@@ -103,6 +103,7 @@ class BaquePlugin:
                 fast_vision_enabled=settings.game_fast_vision,
                 decision_mode=settings.game_decision_mode,
                 decision_reranker=decision_reranker,
+                decision_budget_seconds=settings.game_decision_budget_seconds,
                 win_cap_beans=settings.game_win_cap_beans,
                 rounds_log_path=settings.logs_dir / "baque" / "rounds.jsonl",
             )
@@ -366,18 +367,14 @@ class BaquePlugin:
                     self._auto_started_observer = True
                     LOGGER.info("八雀启动流程：正式牌局已就绪，三家观察器已启动")
             elif game.vision.base_url:
-                # 本地 Ollama 通常串行处理请求。观察器仅在对手回合调用模型；
-                # 轮到自己时控制器会先取消在途对手请求并取得优先权。
+                # 本地视觉模式：三家动作由控制器比较亮牌行变化来记牌（table_watch），
+                # 动画片段观察器只录像、不再调用 Qwen——它会把一次出牌切成几段碎片，
+                # 实测几乎全判为“动画”、写入 0 条，还和自己回合争抢串行的 Ollama。
                 game.set_external_observer_active(True)
-                if observer is not None:
-                    game.set_opponent_observer_controls(
-                        pause=observer.pause_classification,
-                        resume=observer.resume_classification,
-                    )
-                    if not observer.running:
-                        await observer.start(classification_paused=True)
-                        self._auto_started_observer = True
-                LOGGER.info("本地视觉模式：已启用按回合抢占的三家桌面识别")
+                if observer is not None and not observer.running:
+                    await observer.start(classification_paused=True)
+                    self._auto_started_observer = True
+                LOGGER.info("本地视觉模式：已启用亮牌行比对记录三家动作")
 
             message = await game.run_loop(self._auto_stop_event)
             self._last_auto_message = message

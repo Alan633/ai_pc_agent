@@ -88,8 +88,13 @@ class TableTracker:
         self.events: list[TableEvent] = []
         self._seq = 0
 
+    def _capped_own(self, cards: Iterable[Card]) -> Counter[CardKey]:
+        """自己手牌计数不超过牌池张数；超出的必然是视觉误读（如读出 3 张 J♣）。"""
+        own = Counter(card_key(card) for card in cards)
+        return Counter({key: min(count, self.initial[key]) for key, count in own.items()})
+
     def reset_round(self, own_hand: Iterable[Card], deck_count: int | None = 56) -> None:
-        self.own_hand = Counter(card_key(card) for card in own_hand)
+        self.own_hand = self._capped_own(own_hand)
         self.public_discards.clear()
         self.table_visible.clear()
         self.opponents = {seat: OpponentKnowledge(seat) for seat in SEATS}
@@ -123,13 +128,22 @@ class TableTracker:
         """以摸牌阶段看到的桌面亮牌为准，替换已知桌面牌。"""
         self.table_visible = Counter(card_key(card) for card in cards)
 
+    def _leave_table(self, key: CardKey) -> None:
+        """亮牌被拿走：它不再躺在桌面，也不再算“已出过的牌”，而是进了某家的手牌。
+
+        漏扣 public_discards 会让这张牌同时算在“已出”和“手牌”里，计数变负，
+        曾因此反复触发“记牌状态冲突，按当前手牌重建”，把三家记录全部清空。
+        """
+        for counter in (self.table_visible, self.public_discards):
+            if counter[key] > 0:
+                counter[key] -= 1
+                if counter[key] <= 0:
+                    del counter[key]
+
     def record_own_take_visible(self, card: Card) -> None:
         key = card_key(card)
         # 牌已从桌面进入自己手牌；不扣掉会在下次同步前被重复计数。
-        if self.table_visible[key] > 0:
-            self.table_visible[key] -= 1
-            if self.table_visible[key] <= 0:
-                del self.table_visible[key]
+        self._leave_table(key)
         self._event("own_take_visible", "self", key)
 
     def record_opponent_draw_deck(self, seat: str) -> None:
@@ -175,11 +189,16 @@ class TableTracker:
             self.record_opponent_draw_deck(seat)
         else:
             self.record_opponent_draw_unknown(seat)
+            if self.known_deck_top:
+                # 不知道这家是否摸走了已知牌堆顶：宁可丢掉这条信息，也不能让它过期。
+                self.known_deck_top.clear()
+                self._event("known_top_cleared", seat)
         self.record_opponent_discard(seat, discard)
 
     def record_opponent_take_visible(self, seat: str, card: Card) -> None:
         key = card_key(card)
         opp = self._opponent(seat)
+        self._leave_table(key)
         opp.known_hand[key] += 1
         opp.known_takes.append(key)
         self._event("opponent_take_visible", seat, key)
@@ -272,10 +291,18 @@ class TableTracker:
                 del counts[key]
         return counts
 
-    def draw_distribution(self) -> dict[CardKey, float]:
-        if self.known_deck_top:
-            return {self.known_deck_top[0]: 1.0}
+    def draw_distribution(self, skip: int = 0) -> dict[CardKey, float]:
+        """从牌堆再往下第 skip 张（0 = 下一张）的分布。
+
+        已知牌堆顶只决定前几张：越过它们之后按未见牌池随机，且这几张已被摸走、
+        不在池中。旧实现对任何深度都返回同一张已知牌，模拟“再摸三次”时会三次
+        摸到同一张牌，严重扭曲摸牌/取亮牌的估值。
+        """
+        if skip < len(self.known_deck_top):
+            return {self.known_deck_top[skip]: 1.0}
         unseen = self.unseen_counts(include_opportunity=False)
+        unseen.subtract(Counter(self.known_deck_top))
+        unseen = Counter({key: count for key, count in unseen.items() if count > 0})
         total = sum(unseen.values())
         if total <= 0:
             return {}
@@ -383,6 +410,52 @@ class TableTracker:
     def _event(self, kind: str, seat: str | None = None, card: str | None = None, detail: str = "") -> None:
         self._seq += 1
         self.events.append(TableEvent(self._seq, kind, seat, card, detail))
+
+    def repair_counts(self) -> list[CardKey]:
+        """某张牌计数为负（多半是视觉认错牌）时，就地扣掉多记的来源，保留其余记牌。
+
+        自己手牌来自当前截图，视为准确；先扣“已出过的牌”与桌面亮牌，再扣对手
+        已知手牌（转为未知张数，保持对手手牌总数不变）。返回修正过的牌。
+        """
+        counts = self.initial.copy()
+        counts.subtract(self.own_hand)
+        counts.subtract(self.public_discards)
+        for opp in self.opponents.values():
+            counts.subtract(opp.known_hand)
+        for key, seen in self.table_visible.items():
+            extra = seen - self.public_discards[key]
+            if extra > 0:
+                counts[key] -= extra
+        repaired: list[CardKey] = []
+        for key, count in list(self.own_hand.items()):
+            if count > self.initial[key]:
+                # 自己手牌一般可信，但超出牌池张数的部分只能是误读。
+                counts[key] += count - self.initial[key]
+                self.own_hand[key] = self.initial[key]
+                repaired.append(key)
+        for key, value in list(counts.items()):
+            if key == "OPPORTUNITY" or value >= 0:
+                continue
+            deficit = -value
+            for counter in (self.public_discards, self.table_visible):
+                take = min(deficit, counter[key])
+                if take:
+                    counter[key] -= take
+                    deficit -= take
+                    if counter[key] <= 0:
+                        del counter[key]
+            for opp in self.opponents.values():
+                take = min(deficit, opp.known_hand[key])
+                if take:
+                    opp.known_hand[key] -= take
+                    opp.unknown_hand_count += take
+                    deficit -= take
+                    if opp.known_hand[key] <= 0:
+                        del opp.known_hand[key]
+            repaired.append(key)
+            self._event("repair", detail=key)
+        self._validate_counts()
+        return repaired
 
     def _validate_counts(self) -> None:
         # 通过 unseen_counts 统一检查是否出现重复记牌/视觉冲突。

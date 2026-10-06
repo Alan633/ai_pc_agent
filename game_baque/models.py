@@ -51,6 +51,7 @@ class ScreenType(str, Enum):
     WAITING = "waiting"
     SETTLEMENT = "settlement"
     RECHARGE = "recharge"
+    LOBBY = "lobby"
     UNKNOWN = "unknown"
 
 
@@ -77,6 +78,7 @@ class GameSnapshot:
     visible_cards: list[Card] = field(default_factory=list)
     opponent_events: list[OpponentEvent] = field(default_factory=list)
     opportunity_click: Point | None = None
+    opportunity_count: int = 0
     deck_click: Point | None = None
     swap_button: Point | None = None
     discard_button: Point | None = None
@@ -85,7 +87,14 @@ class GameSnapshot:
     continue_button: Point | None = None
     close_popup: Point | None = None
     deck_count: int | None = None
+    # 摸牌阶段每张亮牌上是否有游戏标的“胡 ×N”角标（与 visible_cards 同序）；None 表示未检测。
+    visible_hu: tuple[bool, ...] | None = None
     message: str = ""
+
+    @property
+    def opportunity_card_count(self) -> int:
+        """兼容旧快照：有点击点但没有显式数量时按 1 张问号牌处理。"""
+        return min(4, max(self.opportunity_count, 1 if self.opportunity_click is not None else 0))
 
     def fingerprint(self) -> tuple[object, ...]:
         return (
@@ -96,6 +105,7 @@ class GameSnapshot:
             None
             if self.opportunity_click is None
             else (self.opportunity_click.x, self.opportunity_click.y),
+            self.opportunity_card_count,
             self.deck_count,
         )
 

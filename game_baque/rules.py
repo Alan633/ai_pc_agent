@@ -40,6 +40,10 @@ def card_base_points(card: Card) -> int:
     return BASE_POINTS[card.rank or "6"]
 
 
+# 自己从牌堆摸到胡（自摸）倍数 ×2；拿亮牌或别人打出的牌胡按 ×1（用户 2026-10-06 确认）。
+SELF_DRAW_MULTIPLIER = 2
+
+
 def gold_multiplier(gold_count: int) -> int:
     """官方说明：“胡牌倍数额外 × 金牌数量”（线性，不是翻倍）；没有金牌不额外加倍。
 
@@ -287,7 +291,13 @@ def _evaluate_canonical(
             first_generic = _generic_shapes(first_subset)
             if not first_generic:
                 continue
-            second_generic = _generic_shapes(second_subset)
+            # 两张一组只能是对子（同点），不能是两张连号：游戏对 “6 张顺子 + 8♥9♥”
+            # 不给胡（用户 2026-10-06 给出的锁牌听牌与此一致）。
+            second_generic = (
+                _same_rank_shapes(second_subset)
+                if len(second_subset) == 2
+                else _generic_shapes(second_subset)
+            )
             for a in first_generic:
                 a_color = color is not None and _shape_color_compatible(a, color)
                 for b in second_generic:
@@ -301,8 +311,10 @@ def _evaluate_canonical(
     same_rank_then_generic(PARTITIONS_5_3, "永恒相随", 8, "五谷丰登", 8, "五福临门", 4)
     same_rank_then_generic(PARTITIONS_4_4, "二龙腾飞", 4, "四季发财", 4, "四季如春", 2)
 
-    # 3 + 3 + 2；对子必须为同点。
-    for (pair, pair_get), triples in SPLITS_3_3_2:
+    # 3 + 3 + 2；对子必须为同点。癞子不能参与 3+3+2（用户 2026-10-06 确认）：
+    # 8 张全部分组，有癞子就必然落在某组里，所以手里有癞子时直接不考虑平胡。
+    # 实战曾把“癞子 K♥ K♦ Q♦ Q♦ 10♠ 10♦ + K♣”判成可胡，游戏没给胡，连续三回合白拿白打。
+    for (pair, pair_get), triples in SPLITS_3_3_2 if hard else ():
         pair_shapes = _same_rank_shapes(pair_get(canonical))
         if not pair_shapes:
             continue

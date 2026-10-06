@@ -155,8 +155,142 @@ def detect_round_in_progress(image: Image.Image) -> bool:
     return _blue_ratio(deck) >= 0.55
 
 
+def detect_room_lobby(image: Image.Image) -> bool:
+    """检测新手/普通/高级/顶级四个大色块组成的场次选择页。"""
+    hsv = cv2.cvtColor(_to_bgr(image), cv2.COLOR_BGR2HSV)
+
+    def median_hsv(box: tuple[float, float, float, float]) -> tuple[float, float, float]:
+        patch, _, _ = _crop(hsv, box)
+        values = np.median(patch.reshape(-1, 3), axis=0)
+        return float(values[0]), float(values[1]), float(values[2])
+
+    cyan = median_hsv((0.18, 0.31, 0.32, 0.45))
+    purple = median_hsv((0.39, 0.31, 0.50, 0.45))
+    orange = median_hsv((0.60, 0.31, 0.72, 0.45))
+    red = median_hsv((0.80, 0.31, 0.91, 0.45))
+    return (
+        70 <= cyan[0] <= 100 and cyan[1] >= 55 and cyan[2] >= 150
+        and 110 <= purple[0] <= 145 and purple[1] >= 45 and purple[2] >= 150
+        and 8 <= orange[0] <= 30 and orange[1] >= 70 and orange[2] >= 150
+        and (red[0] <= 10 or red[0] >= 170) and red[1] >= 60 and red[2] >= 150
+    )
+
+
+# 胡牌结算时各家头像旁弹出的输赢横幅位置（相对窗口）：赢家红橙底“+X万”，输家蓝灰底“-X万”。
+SETTLEMENT_SEATS: dict[str, tuple[float, float, float, float]] = {
+    "right": (0.865, 0.45, 0.995, 0.505),
+    "left": (0.005, 0.45, 0.135, 0.505),
+    "top": (0.43, 0.185, 0.57, 0.24),
+    "self": (0.44, 0.87, 0.56, 0.93),
+}
+
+
+def detect_hu_settlement(image: Image.Image) -> str | None:
+    """检测胡牌结算横幅，返回赢家座位（right/left/top/self），不确定赢家时返回 "unknown"。
+
+    实测 1996 帧八雀画面：横幅处红/蓝灰像素占比要么接近 0，要么 ≥0.3，49 帧结算全部
+    命中、无误判。某家红色 = 他胡了；两家以上蓝灰 = 结算画面，唯一没有横幅的一家是赢家。
+    有人胡牌后本局可能继续，所以这只用来停止误归属，不当作本局结束。
+    """
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+    height, width = rgb.shape[:2]
+    reds: list[str] = []
+    blues: list[str] = []
+    for seat, (left, top, right, bottom) in SETTLEMENT_SEATS.items():
+        patch = rgb[round(height * top) : round(height * bottom), round(width * left) : round(width * right)]
+        if patch.size == 0:
+            continue
+        red, green, blue = patch[..., 0], patch[..., 1], patch[..., 2]
+        red_ratio = float(
+            ((red >= 200) & (green >= 60) & (green <= 130) & (blue >= 40) & (blue <= 120) & (red - green >= 90)).mean()
+        )
+        blue_ratio = float(
+            (
+                (red >= 90) & (red <= 140) & (green >= 125) & (green <= 170)
+                & (blue >= 160) & (blue <= 205) & (blue - red >= 40)
+            ).mean()
+        )
+        if red_ratio >= 0.25:
+            reds.append(seat)
+        elif blue_ratio >= 0.2:
+            blues.append(seat)
+    if len(reds) == 1:
+        return reds[0]
+    if len(blues) >= 2:
+        silent = [seat for seat in SETTLEMENT_SEATS if seat not in blues and seat not in reds]
+        return silent[0] if len(silent) == 1 else "unknown"
+    return None
+
+
+# 亮牌行 4 个牌位（0-1000 横坐标，与 vision.TURN_TABLE_SLOTS 一致）。
+TABLE_SLOT_XS = (438, 492, 546, 600)
+
+
+def detect_table_hu_badges(image: Image.Image) -> dict[int, bool]:
+    """亮牌下沿的红色“胡 ×N”角标：游戏标出“拿这张就能胡”的牌。返回 {牌位横坐标: 是否有角标}。
+
+    实测角标处红色像素占比约 0.29，其余牌（含红色花色、橙色“吃”角标）为 0。
+    """
+    rgb = np.asarray(image.convert("RGB")).astype(np.int16)
+    height, width = rgb.shape[:2]
+    result: dict[int, bool] = {}
+    for slot in TABLE_SLOT_XS:
+        center = slot / 1000
+        patch = rgb[
+            round(height * 0.405) : round(height * 0.445),
+            round(width * (center - 0.022)) : round(width * (center + 0.022)),
+        ]
+        if patch.size == 0:
+            result[slot] = False
+            continue
+        red, green, blue = patch[..., 0], patch[..., 1], patch[..., 2]
+        result[slot] = float(((red >= 200) & (green <= 110) & (blue <= 110)).mean()) >= 0.15
+    return result
+
+
+def detect_recharge_popup(image: Image.Image) -> bool:
+    """检测“豆子不足啦”购买弹窗（输光豆子后出现，代表本局游戏结束）。
+
+    特征：浅蓝白购买面板底边那一行（“需充值 X 元”）+ 面板下方深蓝的
+    “认输倒计时”条。实测 453 张截图中 10 张真弹窗面板 ≥0.84、倒计时条 ≥0.71，
+    其余截图两项不会同时 ≥0.4/0.3。只用于识别，绝不点击弹窗上的任何按钮。
+    """
+    bgr = _to_bgr(image)
+    panel, _, _ = _crop(bgr, (0.30, 0.775, 0.70, 0.805))
+    bar, _, _ = _crop(bgr, (0.40, 0.845, 0.62, 0.875))
+    if panel.size == 0 or bar.size == 0:
+        return False
+    p = panel.astype(np.int16)
+    blue, green, red = p[..., 0], p[..., 1], p[..., 2]
+    light = (red >= 200) & (green >= 210) & (blue >= 230) & (blue >= red)
+    b = bar.astype(np.int16)
+    b_blue, b_green, b_red = b[..., 0], b[..., 1], b[..., 2]
+    navy = (b_blue >= 90) & (b_blue - b_red >= 40) & (b_red <= 110) & (b_green <= 130)
+    return float(light.mean()) >= 0.6 and float(navy.mean()) >= 0.5
+
+
 def analyze_game_ui(image: Image.Image) -> FastUIState:
     """快速识别固定 UI；不能确定的页面交给 Qwen 兜底。"""
+    if detect_recharge_popup(image):
+        return FastUIState(
+            screen_type=ScreenType.RECHARGE,
+            confidence=0.97,
+            start_button=None,
+            action_state=None,
+            round_in_progress=False,
+            message="OpenCV 快速识别：豆子不足购买弹窗，本局游戏结束",
+        )
+
+    if detect_room_lobby(image):
+        return FastUIState(
+            screen_type=ScreenType.LOBBY,
+            confidence=0.99,
+            start_button=None,
+            action_state=None,
+            round_in_progress=False,
+            message="OpenCV 快速识别：已返回场次选择页",
+        )
+
     start_button, start_confidence = detect_start_button(image)
     if start_button is not None and start_confidence >= 0.72:
         return FastUIState(

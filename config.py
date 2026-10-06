@@ -19,9 +19,10 @@ class Settings:
     confirm_timeout_seconds: int
     allowed_roots: tuple[Path, ...]
     allowed_executables: frozenset[str]
+    local_console_enabled: bool = True
     game_vision_model: str = "gpt-4.1-mini"
     game_window_title_keyword: str = "欢乐斗地主"
-    game_action_interval_seconds: float = 1.5
+    game_action_interval_seconds: float = 0.6
     game_min_card_confidence: float = 0.72
     game_auto_next_round: bool = False
     game_record_fps: float = 6.0
@@ -35,6 +36,7 @@ class Settings:
     game_decision_mode: str = "hybrid"
     game_decision_model: str = ""
     game_decision_base_url: str = ""
+    game_decision_budget_seconds: float = 1.2
     game_decision_timeout_seconds: float = 4.0
     game_decision_top_n: int = 4
     game_decision_min_confidence: float = 0.55
@@ -182,9 +184,10 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         confirm_timeout_seconds=max(int(os.getenv("CONFIRM_TIMEOUT_SECONDS", "120")), 10),
         allowed_roots=roots,
         allowed_executables=executables,
+        local_console_enabled=_env_bool("LOCAL_CONSOLE_ENABLED", "true"),
         game_vision_model=os.getenv("GAME_VISION_MODEL", openai_model).strip(),
         game_window_title_keyword=os.getenv("GAME_WINDOW_TITLE", "欢乐斗地主").strip(),
-        game_action_interval_seconds=max(float(os.getenv("GAME_ACTION_INTERVAL_SECONDS", "1.5")), 0.5),
+        game_action_interval_seconds=max(float(os.getenv("GAME_ACTION_INTERVAL_SECONDS", "0.6")), 0.2),
         game_min_card_confidence=game_confidence,
         game_auto_next_round=_env_bool("GAME_AUTO_NEXT_ROUND"),
         game_record_fps=min(max(float(os.getenv("GAME_RECORD_FPS", "6")), 1.0), 12.0),
@@ -199,6 +202,9 @@ def load_settings(base_dir: Path | None = None, *, require_secrets: bool = True)
         game_decision_mode=decision_mode,
         game_decision_model=decision_model,
         game_decision_base_url=decision_base_url,
+        game_decision_budget_seconds=max(
+            0.5, min(float(os.getenv("GAME_DECISION_BUDGET_SECONDS", "1.2")), 10.0)
+        ),
         game_decision_timeout_seconds=max(
             1.0, min(float(os.getenv("GAME_DECISION_TIMEOUT_SECONDS", "4.0")), 10.0)
         ),

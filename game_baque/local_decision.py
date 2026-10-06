@@ -82,6 +82,24 @@ class LocalDecisionReranker:
                 reason="合法候选不足，沿用 Python EV。",
             )
 
+        # 后续校验不允许模型选择比最高 EV 低超过 max_ev_drop 的候选。
+        # 若连第二名都越界，模型无论返回什么都不可能改变结果，直接跳过请求。
+        best_ev = max(float(item["ev"]) for item in candidates)
+        if not any(
+            best_ev - float(item["ev"]) <= self.max_ev_drop
+            for item in candidates[1:]
+        ):
+            return HybridDecisionResult(
+                decision=ev_decision,
+                used_model=False,
+                confidence=0.0,
+                choice_id=None,
+                reason=(
+                    f"最高 EV 领先其余候选超过 {self.max_ev_drop:.1f}，"
+                    "无需模型重排。"
+                ),
+            )
+
         payload = {
             "hand": [self._card_payload(card, index) for index, card in enumerate(hand)],
             "gold_ranks": list(gold_ranks),

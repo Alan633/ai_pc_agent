@@ -13,6 +13,7 @@ from game_baque.models import Point
 from game_baque.fast_vision import (
     detect_action_state as cv_detect_action_state,
     detect_round_in_progress as cv_detect_round_in_progress,
+    detect_hu_settlement,
 )
 
 
@@ -41,6 +42,11 @@ class TurnProbe:
     round_in_progress: bool
     frame: CapturedFrame | None
     opportunity_card: bool = False
+    opportunity_point: Point | None = None
+    # 牌堆 + 亮牌行区域的缩略灰度图，用来判断对手回合里亮牌是否变化、是否已稳定。
+    table_signature: bytes | None = None
+    # 胡牌结算横幅：赢家座位（right/left/top/self/unknown），没有结算时为 None。
+    settlement: str | None = None
 
 
 class _MouseInput(ctypes.Structure):
@@ -515,37 +521,50 @@ def detect_choice_popup(image: Any) -> bool:
     return True
 
 
-def detect_opportunity_card(image: Any) -> bool:
-    """检测手牌最左侧是否为“?”选牌卡（白底、橙色问号、骰子）。
+def find_opportunity_card(image: Any) -> Point | None:
+    """扫描出牌阶段全部手牌位，返回“?”选牌卡的点击中心。
 
-    选牌卡总排在最左侧，7 张与 8 张布局下位置一致。实测：选牌卡橙色约 0.15、
-    白底 ≥0.63；癞子（桃色底）橙色 ≤0.066、白底约 0.01；普通牌橙色 ≤0.006。
+    “?”必须先摸牌、到出牌阶段才能打出，所以只扫出牌阶段的 8 张布局。
+
+    双问号牌局完成第一张四选一后，第二张可能仍留在后续牌位，不能只检查
+    最左侧。实测：选牌卡橙色约 0.15、白底 ≥0.63；癞子（桃色底）橙色
+    ≤0.066、白底约 0.01；普通牌橙色 ≤0.006。
     """
     image = image.convert("RGB")
     width, height = image.size
-    pixels = list(
-        image.crop(
-            (
-                round(width * 0.261),
-                round(height * 0.79),
-                round(width * 0.300),
-                round(height * 0.92),
-            )
-        ).getdata()
-    )
-    if not pixels:
-        return False
-    orange = sum(
-        1
-        for red, green, blue in pixels
-        if red > 215 and 110 < green < 200 and blue < 150 and red - blue > 80
-    )
-    neutral = sum(
-        1
-        for red, green, blue in pixels
-        if red > 195 and abs(red - green) < 12 and abs(green - blue) < 12
-    )
-    return orange / len(pixels) >= 0.10 and neutral / len(pixels) >= 0.40
+    # 问号牌固定排在手牌最左侧，规则上最多 4 张；只扫左侧四格可减少误判。
+    slot_xs = tuple(round(282 + index * 53.4) for index in range(4))
+    for slot_x in slot_xs:
+        center = slot_x / 1000
+        pixels = list(
+            image.crop(
+                (
+                    round(width * (center - 0.0195)),
+                    round(height * 0.79),
+                    round(width * (center + 0.0195)),
+                    round(height * 0.92),
+                )
+            ).getdata()
+        )
+        if not pixels:
+            continue
+        orange = sum(
+            1
+            for red, green, blue in pixels
+            if red > 215 and 110 < green < 200 and blue < 150 and red - blue > 80
+        )
+        neutral = sum(
+            1
+            for red, green, blue in pixels
+            if red > 195 and abs(red - green) < 12 and abs(green - blue) < 12
+        )
+        if orange / len(pixels) >= 0.10 and neutral / len(pixels) >= 0.40:
+            return Point(round(width * center), round(height * 0.85))
+    return None
+
+
+def detect_opportunity_card(image: Any) -> bool:
+    return find_opportunity_card(image) is not None
 
 
 def classify_turn_image(image: Any) -> str | None:
@@ -564,6 +583,27 @@ def classify_turn_image(image: Any) -> str | None:
     return action_state
 
 
+# 与 vision.TABLE_CROP_BOX 一致：牌堆数字 + 4 个亮牌位 + 最右侧小牌。
+TABLE_SIGNATURE_BOX = (0.355, 0.32, 0.67, 0.45)
+TABLE_SIGNATURE_SIZE = (40, 10)
+
+
+def table_signature(image: Any) -> bytes:
+    width, height = image.size
+    left, top, right, bottom = TABLE_SIGNATURE_BOX
+    crop = image.crop(
+        (round(width * left), round(height * top), round(width * right), round(height * bottom))
+    )
+    return crop.convert("L").resize(TABLE_SIGNATURE_SIZE).tobytes()
+
+
+def table_signature_changed(first: bytes | None, second: bytes | None, threshold: float = 6.0) -> bool:
+    """两次亮牌区缩略图的平均灰度差是否超过阈值（缺任一方视为变化）。"""
+    if first is None or second is None or len(first) != len(second):
+        return True
+    return sum(abs(a - b) for a, b in zip(first, second)) / len(first) > threshold
+
+
 def probe_game_turn(output_dir: Path, title_keyword: str) -> TurnProbe:
     """廉价探测一帧：只在轮到自己操作时才落盘，供视觉模型识别。
 
@@ -571,6 +611,9 @@ def probe_game_turn(output_dir: Path, title_keyword: str) -> TurnProbe:
     """
     window, image = grab_game_window(title_keyword)
     action_state = classify_turn_image(image)
+    opportunity_point = (
+        find_opportunity_card(image) if action_state == "discard" else None
+    )
     frame = (
         _save_frame(output_dir, window, image)
         if action_state is not None
@@ -580,5 +623,8 @@ def probe_game_turn(output_dir: Path, title_keyword: str) -> TurnProbe:
         action_state,
         detect_round_in_progress(image),
         frame,
-        opportunity_card=action_state == "discard" and detect_opportunity_card(image),
+        opportunity_card=opportunity_point is not None,
+        opportunity_point=opportunity_point,
+        table_signature=table_signature(image),
+        settlement=detect_hu_settlement(image),
     )

@@ -82,10 +82,21 @@ def test_gold_count_multiplies_linearly_like_the_settlement_screen() -> None:
 
 
 def test_hand_with_wild_pays_only_once() -> None:
-    hand = cards("6♥ 7♥ 8♥ J♠ Q♠ K♠ A♣") + [Card(wild=True)]
+    # 癞子补成红桃顺子 6-10 + J♠Q♠K♠：5+3 五福临门，有癞子只付一次。
+    hand = cards("6♥ 7♥ 8♥ 9♥ J♠ Q♠ K♠") + [Card(wild=True)]
     result = evaluate_hu(hand, ("6", "7", "8"))
-    assert result is not None
+    assert result is not None and result.pattern == "五福临门"
     assert not result.hard and result.hard_multiplier == 1
+
+
+def test_wild_cannot_complete_three_three_two() -> None:
+    # 游戏规则：癞子不能参与 3+3+2（平胡）；其他牌型可以用癞子。
+    assert evaluate_hu(cards("6♥ 7♥ 8♥ J♠ Q♠ K♠ A♣") + [Card(wild=True)], ("6", "7", "8")) is None
+    # 17:08 实战：游戏没给胡的那手。
+    assert evaluate_hu(cards("K♥ K♦ Q♦ Q♦ 10♠ 10♦ K♣") + [Card(wild=True)], ("6", "7", "10")) is None
+    # 没有癞子的 3+3+2 仍可胡（14:44 游戏标了“胡 ×1”）。
+    hu = evaluate_hu(cards("10♠ 10♣ 10♣ J♠ J♣ J♣ 7♥ 7♦"), ("8", "K", "A"))
+    assert hu is not None and hu.pattern == "平胡"
 
 
 def test_two_payments_are_capped_per_payment_and_by_balance() -> None:

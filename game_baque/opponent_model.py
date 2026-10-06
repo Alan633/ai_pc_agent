@@ -5,9 +5,31 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
-from game_baque.models import Card
-from game_baque.rules import evaluate_hu
+from game_baque.models import Card, HuResult
+from game_baque.rules import SELF_DRAW_MULTIPLIER, evaluate_hu
 from game_baque.tracker import TableTracker, card_from_key
+
+
+def capped_payment(
+    hu: HuResult,
+    cap: float | None,
+    limit: float | None = None,
+    *,
+    self_draw: bool = False,
+) -> float:
+    """一次胡牌某一家实际要付的分（理论分单位）。
+
+    封顶按每胡一次、每家计算：有癞子付一次，最多 cap；无癞子胡算两次，
+    每次最多 cap，合计最多 2×cap。limit 是这一家本次合计最多能付的（付款方
+    的豆数），None 表示不封顶。
+    """
+    payments = max(1, hu.hard_multiplier)
+    value = float(hu.theoretical_score) * (SELF_DRAW_MULTIPLIER if self_draw else 1)
+    if cap is not None:
+        value = payments * min(value / payments, cap)
+    if limit is not None:
+        value = min(value, limit)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +69,10 @@ class OpponentPatternModel:
     def __init__(self, *, samples: int = 360, seed: int | None = None) -> None:
         self.samples = max(80, int(samples))
         self.rng = random.Random(seed)
+        # 对手胡牌时自己每次最多赔付（理论分单位）；None 表示不封顶。
+        self.loss_cap: float | None = None
+        # 对手胡牌时自己本次合计最多赔付（理论分单位）= 自己的豆数 / 底分；None 表示未知。
+        self.loss_limit: float | None = None
 
     def infer_all(
         self,
@@ -116,7 +142,10 @@ class OpponentPatternModel:
                     if hu is None:
                         continue
                     sample_hu_probability += draw_probability
-                    weighted_score = draw_probability * hu.theoretical_score
+                    # 对手下一摸从牌堆摸到胡：自摸 ×2。
+                    weighted_score = draw_probability * capped_payment(
+                        hu, self.loss_cap, self.loss_limit, self_draw=True
+                    )
                     sample_score += weighted_score
                     pattern_mass[seat][hu.pattern] += draw_probability
                     pattern_score[seat][hu.pattern] += weighted_score
@@ -196,7 +225,7 @@ class OpponentPatternModel:
                 if hu is None:
                     continue
                 wins[seat] += 1
-                scores[seat] += hu.theoretical_score
+                scores[seat] += capped_payment(hu, self.loss_cap, self.loss_limit)
                 patterns[seat][hu.pattern] += 1
 
         sample_count = completed
